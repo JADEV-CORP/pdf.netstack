@@ -43,11 +43,11 @@ jobs:
       run:
         working-directory: website
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0 # page dates come from git history
 
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@v6
         with:
           dotnet-version: |
             8.0.x
@@ -89,7 +89,7 @@ jobs:
       - name: Lighthouse budgets
         run: npx --yes @lhci/cli@0.15.1 autorun --config=./lighthouserc.json
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: site
           path: website/dist

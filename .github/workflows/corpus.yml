@@ -32,9 +32,9 @@ jobs:
       CORPUS_CACHE: ${{ github.workspace }}/artifacts/corpus/files
       CORPUS_REPORT: ${{ github.workspace }}/artifacts/corpus/report
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@v6
         with:
           dotnet-version: 10.0.x
 
@@ -78,7 +78,7 @@ jobs:
         run: |
           if [ -f "$CORPUS_REPORT/report.md" ]; then cat "$CORPUS_REPORT/report.md" >> "$GITHUB_STEP_SUMMARY"; fi
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: corpus-report
@@ -106,9 +106,9 @@ jobs:
       CORPUS_CACHE: ${{ github.workspace }}/artifacts/corpus/files
       COMPARE_REPORT: ${{ github.workspace }}/artifacts/compare
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@v6
         with:
           dotnet-version: 10.0.x
 
@@ -143,7 +143,7 @@ jobs:
         run: |
           if [ -f "$COMPARE_REPORT/compare.md" ]; then cat "$COMPARE_REPORT/compare.md" >> "$GITHUB_STEP_SUMMARY"; fi
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: compare-report
@@ -166,7 +166,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       TAG: ${{ github.ref_name }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
