@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.2.0 (2026-11-10)
+## 1.2.0 (2026-11-12)
 
 - `PdfOptimizerOptions.MaxBilevelImageDpi` (`--max-bilevel-dpi`) gives bilevel images (raw, CCITT,
   JBIG2) their own downsampling resolution, in place of `MaxImageDpi`. Null keeps the old behavior.
