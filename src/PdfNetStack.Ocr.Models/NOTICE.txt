@@ -22,5 +22,5 @@ The SHA-256 of each file is pinned in PdfNetStack.Ocr (OnnxOcrEngine.ModelHashes
 the package is built and again when the models are loaded.
 
 build/PdfNetStack.Ocr.Models.targets is part of PdfNetStack
-(https://github.com/jams4code/pdf.netstack), Copyright (c) 2026 Jamal Abdelkhalek and PdfNetStack
+(https://github.com/JADEV-CORP/pdf.netstack), Copyright (c) 2026 Jamal Abdelkhalek and PdfNetStack
 contributors, MIT License.

@@ -19,7 +19,7 @@ jobs:
   analysis:
     name: Scorecard analysis
     # Scorecard does not run on forks.
-    if: github.repository == 'jams4code/pdf.netstack'
+    if: github.repository == 'JADEV-CORP/pdf.netstack'
     runs-on: ubuntu-latest
     permissions:
       contents: read

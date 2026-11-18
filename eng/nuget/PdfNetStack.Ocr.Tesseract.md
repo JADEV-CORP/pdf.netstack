@@ -69,9 +69,9 @@ output is parsed as untrusted text, and boxes are clamped to the image.
 
 ## Links
 
-- Project and documentation: https://github.com/jams4code/pdf.netstack
-- Choosing an engine: https://github.com/jams4code/pdf.netstack/blob/main/docs/OCR.md
-- Changelog: https://github.com/jams4code/pdf.netstack/blob/main/CHANGELOG.md
+- Project and documentation: https://github.com/JADEV-CORP/pdf.netstack
+- Choosing an engine: https://github.com/JADEV-CORP/pdf.netstack/blob/main/docs/OCR.md
+- Changelog: https://github.com/JADEV-CORP/pdf.netstack/blob/main/CHANGELOG.md
 
 By Jamal Abdelkhalek, [JADEV](https://jadev-corp.com). MIT license. Tesseract is Apache-2.0 and is
 not distributed with this package.

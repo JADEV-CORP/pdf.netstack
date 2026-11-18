@@ -5,7 +5,7 @@ survive, and every output is proved equivalent to its input before you get it. M
 it is also a home for code leaving PDFsharp now that 6.5.0 is AGPL-3.0. No native binaries, no
 dependencies on .NET 8 and later.
 
-[![CI](https://github.com/jams4code/pdf.netstack/actions/workflows/ci.yml/badge.svg)](https://github.com/jams4code/pdf.netstack/actions/workflows/ci.yml)
+[![CI](https://github.com/JADEV-CORP/pdf.netstack/actions/workflows/ci.yml/badge.svg)](https://github.com/JADEV-CORP/pdf.netstack/actions/workflows/ci.yml)
 [![NuGet](https://img.shields.io/nuget/v/PdfNetStack.svg)](https://www.nuget.org/packages/PdfNetStack)
 [![NuGet downloads](https://img.shields.io/nuget/dt/PdfNetStack.svg)](https://www.nuget.org/packages/PdfNetStack)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -133,7 +133,7 @@ dotnet add package PdfNetStack.Ocr.Tesseract  # OCR with an installed Tesseract
 ```
 
 The command line tool also comes as a single native executable, with no .NET install needed:
-each [GitHub release](https://github.com/jams4code/pdf.netstack/releases) carries
+each [GitHub release](https://github.com/JADEV-CORP/pdf.netstack/releases) carries
 `pdfnetstack-<version>-<platform>` for linux-x64, linux-arm64, win-x64, osx-x64 and osx-arm64,
 compiled ahead of time, with their SHA-256 checksums in `SHA256SUMS.txt`.
 

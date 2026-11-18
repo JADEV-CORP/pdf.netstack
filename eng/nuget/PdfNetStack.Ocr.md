@@ -84,8 +84,8 @@ run time. ONNX Runtime's telemetry is turned off before the first model loads.
 
 ## Links
 
-- Project and documentation: https://github.com/jams4code/pdf.netstack
-- OCR design notes: https://github.com/jams4code/pdf.netstack/blob/main/docs/OCR.md
-- Changelog: https://github.com/jams4code/pdf.netstack/blob/main/CHANGELOG.md
+- Project and documentation: https://github.com/JADEV-CORP/pdf.netstack
+- OCR design notes: https://github.com/JADEV-CORP/pdf.netstack/blob/main/docs/OCR.md
+- Changelog: https://github.com/JADEV-CORP/pdf.netstack/blob/main/CHANGELOG.md
 
 By Jamal Abdelkhalek, [JADEV](https://jadev-corp.com). MIT license. Depends on ONNX Runtime (MIT).
