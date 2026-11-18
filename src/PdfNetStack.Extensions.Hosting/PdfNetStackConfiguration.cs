@@ -53,6 +53,8 @@ internal static class PdfNetStackConfiguration
         [nameof(PdfOptimizerOptions.RemovePageThumbnails)] = (o, v, p) => o with { RemovePageThumbnails = Bool(v, p) },
         [nameof(PdfOptimizerOptions.RemovePieceInfo)] = (o, v, p) => o with { RemovePieceInfo = Bool(v, p) },
         [nameof(PdfOptimizerOptions.RemoveUsageRights)] = (o, v, p) => o with { RemoveUsageRights = Bool(v, p) },
+        [nameof(PdfOptimizerOptions.OptimizeEncryptedFiles)] = (o, v, p) => o with { OptimizeEncryptedFiles = Bool(v, p) },
+        [nameof(PdfOptimizerOptions.Password)] = (o, v, p) => o with { Password = v },
         [nameof(PdfOptimizerOptions.MaxDegreeOfParallelism)] = (o, v, p) => o with { MaxDegreeOfParallelism = Int(v, p) },
     };
 
