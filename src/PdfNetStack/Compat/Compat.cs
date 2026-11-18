@@ -293,6 +293,92 @@ internal static class Compat
 #endif
     }
 
+    /// <summary>
+    /// Compresses into the zlib format what <paramref name="write"/> writes to the stream it is
+    /// given, as it is written, so the data never has to be held whole.
+    /// </summary>
+    public static void ZlibCompress(Stream output, Action<Stream> write, CompressionLevel level)
+    {
+#if NET8_0_OR_GREATER
+        using var z = new ZLibStream(output, level, leaveOpen: true);
+        write(z);
+#else
+        output.WriteByte(0x78);
+        output.WriteByte(level == CompressionLevel.Fastest ? (byte)0x01 : (byte)0xDA);
+        uint adler;
+        using (var d = new DeflateStream(output, level, leaveOpen: true))
+        using (var checksum = new Adler32Stream(d))
+        {
+            write(checksum);
+            adler = checksum.Value;
+        }
+
+        output.WriteByte((byte)(adler >> 24));
+        output.WriteByte((byte)(adler >> 16));
+        output.WriteByte((byte)(adler >> 8));
+        output.WriteByte((byte)adler);
+#endif
+    }
+
+#if !NET8_0_OR_GREATER
+    /// <summary>Passes writes on to a deflater and keeps their Adler-32, for the zlib trailer.</summary>
+    private sealed class Adler32Stream(Stream inner) : Stream
+    {
+        private uint _a = 1, _b;
+
+        public uint Value => (_b << 16) | _a;
+
+        public override bool CanRead => false;
+
+        public override bool CanSeek => false;
+
+        public override bool CanWrite => true;
+
+        public override long Length => throw new NotSupportedException();
+
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+
+        public override void Write(byte[] buffer, int offset, int count)
+        {
+            for (int i = offset; i < offset + count; i++)
+            {
+                _a = (_a + buffer[i]) % 65521;
+                _b = (_b + _a) % 65521;
+            }
+
+            inner.Write(buffer, offset, count);
+        }
+
+        public override void Flush() => inner.Flush();
+
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+
+        public override void SetLength(long value) => throw new NotSupportedException();
+    }
+#endif
+
+    /// <summary>Writes <paramref name="data"/> to <paramref name="output"/> asynchronously, without copying it where the framework allows.</summary>
+    public static Task WriteAsync(Stream output, ReadOnlyMemory<byte> data, CancellationToken ct)
+    {
+#if NET8_0_OR_GREATER
+        return output.WriteAsync(data, ct).AsTask();
+#else
+        if (System.Runtime.InteropServices.MemoryMarshal.TryGetArray(data, out ArraySegment<byte> segment))
+        {
+            return output.WriteAsync(segment.Array!, segment.Offset, segment.Count, ct);
+        }
+
+        byte[] copy = data.ToArray();
+        return output.WriteAsync(copy, 0, copy.Length, ct);
+#endif
+    }
+
     // ---------------------------------------------------------------- files
 
     public static void MoveOverwrite(string source, string destination)

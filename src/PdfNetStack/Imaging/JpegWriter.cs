@@ -27,7 +27,7 @@ internal static class JpegWriter
     {
         byte[]? sequential = TryWrite(image, capacityHint);
         if (sequential is null || !allowProgressive) return sequential;
-        byte[]? progressive = TryWriteProgressive(image, sequential.Length);
+        byte[]? progressive = TryWriteProgressive(image, sequential.Length, sequentialFits: true);
         return progressive is not null && progressive.Length < sequential.Length ? progressive : sequential;
     }
 
@@ -81,8 +81,9 @@ internal static class JpegWriter
     /// Writes the image as a progressive JPEG with successive approximation, using the scan script
     /// libjpeg's simple progression uses (ITU T.81 G.1). Every scan gets its own optimal tables.
     /// </summary>
+    /// <param name="sequentialFits">The image was just written sequentially, so its coefficients are known to fit.</param>
     /// <returns>The encoded JPEG, or null when the tables or coefficients do not fit progressive 8 bit coding.</returns>
-    public static byte[]? TryWriteProgressive(JpegImage image, int capacityHint)
+    public static byte[]? TryWriteProgressive(JpegImage image, int capacityHint, bool sequentialFits = false)
     {
         JpegComponent[] components = image.Components;
         (List<ushort[]> tables, int[] tableOf, int[] classOf, int blocksPerMcu) = Layout(image);
@@ -90,7 +91,7 @@ internal static class JpegWriter
 
         // The coefficients must fit the sequential limits, which also bound every progressive symbol.
         var check = new Statistics(2);
-        if (!EncodeScans(image, interleaved: false, classOf, ref check)) return null;
+        if (!sequentialFits && !EncodeScans(image, interleaved: false, classOf, ref check)) return null;
 
         using var output = new ByteWriter(Math.Max(1024, capacityHint));
         WriteHeaders(output, image, tables, tableOf, 0xC2);
@@ -250,20 +251,31 @@ internal static class JpegWriter
         {
             Span<int> predictors = stackalloc int[4];
             predictors.Clear();
-            foreach ((JpegComponent c, int index, int row, int column) in Blocks(image, components))
+            if (components.Length == 1)
             {
-                int value = c.Block(row, column)[0] >> scan.Low;
-                if (scan.High > 0)
+                JpegComponent c = components[0];
+                for (int row = 0; row < c.BlocksPerColumn; row++)
                 {
-                    sink.Bits(value & 1, 1);
-                    continue;
+                    for (int column = 0; column < c.BlocksPerLine; column++) DcBit(c.Block(row, column)[0], 0, scan, classOf, predictors, ref sink);
                 }
 
-                int difference = value - predictors[index];
-                predictors[index] = value;
-                int size = BitLength(difference < 0 ? -difference : difference);
-                sink.Dc(classOf[index], size);
-                if (size > 0) sink.Bits(difference < 0 ? difference - 1 : difference, size);
+                return;
+            }
+
+            // Interleaved: MCU by MCU, the order of a sequential scan.
+            for (int mcuRow = 0; mcuRow < image.McusPerColumn; mcuRow++)
+            {
+                for (int mcuColumn = 0; mcuColumn < image.McusPerLine; mcuColumn++)
+                {
+                    for (int j = 0; j < components.Length; j++)
+                    {
+                        JpegComponent c = components[j];
+                        for (int v = 0; v < c.Vertical; v++)
+                        {
+                            for (int h = 0; h < c.Horizontal; h++) DcBit(c.Block((mcuRow * c.Vertical) + v, (mcuColumn * c.Horizontal) + h)[0], j, scan, classOf, predictors, ref sink);
+                        }
+                    }
+                }
             }
 
             return;
@@ -284,34 +296,23 @@ internal static class JpegWriter
         EmitEobRun(ref state, ref sink);
     }
 
-    /// <summary>Blocks of a scan in coding order: MCU by MCU when interleaved, else the component's own blocks row by row.</summary>
-    private static IEnumerable<(JpegComponent Component, int Index, int Row, int Column)> Blocks(JpegImage image, JpegComponent[] components)
+    /// <summary>One block's DC coefficient in a DC scan: its first pass difference, or its refinement bit.</summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private static void DcBit<TSink>(short coefficient, int index, ProgressiveScan scan, int[] classOf, Span<int> predictors, ref TSink sink)
+        where TSink : struct, IEntropySink
     {
-        if (components.Length == 1)
+        int value = coefficient >> scan.Low;
+        if (scan.High > 0)
         {
-            JpegComponent c = components[0];
-            for (int row = 0; row < c.BlocksPerColumn; row++)
-            {
-                for (int column = 0; column < c.BlocksPerLine; column++) yield return (c, 0, row, column);
-            }
-
-            yield break;
+            sink.Bits(value & 1, 1);
+            return;
         }
 
-        for (int mcuRow = 0; mcuRow < image.McusPerColumn; mcuRow++)
-        {
-            for (int mcuColumn = 0; mcuColumn < image.McusPerLine; mcuColumn++)
-            {
-                for (int j = 0; j < components.Length; j++)
-                {
-                    JpegComponent c = components[j];
-                    for (int v = 0; v < c.Vertical; v++)
-                    {
-                        for (int h = 0; h < c.Horizontal; h++) yield return (c, j, (mcuRow * c.Vertical) + v, (mcuColumn * c.Horizontal) + h);
-                    }
-                }
-            }
-        }
+        int difference = value - predictors[index];
+        predictors[index] = value;
+        int size = BitLength(difference < 0 ? -difference : difference);
+        sink.Dc(classOf[index], size);
+        if (size > 0) sink.Bits(difference < 0 ? difference - 1 : difference, size);
     }
 
     /// <summary>The end-of-band run and the correction bits that wait for it, carried from block to block.</summary>

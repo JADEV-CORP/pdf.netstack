@@ -110,7 +110,8 @@ public sealed record PdfOptimizerOptions
 
     /// <summary>
     /// Merge identical fonts, images and other resources. Streams are compared by what they decode
-    /// to, so copies encoded differently merge too. Default true.
+    /// to, so copies encoded differently merge too, and so do images and forms that differ only by
+    /// the /Name entry readers have ignored since PDF 1.0. Default true.
     /// </summary>
     public bool DeduplicateObjects { get; init; } = true;
 
@@ -244,10 +245,13 @@ public sealed record PdfOptimizerOptions
     /// <summary>
     /// Also write JPEG images progressively (spectral selection and successive approximation, as
     /// libjpeg's default progression) and keep that coding when it is smaller than optimized
-    /// sequential coding. Applies to every JPEG the optimizer writes, lossless or not. The decoded
-    /// image is the same either way. Default false. Requires <see cref="RecompressStreams"/>.
+    /// sequential coding, as it is for most photographs. Applies to every JPEG the optimizer
+    /// writes, lossless or not. The decoded image is the same either way, and the proof compares
+    /// DCT coefficients. Progressive JPEG needs PDF 1.3, so output that stays at an earlier version
+    /// gets sequential coding only; arithmetic coding, which some readers lack, is never used.
+    /// Has no effect without <see cref="RecompressStreams"/>. Default true.
     /// </summary>
-    public bool ProgressiveJpeg { get; init; }
+    public bool ProgressiveJpeg { get; init; } = true;
 
     /// <summary>
     /// Re-read the candidate and prove it equivalent to the source before returning it.
@@ -302,6 +306,13 @@ public sealed record PdfOptimizerOptions
     /// writes the input). <see cref="MaxInputBytes"/> applies as well. Default <see cref="PdfLimits.Default"/>.
     /// </summary>
     public PdfLimits Limits { get; init; } = PdfLimits.Default;
+
+    /// <summary>
+    /// Leave every unfiltered metadata stream unfiltered, not only in PDF/A-1. Set when a document
+    /// is saved as PDF/A, whose XMP packet the archive writer leaves uncompressed on purpose so
+    /// archival tools read it without decoding.
+    /// </summary>
+    internal bool KeepMetadataUnfiltered { get; init; }
 
     /// <summary>True when some option may change images lossily.</summary>
     internal bool IsLossy => JpegQuality is not null || MaxImageDpi is not null || MaxBilevelImageDpi is not null || ConvertImagesToJpeg || QuantizeImages;
@@ -363,7 +374,6 @@ public sealed record PdfOptimizerOptions
         if (MaxImageDpi is not null && !RecompressStreams) throw new ArgumentException("MaxImageDpi needs RecompressStreams enabled.", nameof(MaxImageDpi));
         if (MaxBilevelImageDpi is not null && !RecompressStreams) throw new ArgumentException("MaxBilevelImageDpi needs RecompressStreams enabled.", nameof(MaxBilevelImageDpi));
         if (QuantizeImages && !RecompressStreams) throw new ArgumentException("QuantizeImages needs RecompressStreams enabled.", nameof(QuantizeImages));
-        if (ProgressiveJpeg && !RecompressStreams) throw new ArgumentException("ProgressiveJpeg needs RecompressStreams enabled.", nameof(ProgressiveJpeg));
         if (ConvertImagesToJpeg && (JpegQuality is null || !RecompressStreams))
         {
             throw new ArgumentException("ConvertImagesToJpeg needs JpegQuality set and RecompressStreams enabled.", nameof(ConvertImagesToJpeg));

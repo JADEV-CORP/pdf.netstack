@@ -70,7 +70,8 @@ namespace PdfNetStack.Cli
               --min-ssim <0-1>          Perceptual gate: keep any image whose lossy change
                                         falls below this SSIM; verify: accept downsampled
                                         and converted images that meet it
-              --progressive             Write JPEG progressively when that is smaller
+              --sequential              Write JPEG sequentially only; by default an image is
+                                        written progressively when that is smaller
               --no-verify               Skip the equivalence proof (not recommended)
               --allow-incremental       Flatten files with incremental updates
               --allow-repaired          Rewrite damaged files that needed repair
@@ -570,6 +571,7 @@ namespace PdfNetStack.Cli
                     case "--preset": o = Preset(o, Value(args, ref i)); break;
                     case "--min-ssim": o = o with { MinImageSsim = double.Parse(Value(args, ref i), CultureInfo.InvariantCulture) }; break;
                     case "--progressive": o = o with { ProgressiveJpeg = true }; break;
+                    case "--sequential": o = o with { ProgressiveJpeg = false }; break;
                     case "--no-verify": o = o with { Verify = false }; break;
                     case "--allow-incremental": o = o with { AllowIncrementalUpdates = true }; break;
                     case "--allow-repaired": o = o with { AllowRepairedFiles = true }; break;
