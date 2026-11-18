@@ -1,3 +1,4 @@
+using System.Buffers;
 using PdfNetStack.Objects;
 using PdfNetStack.Parsing;
 using PdfNetStack.Writing;
@@ -136,27 +137,69 @@ internal static class ContentCompactor
         }
     }
 
+    /// <summary>
+    /// Writes a token in its shortest form. Values are canonicalized straight from the content's
+    /// bytes: a page holds thousands of numbers, names and strings, and none needs an object.
+    /// </summary>
     private static void Emit(ByteSink sink, Token t, ReadOnlySpan<byte> raw)
     {
         switch (t.Kind)
         {
             case TokenKind.Number:
-                WriteToken(sink, PdfNumber.Parse(raw).Text, regular: true);
+            {
+                Span<byte> text = raw.Length <= StackLimit ? stackalloc byte[raw.Length] : new byte[raw.Length];
+                WriteToken(sink, text[..PdfNumber.Canonicalize(raw, text, out _, out _)], regular: true);
                 break;
+            }
+
             case TokenKind.Name:
+            {
                 // A name starts with a delimiter, so it never needs a separator in front.
-                PdfSerializer.WriteName(sink, PdfParser.DecodeName(raw[1..]));
+                Span<byte> name = raw.Length <= StackLimit ? stackalloc byte[raw.Length] : new byte[raw.Length];
+                WriteName(sink, name[..PdfParser.DecodeName(raw[1..], name)]);
                 break;
-            case TokenKind.LiteralString:
-                PdfSerializer.WriteString(sink, PdfParser.DecodeLiteralString(raw[1..]));
+            }
+
+            case TokenKind.LiteralString or TokenKind.HexString:
+            {
+                byte[]? rented = null;
+                Span<byte> value = raw.Length <= StackLimit ? stackalloc byte[raw.Length] : (rented = ArrayPool<byte>.Shared.Rent(raw.Length));
+                PdfSerializer.WriteString(sink, value[..DecodeString(t.Kind, raw, value)]);
+                if (rented is not null) ArrayPool<byte>.Shared.Return(rented);
                 break;
-            case TokenKind.HexString:
-                PdfSerializer.WriteString(sink, PdfParser.DecodeHexString(raw[1..]));
-                break;
+            }
+
             default:
                 WriteToken(sink, raw, regular: t.Kind == TokenKind.Keyword);
                 break;
         }
+    }
+
+    /// <summary>Tokens up to this length are canonicalized on the stack.</summary>
+    private const int StackLimit = 256;
+
+    private static int DecodeString(TokenKind kind, ReadOnlySpan<byte> raw, Span<byte> value) =>
+        kind == TokenKind.LiteralString ? PdfParser.DecodeLiteralString(raw[1..], value) : PdfParser.DecodeHexString(raw[1..], value);
+
+    /// <summary>A decoded name with minimal escaping, byte for byte as <see cref="PdfSerializer.WriteName"/> writes its string.</summary>
+    private static void WriteName(ByteSink sink, ReadOnlySpan<byte> name)
+    {
+        sink.Write((byte)'/');
+        foreach (byte b in name)
+        {
+            if (b is > 0x20 and < 0x7F && b != (byte)'#' && PdfSyntax.IsRegular(b))
+            {
+                sink.Write(b);
+            }
+            else
+            {
+                sink.Write((byte)'#');
+                sink.Write(HexDigit(b >> 4));
+                sink.Write(HexDigit(b & 0xF));
+            }
+        }
+
+        static byte HexDigit(int v) => (byte)(v < 10 ? '0' + v : 'A' + v - 10);
     }
 
     private static void WriteToken(ByteSink sink, ReadOnlySpan<byte> token, bool regular)
@@ -259,27 +302,39 @@ internal static class ContentCompactor
         }
     }
 
+    /// <summary>Equal by value, as <see cref="Emit"/> writes them; compared on the content's bytes, without objects.</summary>
     private static bool SameToken(TokenKind ka, ReadOnlySpan<byte> a, TokenKind kb, ReadOnlySpan<byte> b)
     {
         bool stringA = ka is TokenKind.LiteralString or TokenKind.HexString;
         bool stringB = kb is TokenKind.LiteralString or TokenKind.HexString;
-        if (stringA || stringB) return stringA && stringB && Decode(ka, a).AsSpan().SequenceEqual(Decode(kb, b));
+        if (stringA || stringB) return stringA && stringB && Same(ka, a, kb, b, DecodeString);
         if (ka != kb) return false;
         return ka switch
         {
-            TokenKind.Number => PdfNumber.Parse(a).Text.AsSpan().SequenceEqual(PdfNumber.Parse(b).Text),
-            TokenKind.Name => PdfParser.DecodeName(a[1..]) == PdfParser.DecodeName(b[1..]),
+            TokenKind.Number => Same(ka, a, kb, b, static (_, raw, text) => PdfNumber.Canonicalize(raw, text, out bool _, out long _)),
+            TokenKind.Name => Same(ka, a, kb, b, static (_, raw, text) => PdfParser.DecodeName(raw[1..], text)),
             TokenKind.Keyword => a.SequenceEqual(b),
             _ => true,
         };
+    }
 
-        static byte[] Decode(TokenKind kind, ReadOnlySpan<byte> raw) =>
-            kind == TokenKind.LiteralString ? PdfParser.DecodeLiteralString(raw[1..]) : PdfParser.DecodeHexString(raw[1..]);
+    private delegate int Decoder(TokenKind kind, ReadOnlySpan<byte> raw, Span<byte> value);
+
+    /// <summary>Decodes both tokens, each into room of its own length, and compares the results.</summary>
+    private static bool Same(TokenKind ka, ReadOnlySpan<byte> a, TokenKind kb, ReadOnlySpan<byte> b, Decoder decode)
+    {
+        byte[]? rentedA = null, rentedB = null;
+        Span<byte> va = a.Length <= StackLimit ? stackalloc byte[a.Length] : (rentedA = ArrayPool<byte>.Shared.Rent(a.Length));
+        Span<byte> vb = b.Length <= StackLimit ? stackalloc byte[b.Length] : (rentedB = ArrayPool<byte>.Shared.Rent(b.Length));
+        bool same = va[..decode(ka, a, va)].SequenceEqual(vb[..decode(kb, b, vb)]);
+        if (rentedA is not null) ArrayPool<byte>.Shared.Return(rentedA);
+        if (rentedB is not null) ArrayPool<byte>.Shared.Return(rentedB);
+        return same;
     }
 
     private static bool SameValue(PdfObject a, PdfObject b) => (a, b) switch
     {
-        (PdfNumber x, PdfNumber y) => x.Text.AsSpan().SequenceEqual(y.Text),
+        (PdfNumber x, PdfNumber y) => x.SameValue(y),
         (PdfName x, PdfName y) => x.Value == y.Value,
         (PdfString x, PdfString y) => x.Value.AsSpan().SequenceEqual(y.Value),
         (PdfBoolean x, PdfBoolean y) => x.Value == y.Value,

@@ -9,7 +9,8 @@ namespace PdfNetStack.Optimization;
 /// <summary>
 /// Proves that two PDFs describe the same document: walks both object graphs in lockstep from
 /// the trailer and compares every reachable value. Streams are compared by decoded content, so
-/// a different compression of the same bytes is equal, while any change to page content, fonts,
+/// a different compression of the same bytes is equal (and bytes carried over under the same
+/// filters are equal without being decoded), while any change to page content, fonts,
 /// images, annotations, metadata or structure is reported with its path. JPEG data is compared
 /// by DCT coefficients, so a re-encoding of the same image is equal too, and bilevel images by
 /// their pixels, so samples or Group 3 data coded again as Group 4 are equal. Lossy image changes are
@@ -38,11 +39,27 @@ internal sealed class EquivalenceVerifier
     private readonly Dictionary<string, HashSet<int>> _newTags = new(StringComparer.Ordinal);
     private readonly Lazy<HashSet<int>> _type1Programs;
     private readonly HashSet<int> _converted = [];
+
+    // Set by the analysis, maybe on its own thread; read only once the analysis is in.
     private List<int> _sourceOrder = [];
+
+    // The analysis of the source, run on a thread of its own while the walk goes on, when the
+    // rules let any difference depend on it; null otherwise, and it then runs only if asked for.
+    private readonly Task<ContentAnalysis?>? _background;
+    private readonly CancellationTokenSource? _backgroundStop;
+
+    // Resource entries missing from the output, to be proven unused once the analysis is in,
+    // in walk order: each with where the walk was, to compare it as the walk would have.
+    private readonly List<PruneCheck> _pruned = [];
     private readonly HashSet<(int, int)> _visited = new();
     private readonly Dictionary<int, int> _aToB = new();
     private readonly Dictionary<int, int> _bToA = new();
-    private readonly Queue<(int A, int B, string Path)> _pending = new();
+    private readonly Queue<(int A, int B, PathNode Path)> _pending = new();
+
+    // Where the walk is: the object being compared and the keys and indexes from it down to the
+    // value at hand. A path is only rendered when a difference is reported.
+    private readonly List<Segment> _segments = [];
+    private PathNode _node = PathNode.Trailer;
     private readonly List<StreamJob> _streams = new();
     private readonly Dictionary<(bool, int), byte[]?> _globals = new();
 
@@ -55,8 +72,19 @@ internal sealed class EquivalenceVerifier
         _decodeLimit = decodeLimit;
         _allowance = rules.Images;
 
-        // The source is analysed only once a difference needs it; most comparisons never do.
-        _analysis = new Lazy<ContentAnalysis?>(() => Analyze(ct));
+        // The walk reads the source on this thread and the analysis reads it on another: both
+        // only read, and the file parses objects under its own lock. Without a rule that needs
+        // it, the source is analysed only once a difference asks for it.
+        if (rules.AllowResourcePruning || rules.AllowContentCompaction || rules.AllowFontMerging || rules.AllowFontSubsetting || rules.AllowFontConversion)
+        {
+            _backgroundStop = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            CancellationToken stop = _backgroundStop.Token;
+            // A thread of its own: workers that need the result wait for it, and must not also
+            // keep it from starting on a busy pool.
+            _background = Task.Factory.StartNew(() => Analyze(stop), stop, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        }
+
+        _analysis = new Lazy<ContentAnalysis?>(() => _background is { } background ? background.GetAwaiter().GetResult() : Analyze(ct));
         _fontPrograms = new Lazy<Dictionary<int, HashSet<int>>>(() =>
             _analysis.Value is { } analysis ? FontProgramMerger.MergeablePrograms(_a, analysis, _decodeLimit) : new Dictionary<int, HashSet<int>>());
 
@@ -84,9 +112,12 @@ internal sealed class EquivalenceVerifier
         }
     }
 
+    /// <param name="Node">The object the stream was reached in; with <paramref name="Relative"/>, its path.</param>
     /// <param name="Images">Source and output geometry, set when the image may have been resampled.</param>
-    private sealed record StreamJob(PdfStream A, PdfStream B, int NumberA, string Path, List<FilterSpec>? FiltersA, List<FilterSpec>? FiltersB, (ImageGeometry A, ImageGeometry B)? Images)
+    private sealed record StreamJob(PdfStream A, PdfStream B, int NumberA, PathNode Node, string Relative, List<FilterSpec>? FiltersA, List<FilterSpec>? FiltersB, (ImageGeometry A, ImageGeometry B)? Images)
     {
+        public string Path => Node.Render() + Relative;
+
         /// <summary>Set for a bilevel image whose output is CCITT data, to be compared by pixels.</summary>
         public BilevelJob? Bilevel { get; init; }
 
@@ -110,29 +141,59 @@ internal sealed class EquivalenceVerifier
     public static string? Verify(PdfFile source, PdfFile output, VerificationRules rules, long decodeLimit, int parallelism, CancellationToken ct, out int objectsCompared)
     {
         var v = new EquivalenceVerifier(source, output, rules, decodeLimit, ct);
-        string? difference = v.Run(parallelism, ct);
-        objectsCompared = v.ObjectsCompared;
-        return difference;
+        try
+        {
+            string? difference = v.Run(parallelism, ct);
+            objectsCompared = v.ObjectsCompared;
+            return difference;
+        }
+        finally
+        {
+            v.StopBackground();
+        }
+    }
+
+    /// <summary>Ends the background analysis when the walk ended without it, and waits for it to leave the files.</summary>
+    private void StopBackground()
+    {
+        if (_background is null) return;
+        _backgroundStop!.Cancel();
+        try
+        {
+            _background.Wait();
+        }
+        catch (AggregateException)
+        {
+            // Its failure, if it mattered, was thrown where its result was asked for.
+        }
+
+        _backgroundStop.Dispose();
     }
 
     private string? Run(int parallelism, CancellationToken ct)
     {
         foreach (string key in new[] { "Root", "Info", "ID" })
         {
-            string? d = Compare(_a.Trailer[key], _b.Trailer[key], "trailer/" + key, 0);
-            if (d is not null) return d;
+            string? d = CompareAt(key, _a.Trailer[key], _b.Trailer[key], 0);
+            if (d is not null) return FirstPrunedDifference() ?? d;
         }
 
         int n = 0;
         while (_pending.Count > 0)
         {
             if ((++n & 1023) == 0) ct.ThrowIfCancellationRequested();
-            (int a, int b, string path) = _pending.Dequeue();
+            (int a, int b, PathNode path) = _pending.Dequeue();
+            _node = path;
+            _segments.Clear();
             ObjectsCompared++;
-            string? d = CompareResolved(_a.GetObject(a), _b.GetObject(b), path, 0, a);
-            if (d is not null) return d;
+            string? d = CompareResolved(_a.GetObject(a), _b.GetObject(b), 0, a);
+            if (d is not null) return FirstPrunedDifference() ?? d;
         }
 
+        // Entries the walk let go missing were decided in the walk before; then the new subset
+        // tags, and only then anything the stream data can show.
+        string? pruned = FirstPrunedDifference();
+        if (pruned is not null) return pruned;
         if (CheckNewTags() is { } tagDifference) return tagDifference;
 
         // Filter parameters were resolved during the walk; stream content is compared in parallel.
@@ -154,9 +215,79 @@ internal sealed class EquivalenceVerifier
 
     private const int MaxPathLength = 256;
 
-    private string? Compare(PdfObject? a, PdfObject? b, string path, int depth)
+    /// <summary>One step down from the object being compared: a dictionary key, or an array index when the key is null.</summary>
+    private readonly record struct Segment(string? Key, int Index);
+
+    /// <summary>
+    /// An object queued for comparison and how the walk reached it: the path of the object that
+    /// referred to it and the steps from there. Rendering it gives the path the walk used to
+    /// build eagerly for every value it compared.
+    /// </summary>
+    private sealed class PathNode(PathNode? parent, string relative, int number)
     {
-        if (depth > PdfParser.MaxNesting) return path + ": nesting too deep to verify";
+        public static readonly PathNode Trailer = new(null, "trailer", -1);
+
+        public string Render()
+        {
+            var chain = new List<PathNode>();
+            for (PathNode? n = this; n is not null; n = n.Parent) chain.Add(n);
+            string path = "";
+            for (int i = chain.Count - 1; i >= 0; i--)
+            {
+                PathNode n = chain[i];
+                string full = path + n.Relative;
+
+                // A path names where a difference is; past a few hundred characters, as down a
+                // page tree nested thousands deep, the object's number names it as well.
+                path = n.Number < 0 || full.Length <= MaxPathLength ? full : Compat.Format("object {0}", n.Number);
+            }
+
+            return path;
+        }
+
+        private PathNode? Parent { get; } = parent;
+
+        private string Relative { get; } = relative;
+
+        private int Number { get; } = number;
+    }
+
+    /// <summary>The steps below the object being compared, as the path writes them.</summary>
+    private string Steps()
+    {
+        if (_segments.Count == 0) return "";
+        var sb = new System.Text.StringBuilder();
+        foreach (Segment segment in _segments)
+        {
+            if (segment.Key is { } key) sb.Append('/').Append(key);
+            else sb.Append('[').Append(segment.Index.ToString(System.Globalization.CultureInfo.InvariantCulture)).Append(']');
+        }
+
+        return sb.ToString();
+    }
+
+    /// <summary>The path of the value being compared, for a difference report.</summary>
+    private string Here() => _node.Render() + Steps();
+
+    private string? CompareAt(string key, PdfObject? a, PdfObject? b, int depth)
+    {
+        _segments.Add(new Segment(key, 0));
+        string? d = Compare(a, b, depth);
+        _segments.RemoveAt(_segments.Count - 1);
+        return d;
+    }
+
+    private string? CompareAt(int index, PdfObject? a, PdfObject? b, int depth)
+    {
+        _segments.Add(new Segment(null, index));
+        string? d = Compare(a, b, depth);
+        _segments.RemoveAt(_segments.Count - 1);
+        return d;
+    }
+
+    private string? Compare(PdfObject? a, PdfObject? b, int depth)
+    {
+        if (depth > PdfParser.MaxNesting) return Here() + ": nesting too deep to verify";
 
         if (a is PdfReference ra && b is PdfReference rb)
         {
@@ -164,33 +295,28 @@ internal sealed class EquivalenceVerifier
             bool bExists = _b.Exists(rb.Number) && _b.GetObject(rb.Number) is not PdfNull;
             if (!aExists || !bExists)
             {
-                return aExists == bExists ? null : path + ": reference resolves differently";
+                return aExists == bExists ? null : Here() + ": reference resolves differently";
             }
 
             // Object identity: one source object must always land on the same output object, and
             // two source objects may share an output object only when merging them is harmless.
             if (_aToB.TryGetValue(ra.Number, out int mappedB) && mappedB != rb.Number)
             {
-                return path + ": one source object maps to two output objects";
+                return Here() + ": one source object maps to two output objects";
             }
 
             if (_bToA.TryGetValue(rb.Number, out int mappedA) && mappedA != ra.Number && !Mergeable(_b.GetObject(rb.Number)))
             {
-                return path + ": two distinct source objects were merged into one";
+                return Here() + ": two distinct source objects were merged into one";
             }
 
             _aToB[ra.Number] = rb.Number;
             _bToA.TryAdd(rb.Number, ra.Number);
-
-            // A path names where a difference is; past a few hundred characters, as down a page
-            // tree nested thousands deep, the object's number names it as well, and copying ever
-            // longer paths would cost the square of the depth.
-            string next = path.Length <= MaxPathLength ? path : Compat.Format("object {0}", ra.Number);
-            if (_visited.Add((ra.Number, rb.Number))) _pending.Enqueue((ra.Number, rb.Number, next));
+            if (_visited.Add((ra.Number, rb.Number))) _pending.Enqueue((ra.Number, rb.Number, new PathNode(_node, Steps(), ra.Number)));
             return null;
         }
 
-        return CompareResolved(_a.Resolve(a), _b.Resolve(b), path, depth);
+        return CompareResolved(_a.Resolve(a), _b.Resolve(b), depth);
     }
 
     private static bool Mergeable(PdfObject obj) => obj switch
@@ -201,7 +327,7 @@ internal sealed class EquivalenceVerifier
     };
 
     /// <param name="numberA">Object number of <paramref name="a"/> when it is an indirect object, else -1.</param>
-    private string? CompareResolved(PdfObject? a, PdfObject? b, string path, int depth, int numberA = -1)
+    private string? CompareResolved(PdfObject? a, PdfObject? b, int depth, int numberA = -1)
     {
         a ??= PdfNull.Instance;
         b ??= PdfNull.Instance;
@@ -209,22 +335,22 @@ internal sealed class EquivalenceVerifier
         switch (a)
         {
             case PdfNull:
-                return b is PdfNull ? null : path + ": null vs value";
+                return b is PdfNull ? null : Here() + ": null vs value";
             case PdfBoolean ab:
-                return b is PdfBoolean bb && ab.Value == bb.Value ? null : path + ": boolean differs";
+                return b is PdfBoolean bb && ab.Value == bb.Value ? null : Here() + ": boolean differs";
             case PdfNumber an:
-                return b is PdfNumber bn && an.Text.AsSpan().SequenceEqual(bn.Text) ? null : path + ": number differs";
+                return b is PdfNumber bn && an.SameValue(bn) ? null : Here() + ": number differs";
             case PdfName aName:
-                return b is PdfName bName && aName.Value == bName.Value ? null : path + ": name differs";
+                return b is PdfName bName && aName.Value == bName.Value ? null : Here() + ": name differs";
             case PdfString aStr:
-                return b is PdfString bStr && aStr.Value.AsSpan().SequenceEqual(bStr.Value) ? null : path + ": string differs";
+                return b is PdfString bStr && aStr.Value.AsSpan().SequenceEqual(bStr.Value) ? null : Here() + ": string differs";
             case PdfArray aArr:
             {
-                if (b is not PdfArray bArr) return path + ": array vs other";
-                if (aArr.Count != bArr.Count) return path + $": array length {aArr.Count} vs {bArr.Count}";
+                if (b is not PdfArray bArr) return Here() + ": array vs other";
+                if (aArr.Count != bArr.Count) return Here() + $": array length {aArr.Count} vs {bArr.Count}";
                 for (int i = 0; i < aArr.Count; i++)
                 {
-                    string? d = Compare(aArr[i], bArr[i], path + "[" + i + "]", depth + 1);
+                    string? d = CompareAt(i, aArr[i], bArr[i], depth + 1);
                     if (d is not null) return d;
                 }
 
@@ -232,10 +358,10 @@ internal sealed class EquivalenceVerifier
             }
 
             case PdfDictionary aDict:
-                return b is PdfDictionary bDict ? CompareDictionaries(aDict, bDict, path, depth, -1) : path + ": dictionary vs other";
+                return b is PdfDictionary bDict ? CompareDictionaries(aDict, bDict, depth, -1) : Here() + ": dictionary vs other";
             case PdfStream aStream:
             {
-                if (b is not PdfStream bStream) return path + ": stream vs other";
+                if (b is not PdfStream bStream) return Here() + ": stream vs other";
                 List<FilterSpec>? fa = SafeFilters(_a, aStream);
                 List<FilterSpec>? fb = SafeFilters(_b, bStream);
 
@@ -250,7 +376,7 @@ internal sealed class EquivalenceVerifier
                 {
                     // A soft mask with /Matte must keep its image's size (ISO 32000-1, 11.6.5.3).
                     bool resized = ga.Width != gb.Width || ga.Height != gb.Height;
-                    if (resized && LossyImages.HasMatteSoftMask(_b, bStream.Dictionary)) return path + ": image with a /Matte soft mask changed size";
+                    if (resized && LossyImages.HasMatteSoftMask(_b, bStream.Dictionary)) return Here() + ": image with a /Matte soft mask changed size";
 
                     // The lossy pass changes a bilevel image only by reducing it, and never writes
                     // JPEG 2000 or JBIG2: at the same size these must match exactly (bilevel images
@@ -262,13 +388,13 @@ internal sealed class EquivalenceVerifier
                 // A JPEG 2000 image may leave /BitsPerComponent to its data; samples or a JPEG made from it state 8.
                 bool bitsMayAppear = images is { Item1.Coding: ImageCoding.Jpx, Item2.Coding: not ImageCoding.Jpx };
                 bool palette = images is { Item2.Palette: not null };
-                string? d = CompareDictionaries(aStream.Dictionary, bStream.Dictionary, path, depth, numberA, isStream: true, sizeMayChange: images is not null, bitsMayAppear: bitsMayAppear, paletteAppears: palette);
+                string? d = CompareDictionaries(aStream.Dictionary, bStream.Dictionary, depth, numberA, isStream: true, sizeMayChange: images is not null, bitsMayAppear: bitsMayAppear, paletteAppears: palette);
                 if (d is not null) return d;
 
                 // A palette stands for samples in the source's own color space.
                 if (palette)
                 {
-                    d = Compare(aStream.Dictionary["ColorSpace"] ?? PdfNull.Instance, images!.Value.Item2.PaletteBase ?? PdfNull.Instance, path + "/ColorSpace", depth + 1);
+                    d = CompareAt("ColorSpace", aStream.Dictionary["ColorSpace"] ?? PdfNull.Instance, images!.Value.Item2.PaletteBase ?? PdfNull.Instance, depth + 1);
                     if (d is not null) return d;
                 }
 
@@ -285,11 +411,11 @@ internal sealed class EquivalenceVerifier
                     // Bilevel images coded again are compared by their pixels instead.
                     if (bilevel is null)
                     {
-                        if (ka.Count != kb.Count) return path + ": encoded filter chain differs";
+                        if (ka.Count != kb.Count) return Here() + ": encoded filter chain differs";
                         for (int i = 0; i < ka.Count; i++)
                         {
-                            if (ka[i].Name != kb[i].Name) return path + ": encoded filter differs";
-                            d = Compare(ka[i].Parms ?? PdfNull.Instance, kb[i].Parms ?? PdfNull.Instance, path + "/DecodeParms", depth + 1);
+                            if (ka[i].Name != kb[i].Name) return Here() + ": encoded filter differs";
+                            d = CompareAt("DecodeParms", ka[i].Parms ?? PdfNull.Instance, kb[i].Parms ?? PdfNull.Instance, depth + 1);
                             if (d is not null) return d;
                         }
                     }
@@ -299,12 +425,12 @@ internal sealed class EquivalenceVerifier
                     globals = (Globals(_a, fa, g.Item1), Globals(_b, fb, g.Item2));
                 }
 
-                _streams.Add(new StreamJob(aStream, bStream, numberA, path, fa, fb, images) { Bilevel = bilevel, Globals = globals, Type1AsCff = numberA >= 0 && _converted.Contains(numberA) });
+                _streams.Add(new StreamJob(aStream, bStream, numberA, _node, Steps(), fa, fb, images) { Bilevel = bilevel, Globals = globals, Type1AsCff = numberA >= 0 && _converted.Contains(numberA) });
                 return null;
             }
 
             default:
-                return path + ": unexpected object";
+                return Here() + ": unexpected object";
         }
     }
 
@@ -336,12 +462,12 @@ internal sealed class EquivalenceVerifier
     /// <param name="numberA">Object number of the source stream whose dictionary this is, else -1.</param>
     /// <param name="bitsMayAppear">/BitsPerComponent 8 may be in the output only.</param>
     /// <param name="paletteAppears">The output is the source with a palette: its /ColorSpace and /BitsPerComponent are checked apart.</param>
-    private string? CompareDictionaries(PdfDictionary a, PdfDictionary b, string path, int depth, int numberA, bool isStream = false, bool sizeMayChange = false, bool bitsMayAppear = false, bool paletteAppears = false)
+    private string? CompareDictionaries(PdfDictionary a, PdfDictionary b, int depth, int numberA, bool isStream = false, bool sizeMayChange = false, bool bitsMayAppear = false, bool paletteAppears = false)
     {
         // A merged or subset TrueType program has a new length; /Length1 describes the encoding of
         // the data. Decided only when the lengths differ, as it needs the source analysis.
         bool mergedProgram = isStream && numberA >= 0 &&
-            _a.Resolve(a["Length1"]) is PdfNumber l1 && _b.Resolve(b["Length1"]) is PdfNumber l2 && !l1.Text.AsSpan().SequenceEqual(l2.Text) &&
+            _a.Resolve(a["Length1"]) is PdfNumber l1 && _b.Resolve(b["Length1"]) is PdfNumber l2 && !l1.SameValue(l2) &&
             ((_rules.AllowFontMerging && _fontPrograms.Value.ContainsKey(numberA)) || (_rules.AllowFontSubsetting && _fontSubsets.Value.ContainsKey(numberA)));
 
         // A Type 1 program written as CFF loses its Type 1 lengths and gains /Subtype /Type1C.
@@ -355,7 +481,7 @@ internal sealed class EquivalenceVerifier
         {
             foreach (string key in InheritedAttributes.Keys)
             {
-                string? d = Compare(Effective(_a, a, key), Effective(_b, b, key), path + "/" + key, depth + 1);
+                string? d = CompareAt(key, Effective(_a, a, key), Effective(_b, b, key), depth + 1);
                 if (d is not null) return d;
             }
         }
@@ -369,19 +495,35 @@ internal sealed class EquivalenceVerifier
             if ((page || node) && Inheritable(key)) continue;
             if (_ignoredSourceKeys.Contains(key) && b[key] is null) continue;
             if (isStream && key == "Name" && b[key] is null && _rules.AllowXObjectNameRemoval && Deduplicator.IsXObject(a)) continue;
-            if (b[key] is null && _rules.AllowResourcePruning && Unused(a, key)) continue;
+            if (b[key] is null && _rules.AllowResourcePruning)
+            {
+                // A converted program's Type 1 lengths may go whatever the analysis says.
+                if (converted && key is "Length1" or "Length2" or "Length3") continue;
+
+                // Decided once the analysis is in; the walk goes on meanwhile. Nothing below lets
+                // a missing entry go except a converted program's /FontFile, whose check needs the
+                // analysis anyway: that one is decided here, in the order the walk always had.
+                if (key != "FontFile")
+                {
+                    _pruned.Add(new PruneCheck(_node, [.. _segments], a, key, depth));
+                    continue;
+                }
+
+                if (Unused(a, key)) continue;
+            }
+
             if (key is "BaseFont" or "FontName" && SubsetTagged(a, b, key)) continue;
             if (converted && key is "Length1" or "Length2" or "Length3" && b[key] is null) continue;
             if (key == "FontFile" && b[key] is null && Type1AsCff(a, b) is { } program)
             {
                 // The descriptor names the same program under /FontFile3; its data is proven glyph by glyph.
                 _converted.Add(program);
-                string? moved = Compare(a[key], b["FontFile3"], path + "/FontFile", depth + 1);
+                string? moved = CompareAt("FontFile", a[key], b["FontFile3"], depth + 1);
                 if (moved is not null) return moved;
                 continue;
             }
 
-            string? d = Compare(a[key], b[key] ?? PdfNull.Instance, path + "/" + key, depth + 1);
+            string? d = CompareAt(key, a[key], b[key] ?? PdfNull.Instance, depth + 1);
             if (d is not null) return d;
         }
 
@@ -395,7 +537,7 @@ internal sealed class EquivalenceVerifier
             if (bitsMayAppear && key == "BitsPerComponent" && _b.Resolve(b[key]) is PdfNumber { IsInteger: true, IntegerValue: 8 }) continue;
             if (converted && key == "Subtype" && b.GetName(key) == "Type1C") continue;
             if (key == "FontFile3" && Type1AsCff(a, b) is not null) continue;
-            if (_b.Resolve(b[key]) is not PdfNull) return path + "/" + key + ": key only in output";
+            if (_b.Resolve(b[key]) is not PdfNull) return Here() + "/" + key + ": key only in output";
         }
 
         return null;
@@ -493,6 +635,29 @@ internal sealed class EquivalenceVerifier
         return PdfNull.Instance;
     }
 
+    /// <summary>An entry of the source missing from the output, and where the walk met it.</summary>
+    private sealed record PruneCheck(PathNode Node, Segment[] Steps, PdfDictionary Category, string Key, int Depth);
+
+    /// <summary>
+    /// The first entry missing from the output, in walk order, that the analysis does not prove
+    /// unused, compared with nothing as the walk would have compared it there; null when all are.
+    /// </summary>
+    private string? FirstPrunedDifference()
+    {
+        foreach (PruneCheck check in _pruned)
+        {
+            if (Unused(check.Category, check.Key)) continue;
+            _node = check.Node;
+            _segments.Clear();
+            _segments.AddRange(check.Steps);
+            string? d = CompareAt(check.Key, check.Category[check.Key], PdfNull.Instance, check.Depth + 1);
+            if (d is not null) return d;
+        }
+
+        _pruned.Clear();
+        return null;
+    }
+
     /// <summary>True when the source analysis proves no content can look <paramref name="key"/> up in <paramref name="category"/>.</summary>
     private bool Unused(PdfDictionary category, string key) =>
         _analysis.Value is { Complete: true } analysis &&
@@ -532,15 +697,21 @@ internal sealed class EquivalenceVerifier
 
     private string? CompareStreamData(StreamJob job)
     {
-        (PdfStream a, PdfStream b, int numberA, string path, List<FilterSpec>? fa, List<FilterSpec>? fb) = (job.A, job.B, job.NumberA, job.Path, job.FiltersA, job.FiltersB);
+        (PdfStream a, PdfStream b, int numberA, List<FilterSpec>? fa, List<FilterSpec>? fb) = (job.A, job.B, job.NumberA, job.FiltersA, job.FiltersB);
+
+        // Bytes carried over under the same filters decode alike, or fail alike: equal without
+        // decoding either side. Images that may be resampled, bilevel images coded again and Type 1
+        // programs held as CFF keep their own checks.
+        if (job.Images is null && job.Bilevel is null && !job.Type1AsCff && a.EncodedLength == b.EncodedLength && SameFilterChain(fa, fb) && a.Data.Span.SequenceEqual(b.Data.Span)) return null;
+
         using DecodedStream? da = TryDecode(a, fa);
         using DecodedStream? db = TryDecode(b, fb);
         if (da is null || db is null)
         {
             // Undecodable data must have been carried over untouched, encoding and size included.
-            if (job.Images is { } g && g.A != g.B) return path + ": image size or coding changed on undecodable data";
-            if (!a.Data.Span.SequenceEqual(b.Data.Span)) return path + ": undecodable stream data changed";
-            return SameFilterChain(fa, fb) ? null : path + ": filter chain changed on undecodable stream";
+            if (job.Images is { } g && g.A != g.B) return job.Path + ": image size or coding changed on undecodable data";
+            if (!a.Data.Span.SequenceEqual(b.Data.Span)) return job.Path + ": undecodable stream data changed";
+            return SameFilterChain(fa, fb) ? null : job.Path + ": filter chain changed on undecodable stream";
         }
 
         if (job.Images is { } images)
@@ -554,28 +725,28 @@ internal sealed class EquivalenceVerifier
             // Each side must decode as its own dictionary says: samples, or one coded image.
             static bool Coded(DecodedStream d, ImageGeometry g) =>
                 d.PendingPredictor is null && (g.Filter is { } codec ? d.Remaining is [{ } only] && only.Name == codec : d.Remaining.Count == 0);
-            if (!Coded(da, images.A) || !Coded(db, images.B)) return path + ": resampled image is not coded as its dictionary says";
+            if (!Coded(da, images.A) || !Coded(db, images.B)) return job.Path + ": resampled image is not coded as its dictionary says";
             string? failure = LossyImages.Verify(da.Data.Span, images.A, job.Globals.A, db.Data.Span, images.B, job.Globals.B, _allowance.MinSsim, _decodeLimit);
-            return failure is null ? null : path + ": " + failure;
+            return failure is null ? null : job.Path + ": " + failure;
         }
 
-        if (job.Bilevel is { } bilevel) return CompareBilevel(da, db, bilevel, path);
+        if (job.Bilevel is { } bilevel) return CompareBilevel(da, db, bilevel, job);
         if (job.Type1AsCff)
         {
-            if (da.PendingPredictor is not null || db.PendingPredictor is not null || da.Remaining.Count > 0 || db.Remaining.Count > 0) return path + ": font program is not plain data";
+            if (da.PendingPredictor is not null || db.PendingPredictor is not null || da.Remaining.Count > 0 || db.Remaining.Count > 0) return job.Path + ": font program is not plain data";
             string? converted = Fonts.Type1.Type1ToCff.FindDifference(da.Data.ToArray(), db.Data.ToArray());
-            return converted is null ? null : path + ": Type 1 program as CFF: " + converted;
+            return converted is null ? null : job.Path + ": Type 1 program as CFF: " + converted;
         }
 
-        if (da.PendingPredictor != db.PendingPredictor) return path + ": predictor differs";
-        if (!SameFilterChain(da.Remaining, db.Remaining)) return path + ": remaining filters differ";
+        if (da.PendingPredictor != db.PendingPredictor) return job.Path + ": predictor differs";
+        if (!SameFilterChain(da.Remaining, db.Remaining)) return job.Path + ": remaining filters differ";
         if (da.Data.Span.SequenceEqual(db.Data.Span)) return null;
 
         bool plain = da.PendingPredictor is null && da.Remaining.Count == 0;
         if (plain && numberA >= 0 && _rules.AllowContentCompaction && _analysis.Value is { } analysis && analysis.ContentStreams.Contains(numberA))
         {
             string? difference = ContentCompactor.FindDifference(da.Data, db.Data);
-            return difference is null ? null : path + ": content " + difference;
+            return difference is null ? null : job.Path + ": content " + difference;
         }
 
         string? fontDifference = null;
@@ -593,7 +764,7 @@ internal sealed class EquivalenceVerifier
             if (fontDifference is null) return null;
         }
 
-        if (fontDifference is not null) return path + ": font program " + fontDifference;
+        if (fontDifference is not null) return job.Path + ": font program " + fontDifference;
 
         // Re-encoded JPEG data differs in bytes; equality is decided on its coefficients.
         if (da.PendingPredictor is null && da.Remaining is [{ Name: "DCTDecode" } dct])
@@ -608,33 +779,33 @@ internal sealed class EquivalenceVerifier
                 if (!LossyImages.RequantizationPasses(da.Data.Span, db.Data.Span, colorTransform, gate, _decodeLimit)) difference = "requantized JPEG is below the perceptual gate";
             }
 
-            return difference is null ? null : path + ": " + difference;
+            return difference is null ? null : job.Path + ": " + difference;
         }
 
-        return path + ": decoded stream content differs";
+        return job.Path + ": decoded stream content differs";
     }
 
     /// <summary>
     /// A bilevel image whose output is CCITT data: equal when both sides decode to the same pixels.
     /// A source that is not plain samples or flawless CCITT data must have been carried over as it was.
     /// </summary>
-    private string? CompareBilevel(DecodedStream da, DecodedStream db, BilevelJob job, string path)
+    private string? CompareBilevel(DecodedStream da, DecodedStream db, BilevelJob bilevel, StreamJob job)
     {
         // Each side decodes as the walk read it: samples or CCITT data, nothing pending.
-        if (da.PendingPredictor is not null || db.PendingPredictor is not null || da.Remaining.Count != (job.Source is null ? 0 : 1) || db.Remaining.Count != 1)
+        if (da.PendingPredictor is not null || db.PendingPredictor is not null || da.Remaining.Count != (bilevel.Source is null ? 0 : 1) || db.Remaining.Count != 1)
         {
-            return path + ": bilevel image is not coded as its dictionary says";
+            return job.Path + ": bilevel image is not coded as its dictionary says";
         }
 
-        if (job.Source == job.Output && da.Data.Span.SequenceEqual(db.Data.Span)) return null;
+        if (bilevel.Source == bilevel.Output && da.Data.Span.SequenceEqual(db.Data.Span)) return null;
 
         // Strict decoding: data a reader could take differently proves nothing.
-        int width = job.Width, height = job.Height;
-        byte[]? before = BilevelImages.Pixels(da.Data.Span, job.Source, width, height, _decodeLimit);
-        byte[]? after = BilevelImages.Pixels(db.Data.Span, job.Output, width, height, _decodeLimit);
-        if (before is null) return path + ": bilevel image changed but its source does not decode exactly";
-        if (after is null) return path + ": recoded bilevel image does not decode exactly";
-        return BilevelImages.SamePixels(before, after, width, height) ? null : path + ": bilevel image pixels differ";
+        int width = bilevel.Width, height = bilevel.Height;
+        byte[]? before = BilevelImages.Pixels(da.Data.Span, bilevel.Source, width, height, _decodeLimit);
+        byte[]? after = BilevelImages.Pixels(db.Data.Span, bilevel.Output, width, height, _decodeLimit);
+        if (before is null) return job.Path + ": bilevel image changed but its source does not decode exactly";
+        if (after is null) return job.Path + ": recoded bilevel image does not decode exactly";
+        return BilevelImages.SamePixels(before, after, width, height) ? null : job.Path + ": bilevel image pixels differ";
     }
 
     private DecodedStream? TryDecode(PdfStream s, List<FilterSpec>? filters)
@@ -671,7 +842,7 @@ internal sealed class EquivalenceVerifier
         if (b is null or PdfNull) return false;
         return (a, b) switch
         {
-            (PdfNumber x, PdfNumber y) => x.Text.AsSpan().SequenceEqual(y.Text),
+            (PdfNumber x, PdfNumber y) => x.SameValue(y),
             (PdfName x, PdfName y) => x.Value == y.Value,
             (PdfBoolean x, PdfBoolean y) => x.Value == y.Value,
             (PdfString x, PdfString y) => x.Value.AsSpan().SequenceEqual(y.Value),
