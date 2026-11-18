@@ -33,6 +33,12 @@ internal sealed class EquivalenceVerifier
     private readonly VerificationRules _rules;
     private readonly Lazy<ContentAnalysis?> _analysis;
     private readonly Lazy<Dictionary<int, HashSet<int>>> _fontPrograms;
+    private readonly Lazy<Dictionary<int, FontSubsetter.Candidate>> _fontSubsets;
+    private readonly Lazy<HashSet<(PdfDictionary, string)>> _taggable;
+    private readonly Dictionary<string, HashSet<int>> _newTags = new(StringComparer.Ordinal);
+    private readonly Lazy<HashSet<int>> _type1Programs;
+    private readonly HashSet<int> _converted = [];
+    private List<int> _sourceOrder = [];
     private readonly HashSet<(int, int)> _visited = new();
     private readonly Dictionary<int, int> _aToB = new();
     private readonly Dictionary<int, int> _bToA = new();
@@ -53,6 +59,15 @@ internal sealed class EquivalenceVerifier
         _analysis = new Lazy<ContentAnalysis?>(() => Analyze(ct));
         _fontPrograms = new Lazy<Dictionary<int, HashSet<int>>>(() =>
             _analysis.Value is { } analysis ? FontProgramMerger.MergeablePrograms(_a, analysis, _decodeLimit) : new Dictionary<int, HashSet<int>>());
+
+        // The programs a subset may replace, and the glyphs each must keep, from the source alone.
+        _fontSubsets = new Lazy<Dictionary<int, FontSubsetter.Candidate>>(() =>
+            _analysis.Value is { } analysis
+                ? FontSubsetter.Plan(_a, analysis, _sourceOrder, PdfOptimizer.IsPdfA1(_a, _decodeLimit), _decodeLimit, ct).Where(p => p.Value.Skip is null).ToDictionary(p => p.Key, p => p.Value)
+                : new Dictionary<int, FontSubsetter.Candidate>());
+        _taggable = new Lazy<HashSet<(PdfDictionary, string)>>(() =>
+            [.. _fontSubsets.Value.Values.SelectMany(c => c.Names).Select(n => (n.Dictionary, n.Key))]);
+        _type1Programs = new Lazy<HashSet<int>>(() => _analysis.Value is { } analysis ? Type1Converter.Candidates(_a, analysis.References, _sourceOrder) : []);
     }
 
     private ContentAnalysis? Analyze(CancellationToken ct)
@@ -60,6 +75,7 @@ internal sealed class EquivalenceVerifier
         try
         {
             ObjectGraph graph = ObjectGraph.Collect(_a, stripThumbnails: false, stripPieceInfo: false, ct);
+            _sourceOrder = graph.Order;
             return ContentAnalysis.Run(_a, graph.Order, _ignoredSourceKeys, _decodeLimit, ct);
         }
         catch (PdfFormatException)
@@ -76,6 +92,9 @@ internal sealed class EquivalenceVerifier
 
         /// <summary>The decoded JBIG2Globals of the source and of the output, for a resampled JBIG2 image.</summary>
         public (byte[]? A, byte[]? B) Globals { get; init; }
+
+        /// <summary>Set for a Type 1 program the output holds as CFF, to be compared glyph by glyph.</summary>
+        public bool Type1AsCff { get; init; }
     }
 
     /// <summary>A bilevel image coded again, with the CCITT parameters the walk read from each side.</summary>
@@ -113,6 +132,8 @@ internal sealed class EquivalenceVerifier
             string? d = CompareResolved(_a.GetObject(a), _b.GetObject(b), path, 0, a);
             if (d is not null) return d;
         }
+
+        if (CheckNewTags() is { } tagDifference) return tagDifference;
 
         // Filter parameters were resolved during the walk; stream content is compared in parallel.
         var jobs = _streams;
@@ -278,7 +299,7 @@ internal sealed class EquivalenceVerifier
                     globals = (Globals(_a, fa, g.Item1), Globals(_b, fb, g.Item2));
                 }
 
-                _streams.Add(new StreamJob(aStream, bStream, numberA, path, fa, fb, images) { Bilevel = bilevel, Globals = globals });
+                _streams.Add(new StreamJob(aStream, bStream, numberA, path, fa, fb, images) { Bilevel = bilevel, Globals = globals, Type1AsCff = numberA >= 0 && _converted.Contains(numberA) });
                 return null;
             }
 
@@ -317,8 +338,14 @@ internal sealed class EquivalenceVerifier
     /// <param name="paletteAppears">The output is the source with a palette: its /ColorSpace and /BitsPerComponent are checked apart.</param>
     private string? CompareDictionaries(PdfDictionary a, PdfDictionary b, string path, int depth, int numberA, bool isStream = false, bool sizeMayChange = false, bool bitsMayAppear = false, bool paletteAppears = false)
     {
-        // A merged TrueType program has a new length; /Length1 describes the encoding of the data.
-        bool mergedProgram = isStream && _rules.AllowFontMerging && numberA >= 0 && a["Length1"] is not null && _fontPrograms.Value.ContainsKey(numberA);
+        // A merged or subset TrueType program has a new length; /Length1 describes the encoding of
+        // the data. Decided only when the lengths differ, as it needs the source analysis.
+        bool mergedProgram = isStream && numberA >= 0 &&
+            _a.Resolve(a["Length1"]) is PdfNumber l1 && _b.Resolve(b["Length1"]) is PdfNumber l2 && !l1.Text.AsSpan().SequenceEqual(l2.Text) &&
+            ((_rules.AllowFontMerging && _fontPrograms.Value.ContainsKey(numberA)) || (_rules.AllowFontSubsetting && _fontSubsets.Value.ContainsKey(numberA)));
+
+        // A Type 1 program written as CFF loses its Type 1 lengths and gains /Subtype /Type1C.
+        bool converted = isStream && numberA >= 0 && _converted.Contains(numberA);
 
         // Inherited page attributes may move between tree nodes and pages. Nodes are not compared
         // on them; each page is compared on the values it ends up with.
@@ -343,6 +370,17 @@ internal sealed class EquivalenceVerifier
             if (_ignoredSourceKeys.Contains(key) && b[key] is null) continue;
             if (isStream && key == "Name" && b[key] is null && _rules.AllowXObjectNameRemoval && Deduplicator.IsXObject(a)) continue;
             if (b[key] is null && _rules.AllowResourcePruning && Unused(a, key)) continue;
+            if (key is "BaseFont" or "FontName" && SubsetTagged(a, b, key)) continue;
+            if (converted && key is "Length1" or "Length2" or "Length3" && b[key] is null) continue;
+            if (key == "FontFile" && b[key] is null && Type1AsCff(a, b) is { } program)
+            {
+                // The descriptor names the same program under /FontFile3; its data is proven glyph by glyph.
+                _converted.Add(program);
+                string? moved = Compare(a[key], b["FontFile3"], path + "/FontFile", depth + 1);
+                if (moved is not null) return moved;
+                continue;
+            }
+
             string? d = Compare(a[key], b[key] ?? PdfNull.Instance, path + "/" + key, depth + 1);
             if (d is not null) return d;
         }
@@ -355,6 +393,8 @@ internal sealed class EquivalenceVerifier
             if ((page || node) && Inheritable(key)) continue;
             if (a.ContainsKey(key)) continue;
             if (bitsMayAppear && key == "BitsPerComponent" && _b.Resolve(b[key]) is PdfNumber { IsInteger: true, IntegerValue: 8 }) continue;
+            if (converted && key == "Subtype" && b.GetName(key) == "Type1C") continue;
+            if (key == "FontFile3" && Type1AsCff(a, b) is not null) continue;
             if (_b.Resolve(b[key]) is not PdfNull) return path + "/" + key + ": key only in output";
         }
 
@@ -362,6 +402,82 @@ internal sealed class EquivalenceVerifier
     }
 
     private static bool Inheritable(string key) => Array.IndexOf(InheritedAttributes.Keys, key) >= 0;
+
+    /// <summary>
+    /// True when the output name is the source name with a new subset tag, on a font, CIDFont or
+    /// descriptor whose program the source analysis lets a subset replace (ISO 32000-1, 9.6.4).
+    /// The tag is recorded so that two different programs are never shown to share one.
+    /// </summary>
+    private bool SubsetTagged(PdfDictionary a, PdfDictionary b, string key)
+    {
+        if (!_rules.AllowFontSubsetting || a[key] is not PdfName source || b[key] is not PdfName output) return false;
+        if (source.Value == output.Value || FontSubsetter.HasTag(source.Value) || !FontSubsetter.HasTag(output.Value)) return false;
+        if (output.Value.Length != source.Value.Length + 7 || !output.Value.EndsWith(source.Value, StringComparison.Ordinal)) return false;
+        if (!_taggable.Value.Contains((a, key))) return false;
+        string tag = output.Value[..6];
+        if (!_newTags.TryGetValue(tag, out HashSet<int>? programs))
+        {
+            programs = [];
+            _newTags[tag] = programs;
+        }
+
+        programs.Add(ProgramIn(_b, b, 0));
+        return true;
+    }
+
+    /// <summary>The object number of the program behind a font, CIDFont or descriptor, or -1.</summary>
+    private static int ProgramIn(PdfFile file, PdfDictionary d, int depth)
+    {
+        if (depth > 3) return -1;
+        foreach (string key in new[] { "FontFile2", "FontFile3", "FontFile" })
+        {
+            if (d[key] is PdfReference r) return r.Number;
+        }
+
+        if (file.ResolveDictionary(d["FontDescriptor"]) is { } descriptor) return ProgramIn(file, descriptor, depth + 1);
+        return file.Resolve(d["DescendantFonts"]) is PdfArray { Count: > 0 } kids && file.ResolveDictionary(kids[0]) is { } cid ? ProgramIn(file, cid, depth + 1) : -1;
+    }
+
+    /// <summary>
+    /// The source program of a descriptor whose Type 1 /FontFile the output holds as /FontFile3
+    /// CFF, when the source analysis allows that program to be converted; else null.
+    /// </summary>
+    private int? Type1AsCff(PdfDictionary a, PdfDictionary b) =>
+        _rules.AllowFontConversion && a["FontFile"] is PdfReference source && a["FontFile3"] is null && b["FontFile"] is null &&
+        b["FontFile3"] is PdfReference output && _b.GetObject(output.Number) is PdfStream cff && cff.Dictionary.GetName("Subtype") == "Type1C" &&
+        AtLeastPdf12(_b) && _type1Programs.Value.Contains(source.Number)
+            ? source.Number
+            : null;
+
+    /// <summary>FontFile3 /Type1C arrived with PDF 1.2; the catalog's /Version may raise the header's.</summary>
+    private static bool AtLeastPdf12(PdfFile file)
+    {
+        static bool Ok(string? v) => decimal.TryParse(v, System.Globalization.NumberStyles.AllowDecimalPoint, System.Globalization.CultureInfo.InvariantCulture, out decimal d) && d >= 1.2m;
+        return Ok(file.HeaderVersion) || Ok(file.ResolveDictionary(file.Trailer["Root"])?.GetName("Version"));
+    }
+
+    /// <summary>A new tag must not be one the source already uses, and must name one output program only.</summary>
+    private string? CheckNewTags()
+    {
+        if (_newTags.Count == 0) return null;
+        var existing = new HashSet<string>(StringComparer.Ordinal);
+        foreach (int number in _sourceOrder)
+        {
+            if (_a.GetObject(number) is not PdfDictionary d) continue;
+            foreach (string key in new[] { "BaseFont", "FontName" })
+            {
+                if (d.GetName(key) is { } name && FontSubsetter.HasTag(name)) existing.Add(name[..6]);
+            }
+        }
+
+        foreach ((string tag, HashSet<int> programs) in _newTags)
+        {
+            if (existing.Contains(tag)) return $"subset tag {tag} is already used in the source";
+            if (programs.Count != 1 || programs.Contains(-1)) return $"subset tag {tag} names more than one font program";
+        }
+
+        return null;
+    }
 
     /// <summary>A page's value for an inheritable attribute: its own, or the nearest ancestor's.</summary>
     private static PdfObject Effective(PdfFile file, PdfDictionary page, string key)
@@ -444,6 +560,12 @@ internal sealed class EquivalenceVerifier
         }
 
         if (job.Bilevel is { } bilevel) return CompareBilevel(da, db, bilevel, path);
+        if (job.Type1AsCff)
+        {
+            if (da.PendingPredictor is not null || db.PendingPredictor is not null || da.Remaining.Count > 0 || db.Remaining.Count > 0) return path + ": font program is not plain data";
+            string? converted = Fonts.Type1.Type1ToCff.FindDifference(da.Data.ToArray(), db.Data.ToArray());
+            return converted is null ? null : path + ": Type 1 program as CFF: " + converted;
+        }
 
         if (da.PendingPredictor != db.PendingPredictor) return path + ": predictor differs";
         if (!SameFilterChain(da.Remaining, db.Remaining)) return path + ": remaining filters differ";
@@ -456,11 +578,22 @@ internal sealed class EquivalenceVerifier
             return difference is null ? null : path + ": content " + difference;
         }
 
+        string? fontDifference = null;
+        if (plain && numberA >= 0 && _rules.AllowFontSubsetting && _fontSubsets.Value.TryGetValue(numberA, out FontSubsetter.Candidate? subset))
+        {
+            fontDifference = subset.Cff
+                ? FontSubsetter.FindCffDifference(da.Data.ToArray(), db.Data.ToArray(), subset.Glyphs)
+                : TrueTypeGlyphs.FindSubsetDifference(da.Data.Span, db.Data.Span, subset.Glyphs);
+            if (fontDifference is null) return null;
+        }
+
         if (plain && numberA >= 0 && _rules.AllowFontMerging && _fontPrograms.Value.TryGetValue(numberA, out HashSet<int>? glyphs))
         {
-            string? difference = TrueTypeGlyphs.FindDifference(da.Data.Span, db.Data.Span, glyphs);
-            return difference is null ? null : path + ": font program " + difference;
+            fontDifference = TrueTypeGlyphs.FindDifference(da.Data.Span, db.Data.Span, glyphs);
+            if (fontDifference is null) return null;
         }
+
+        if (fontDifference is not null) return path + ": font program " + fontDifference;
 
         // Re-encoded JPEG data differs in bytes; equality is decided on its coefficients.
         if (da.PendingPredictor is null && da.Remaining is [{ Name: "DCTDecode" } dct])
@@ -572,6 +705,15 @@ internal sealed record VerificationRules
     /// <summary>TrueType programs of identity mapped composite fonts may change where no shown glyph is affected.</summary>
     public bool AllowFontMerging { get; init; }
 
+    /// <summary>
+    /// TrueType and CFF programs whose usage the source analysis lists in full may lose the glyphs
+    /// no reader can draw, and their fonts' names may gain a subset tag.
+    /// </summary>
+    public bool AllowFontSubsetting { get; init; }
+
+    /// <summary>Type 1 programs may become CFF programs that draw and hint every glyph the same way.</summary>
+    public bool AllowFontConversion { get; init; }
+
     /// <summary>Inheritable page attributes may move from page tree nodes onto the pages that inherit them.</summary>
     public bool AllowInheritedAttributes { get; init; }
 
@@ -582,5 +724,15 @@ internal sealed record VerificationRules
     public bool AllowXObjectNameRemoval { get; init; }
 
     /// <summary>Every lossless structural change the optimizer makes, and no lossy image change.</summary>
-    public static VerificationRules Lossless { get; } = new() { AllowResourcePruning = true, AllowContentCompaction = true, AllowFontMerging = true, AllowInheritedAttributes = true, AllowBilevelRecoding = true, AllowXObjectNameRemoval = true };
+    public static VerificationRules Lossless { get; } = new()
+    {
+        AllowResourcePruning = true,
+        AllowContentCompaction = true,
+        AllowFontMerging = true,
+        AllowFontSubsetting = true,
+        AllowFontConversion = true,
+        AllowInheritedAttributes = true,
+        AllowBilevelRecoding = true,
+        AllowXObjectNameRemoval = true,
+    };
 }

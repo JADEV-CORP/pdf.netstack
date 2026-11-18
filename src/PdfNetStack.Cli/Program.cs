@@ -47,6 +47,10 @@ namespace PdfNetStack.Cli
               --no-prune                Keep resources no content uses
               --no-compact              Do not rewrite content streams compactly
               --no-font-merge           Do not merge subsets of one TrueType font
+              --no-font-subset          Do not subset fully embedded TrueType and CFF fonts
+              --convert-type1           Rewrite Type 1 fonts as CFF (same outlines and hints;
+                                        hinted rasterizers may draw a few small glyphs
+                                        a pixel apart)
               --linearize               Write a linearized file (fast web view)
               --streaming               Read the input on demand and write the rewrite
                                         through a temporary file, proven there: memory
@@ -560,6 +564,8 @@ namespace PdfNetStack.Cli
                     case "--no-prune": o = o with { PruneUnusedResources = false }; break;
                     case "--no-compact": o = o with { CompactContentStreams = false }; break;
                     case "--no-font-merge": o = o with { MergeFontSubsets = false }; break;
+                    case "--no-font-subset": o = o with { SubsetFonts = false }; break;
+                    case "--convert-type1": o = o with { ConvertType1Fonts = true }; break;
                     case "--linearize": o = o with { Linearize = true }; break;
                     case "--streaming": o = o with { Streaming = true, MaxInputBytes = long.MaxValue }; break;
                     case "--no-recompress": o = o with { RecompressStreams = false }; break;

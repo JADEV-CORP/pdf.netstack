@@ -7,10 +7,10 @@ namespace PdfNetStack.Optimization;
 
 /// <summary>
 /// What the content of a document uses: the resource names each resource dictionary is looked
-/// up with, which streams are content streams and nothing else, and which glyphs each composite
-/// font with an identity encoding shows. The optimizer runs it before it changes anything, and
-/// the verifier runs it again on its own parse of the source, so every structural change is
-/// checked against an analysis of the original.
+/// up with, which streams are content streams and nothing else, and which codes each font shows:
+/// single bytes for simple fonts, two byte codes for composite fonts with an identity encoding.
+/// The optimizer runs it before it changes anything, and the verifier runs it again on its own
+/// parse of the source, so every structural change is checked against an analysis of the original.
 /// </summary>
 /// <remarks>
 /// Content is executed from the page tree and from annotation appearances, following form
@@ -47,6 +47,7 @@ internal sealed class ContentAnalysis
     private readonly HashSet<(PdfObject Holder, PdfDictionary? Resources)> _reached = [];
     private readonly Queue<(PdfObject Holder, IReadOnlyList<PdfStream> Parts, PdfDictionary? Resources)> _deferred = new();
     private readonly Dictionary<PdfDictionary, HashSet<int>> _codes = new();
+    private readonly Dictionary<PdfDictionary, HashSet<int>> _simpleCodes = new();
     private readonly HashSet<PdfDictionary> _unreliableFonts = [];
     private readonly Dictionary<PdfDictionary, HashSet<PdfDictionary>> _fallbacks = new();
     private long _bytes;
@@ -84,7 +85,13 @@ internal sealed class ContentAnalysis
     /// <summary>Codes shown with each composite font whose encoding is Identity-H or Identity-V.</summary>
     public IReadOnlyDictionary<PdfDictionary, HashSet<int>> IdentityCodes => _codes;
 
-    /// <summary>Composite fonts some of whose text could not be decoded into codes.</summary>
+    /// <summary>Single byte codes shown with each simple font (Type 1, TrueType, Type 3).</summary>
+    public IReadOnlyDictionary<PdfDictionary, HashSet<int>> SimpleCodes => _simpleCodes;
+
+    /// <summary>
+    /// Fonts some of whose text could not be decoded into codes: composite fonts shown with
+    /// strings of odd length, or with a CMap other than Identity-H or Identity-V.
+    /// </summary>
     public IReadOnlyCollection<PdfDictionary> UnreliableFonts => _unreliableFonts;
 
     /// <summary>True when the font object <paramref name="fontNumber"/> is selectable only through category dictionaries this analysis saw completely.</summary>
@@ -530,7 +537,25 @@ internal sealed class ContentAnalysis
                     return;
                 }
 
-                if (font.GetName("Subtype") != "Type0" || font.GetName("Encoding") is not ("Identity-H" or "Identity-V")) return;
+                if (font.GetName("Subtype") != "Type0")
+                {
+                    if (!_simpleCodes.TryGetValue(font, out HashSet<int>? bytes))
+                    {
+                        bytes = [];
+                        _simpleCodes[font] = bytes;
+                    }
+
+                    foreach (byte b in s.Value) bytes.Add(b);
+                    return;
+                }
+
+                // Codes of other CMaps need the CMap to split the string; such fonts are never subset or merged.
+                if (font.GetName("Encoding") is not ("Identity-H" or "Identity-V"))
+                {
+                    _unreliableFonts.Add(font);
+                    return;
+                }
+
                 if (!_codes.TryGetValue(font, out HashSet<int>? codes))
                 {
                     codes = [];

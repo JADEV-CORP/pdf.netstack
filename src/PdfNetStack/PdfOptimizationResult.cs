@@ -83,6 +83,19 @@ public sealed record OptimizationStatistics(
     /// <summary>TrueType font programs replaced by a merged program shared with other subsets of the same font.</summary>
     public int FontProgramsMerged { get; init; }
 
+    /// <summary>TrueType and CFF font programs replaced by a subset holding the glyphs the document can show.</summary>
+    public int FontProgramsSubset { get; init; }
+
+    /// <summary>Type 1 font programs rewritten as CFF with the same glyphs and hints.</summary>
+    public int Type1FontsConverted { get; init; }
+
+    /// <summary>
+    /// Fully embedded fonts that were not subset for a reason other than size, one entry per
+    /// program: its name, a colon and the reason (forms can draw text with it, its use could not
+    /// be listed in full, readers treat its name specially, and so on).
+    /// </summary>
+    public IReadOnlyList<string> FontsLeftWhole { get; init; } = [];
+
     /// <summary>True when the output was written as a linearized file.</summary>
     public bool Linearized { get; init; }
 
@@ -98,7 +111,7 @@ public sealed record PhaseTimings
     /// <summary>Parsing, safety checks and reachability.</summary>
     public TimeSpan Analyze { get; init; }
 
-    /// <summary>Content analysis, resource pruning and font program merging.</summary>
+    /// <summary>Content analysis, resource pruning, font subsetting, conversion and merging.</summary>
     public TimeSpan Content { get; init; }
 
     /// <summary>Stream re-encoding.</summary>

@@ -138,6 +138,29 @@ public sealed record PdfOptimizerOptions
     public bool MergeFontSubsets { get; init; } = true;
 
     /// <summary>
+    /// Subset fully embedded TrueType and CFF fonts to the glyphs the document can show, and leave
+    /// out the layout tables (GSUB, GPOS, GDEF, kern and the like) PDF readers never apply. Glyph
+    /// ids do not change, every glyph any reader could pick for a code shown keeps its outline,
+    /// metrics and hints, and the font's name gains a subset tag. Fonts that interactive forms can
+    /// draw new text with, fonts whose use cannot be listed in full, and names readers treat
+    /// specially stay whole; <see cref="OptimizationStatistics.FontsLeftWhole"/> says why for each.
+    /// Lossless. Default true.
+    /// </summary>
+    public bool SubsetFonts { get; init; } = true;
+
+    /// <summary>
+    /// Rewrite Type 1 font programs (FontFile) as CFF (FontFile3 /Type1C), which holds the same
+    /// glyphs and hints in far fewer bytes: Type 1 data is encrypted and does not compress.
+    /// Every glyph is kept; the proof interprets both programs and requires the same paths,
+    /// widths, hints and encoding. Fonts using features CFF cannot express exactly stay as they
+    /// are. Needs PDF 1.2 output. Rasterizers that hint the two formats with separate code can
+    /// draw a few small glyphs a pixel apart (FreeType: 401 of 62,748 hinted glyph images on 220
+    /// TeX fonts, as with Adobe's own conversion; PDFium, which draws them unhinted, shows no
+    /// change), so this is off until asked for. Default false.
+    /// </summary>
+    public bool ConvertType1Fonts { get; init; }
+
+    /// <summary>
     /// Write a linearized file (ISO 32000-1, Annex F), which a viewer can start showing before the
     /// whole file has arrived ("fast web view"). Inherited page attributes are moved onto the
     /// pages, and every object is written on its own without object streams, so the output can

@@ -77,7 +77,74 @@ head; the same ascender, descender, line gap, caret slope and metric format in h
 version and hinting limits at least as wide; and for each of those glyphs the same outline bytes
 (up to trailing zero padding), the same advance width and the same left side bearing. Glyph names
 (post) are dropped and the name and cmap tables come from one of the merged programs; a
-CIDFontType2 with an identity map selects glyphs by id and reads none of them.
+CIDFontType2 with an identity map selects glyphs by id and reads none of them. Subsets made by
+the pass below may be merged too, so the tables readers never apply may be missing.
+
+**Font subsets.** A TrueType program (FontFile2) or a CFF program (FontFile3 /Type1C or
+/CIDFontType0C) may be replaced by a subset of itself only when every glyph a reader can draw
+from it is known. The verifier finds that out from its own analysis of the source and requires
+all of this:
+
+- the analysis read in full every content stream that can use the program (pages, forms,
+  tiling patterns, Type 3 glyph procedures, soft masks, every state of every appearance) and
+  tied every string shown to its font, and each font using the program is selectable only
+  through resource dictionaries it read in full;
+- no interactive form can draw new text with it: the program is not reached from the AcroForm
+  /DR, no /DA string anywhere names a font that uses it, and the document has no XFA;
+- each font using it is a simple TrueType or Type 1 font with /Widths, or a Type0 font with
+  Identity-H or Identity-V over a CIDFontType2 (identity or stream /CIDToGIDMap) or a
+  CIDFontType0; its descriptor has no /CharSet or /CIDSet; the file is not PDF/A-1.
+
+The glyphs that must survive are worked out on the source. For a composite font, the glyph of
+each CID shown, through /CIDToGIDMap or the CFF charset. For a simple font, every glyph some
+reader could pick for each code shown: through every cmap subtable (the code, the code plus
+0xF000, 0xF100 and 0xF200, and the Unicode value of each candidate name), the glyph names of
+/Differences and of every predefined encoding at that code looked up in post or the CFF
+charset, the program's built-in encoding, and the glyph whose id is the code. Then .notdef,
+every component of a composite glyph and both parts of an accented (seac) glyph, transitively.
+
+Each of those glyphs must keep its outline byte for byte (TrueType glyf data up to zero padding,
+CFF charstrings exactly), its advance width and its left side bearing. Glyph ids never change,
+so /CIDToGIDMap, cmap, post and the charset select the same glyphs as before. Everything else
+that steers rendering must be byte identical: for TrueType every table but glyf, loca and hmtx,
+with head differing only in its checksum and loca format, and only tables readers never apply
+(GSUB, GPOS, GDEF, BASE, JSTF, MATH, kern, morx, mort, kerx, feat, DSIG) allowed to go; for CFF
+the names, strings, charset, encoding, FDSelect, every Top, Font and Private DICT entry other
+than offsets, the number of subroutines, and byte for byte every subroutine those glyphs call,
+directly or through other subroutines, found by running their charstrings. A subroutine nothing
+calls becomes a bare return, so every subroutine keeps its number. Hinting instructions (fpgm,
+prep, cvt, glyph instructions, CFF hints) stay as they were, so hinted rendering matches too.
+Font dictionaries,
+/Widths, /W, /W2, /DW, /Encoding and /ToUnicode go through the graph walk unchanged. The one
+change allowed there is the subset tag of ISO 32000-1, 9.6.4: /BaseFont, the CIDFont's
+/BaseFont and /FontName may gain six capital letters and a plus sign, only when they had no
+tag and the name is not one readers treat specially (the standard 14 names, the Arial, Times,
+Helvetica and Courier aliases some readers map Type 1 fonts to, Symbol and dingbat fonts). A new
+tag is never one the source already uses, and two different output programs never share one.
+Programs with the same content are subset together for all their fonts, so they stay one.
+
+**Type 1 programs as CFF.** With `ConvertType1Fonts` (off by default), a Type 1 program
+(FontFile) may be replaced by a CFF program
+(FontFile3 /Subtype /Type1C) holding every one of its glyphs, when every font using the
+descriptor is a simple Type 1 font and the output is PDF 1.2 or later; the descriptor's /FontFile
+becomes /FontFile3 and the stream drops /Length1 to /Length3. The verifier decrypts the source
+(eexec, binary or hex, and charstrings) and interprets both programs glyph by glyph. Each glyph
+must have the same name, the same advance width and the same path: moves, lines and curves at
+exactly the same coordinates, Type 1 flex against CFF flex with the same depth. Type 1 division
+is taken in 16.16 fixed point, rounded to nearest, as FreeType and pdf.js compute it, so CFF
+holds the result exactly. Hints must match as well: the same stems, grouped the same way at the
+same points of the path (Type 1 hint replacement against CFF hint masks), stem3 hints as the
+same counter groups, and an accented glyph must name the same base and accent at the same
+offset. The font matrix, bounding box, built-in encoding (the glyph named by each code), paint
+type and every Private value that steers hinting (blue zones, blue scale, shift and fuzz,
+standard and snap stem widths, ForceBold, language group, expansion factor) must be equal, and
+the CFF DICTs may hold nothing else that changes rendering. A font that uses anything CFF
+cannot say exactly is left as it is: counter control and other OtherSubrs, dotsection, a
+vertical advance, coordinates out of the 16.16 range, stroked (PaintType 2) or multiple master
+fonts. Rasterizers hint the two formats with separate code: on 220 Type 1 programs from the
+public corpus, FreeType draws 62,347 of 62,748 hinted glyph images alike in both forms, and
+the other 401 differ in the same way for Adobe's own converter (tx), whose output FreeType draws
+identically to this one; PDFium, which draws these fonts without hinting, shows no difference.
 
 **Streams equal after decoding.** Deduplication compares streams by what they decode to, so two
 copies of a font program or image merge even when they were encoded differently. The comparison
@@ -261,6 +328,13 @@ PSNR says little. Read side by side, the reduced pages keep every stroke, rule a
   numbers, names, strings, comments and inline images, a randomized round trip, and every kind
   of token change caught; font merging with glyph conflicts, glyphs past the end of a subset and
   changed outlines; mutated inputs that must never throw.
+- Font subsets and Type 1 conversion: simple and composite TrueType and CFF fonts subset with
+  every glyph a reader could pick, composite components and subroutine numbers kept; fonts that
+  forms can draw with, fonts a /DA string names, special names and unreadable content left whole;
+  every change the subset proof must catch (a shown glyph, a used table or subroutine); Type 1
+  programs written in code with hint replacement, flex, seac, stem3, division, sbw and hex eexec,
+  converted and proven, and each feature CFF cannot express refused; mutated Type 1 programs
+  that may only fail as font errors.
 - Linearization: the layout checks above on documents with one and many pages, shared fonts,
   bookmarks in and out of the first page, form fields, an open action and inherited attributes;
   page trees it cannot lay out; mutated inputs.
