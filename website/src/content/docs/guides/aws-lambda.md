@@ -67,9 +67,11 @@ The library itself writes nothing to disk unless you give it a path or a stream.
   460 MB of working set), and `/tmp` holds about three times the file. Memory still follows the
   objects and the streams being recompressed, so image heavy files need room in that mode too.
   Check the size in the S3 event before downloading, and set `MaxInputBytes` and
-  `EphemeralStorage` to match. Without `Streaming`, size the function from the
-  [measured numbers](/concepts/memory-and-performance/#measured-memory-use): on 1.2.0 the
-  optimizer peaked at 24 to 60 times the input file.
+  `EphemeralStorage` to match. Without `Streaming`, size the function for the document plus
+  about three times the largest decoded stream per worker, see
+  [Memory and performance](/concepts/memory-and-performance/#workers-and-the-decoded-size). From
+  1.3 the optimizer runs fewer workers when the function has little memory, and
+  `PdfLimits.Untrusted` bounds what a file from a user may cost.
 - HTML conversion of invoices and reports fits in 512 MB; 1,024 MB converts faster for the CPU.
   `MaxPages` bounds the output.
 - A synchronous response is at most 6 MB, base64 encoded for binary bodies. Write larger PDFs to

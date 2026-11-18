@@ -24,9 +24,11 @@ limits on hostile input, and no native code in the core packages.
 
 ## Who builds it
 
-PdfNetStack is created and maintained by [Jamal Abdelkhalek](https://www.jadev-corp.com/jamal) at
-[JADEV](https://www.jadev-corp.com/en). The packages on NuGet are published by
-the `jadev` account.
+PdfNetStack was created by [Jamal Abdelkhalek](https://www.jadev-corp.com/jamal) at
+[JADEV](https://www.jadev-corp.com/en), and is built by a small team there. Its maintainers are
+Jamal Abdelkhalek and Ilyass Krichi; how decisions and releases are made is in
+[GOVERNANCE.md](https://github.com/JADEV-CORP/pdf.netstack/blob/main/GOVERNANCE.md). The packages
+on NuGet are published by the `jadev` account.
 
 - Source and issues: [github.com/JADEV-CORP/pdf.netstack](https://github.com/JADEV-CORP/pdf.netstack)
 - Packages: [PdfNetStack on NuGet](https://www.nuget.org/packages/PdfNetStack)

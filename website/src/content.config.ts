@@ -13,7 +13,7 @@ export const collections = {
         title: z.string().min(3).max(46),
         description: z.string().min(50).max(155),
         /** First release that has the feature: shown as a badge, with a note while unreleased. */
-        since: z.enum(['1.0', '1.1', 'unreleased']).optional(),
+        since: z.enum(['1.0', '1.1', '1.2', '1.3', 'unreleased']).optional(),
         /** Questions and answers rendered by the page and emitted as FAQPage JSON-LD. */
         faq: z.array(z.object({ q: z.string(), a: z.string() })).optional(),
       }),
