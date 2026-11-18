@@ -9,7 +9,8 @@ namespace PdfNetStack.Documents;
 /// by every later import. Annotations are copied fresh for each page, because an annotation
 /// belongs to exactly one page. References to pages are remapped to their copies when those pages
 /// are imported in the same call, and become null otherwise. Form fields come along with their
-/// widgets (see <see cref="ImportFields"/>).
+/// widgets (see <see cref="ImportFields"/>), and the part of the structure tree that tags the
+/// pages' content with them (see <see cref="ImportStructure"/>).
 /// </summary>
 internal sealed partial class PageImporter
 {
@@ -18,9 +19,16 @@ internal sealed partial class PageImporter
     private static readonly HashSet<string> DroppedPageKeys = new(StringComparer.Ordinal) { "Parent", "StructParents", "B" };
     private static readonly HashSet<string> AnnotationKeys = new(StringComparer.Ordinal) { "Annots", "Popup", "IRT" };
 
+    // Objects copied between two looks at the cancellation token.
+    private const int CancellationInterval = 256;
+
     private readonly PdfDocument _source;
     private readonly PdfDocument _target;
     private readonly Dictionary<int, int> _shared = new();
+
+    // Source numbers of the shared objects the current call copied first, so their structure
+    // keys can be remapped once the copies exist. Null outside Import.
+    private List<int>? _newlyShared;
 
     public PageImporter(PdfDocument source, PdfDocument target)
     {
@@ -30,7 +38,7 @@ internal sealed partial class PageImporter
 
     private bool SameDocument => ReferenceEquals(_source, _target);
 
-    public IReadOnlyList<PdfPage> Import(List<PdfPage> pages)
+    public IReadOnlyList<PdfPage> Import(List<PdfPage> pages, CancellationToken ct = default)
     {
         if (!SameDocument && !_source.Security.HasOwnerAccess && !_source.Security.Permissions.HasFlag(PdfPermissions.CopyContent))
         {
@@ -49,9 +57,39 @@ internal sealed partial class PageImporter
         var batch = new Dictionary<int, int>();
         var work = new Queue<(PdfObject Source, int Target)>();
         var result = new List<PdfPage>(pages.Count);
+        _newlyShared = [];
 
+        // A document still empty takes the source's language as its own.
+        bool targetWasEmpty = !SameDocument && _target.Pages.Count == 0;
+        FormState form = SaveFormState();
+        try
+        {
+            CopyPages(pages, numbers, pageMap, batch, work, result, targetWasEmpty, ct);
+        }
+        catch
+        {
+            // A failed or cancelled import leaves the target as it was: copies made so far are
+            // unreachable and never saved, but the shared copies this call reserved would
+            // otherwise be reused by the next import while some never came to exist.
+            foreach (int source in _newlyShared) _shared.Remove(source);
+            RestoreFormState(form);
+            _structure = null;
+            throw;
+        }
+        finally
+        {
+            _newlyShared = null;
+        }
+
+        return result;
+    }
+
+    private void CopyPages(
+        List<PdfPage> pages, int[] numbers, Dictionary<int, int> pageMap, Dictionary<int, int> batch, Queue<(PdfObject, int)> work, List<PdfPage> result, bool targetWasEmpty, CancellationToken ct)
+    {
         for (int i = 0; i < pages.Count; i++)
         {
+            ct.ThrowIfCancellationRequested();
             var copy = new PdfDictionary(pages[i].Dictionary.Count);
             for (int k = 0; k < pages[i].Dictionary.Count; k++)
             {
@@ -65,8 +103,10 @@ internal sealed partial class PageImporter
         }
 
         List<(int Target, string Key, PdfObject Value)> fixups = ImportFields(pageMap, batch, work);
-        while (work.Count > 0)
+        StructureCopy? structure = ImportStructure(pageMap, batch, work, ct);
+        for (int done = 0; work.Count > 0; done++)
         {
+            if (done % CancellationInterval == 0) ct.ThrowIfCancellationRequested();
             (PdfObject source, int target) = work.Dequeue();
             _target.Objects[target] = source switch
             {
@@ -81,7 +121,43 @@ internal sealed partial class PageImporter
             if (_target.Objects[target] is PdfDictionary d) d.Set(key, value);
         }
 
-        return result;
+        FinishStructure(structure, pageMap, batch, _newlyShared!, targetWasEmpty);
+    }
+
+    /// <summary>What importing fields changes in the target's form: the catalog entry, the form's entries and its two arrays.</summary>
+    private sealed record FormState(PdfObject? Entry, PdfDictionary? Form, PdfDictionary? Entries, PdfArray? Fields, List<PdfObject>? FieldItems, PdfArray? Order, List<PdfObject>? OrderItems);
+
+    private FormState SaveFormState()
+    {
+        PdfObject? entry = _target.Catalog["AcroForm"];
+        if (_target.Resolve(entry) is not PdfDictionary form) return new FormState(entry, null, null, null, null, null, null);
+        PdfArray? fields = _target.Resolve(form["Fields"]) as PdfArray;
+        PdfArray? order = _target.Resolve(form["CO"]) as PdfArray;
+        return new FormState(entry, form, PdfDocument.Clone(form), fields, fields is null ? null : [.. fields.Items], order, order is null ? null : [.. order.Items]);
+    }
+
+    private void RestoreFormState(FormState state)
+    {
+        if (state.Entry is null) _target.Catalog.Remove("AcroForm");
+        else _target.Catalog.Set("AcroForm", state.Entry);
+        if (state.Form is null || state.Entries is null) return;
+        foreach (string key in state.Form.Select(e => e.Key).ToList()) state.Form.Remove(key);
+        for (int i = 0; i < state.Entries.Count; i++)
+        {
+            (string key, PdfObject value) = state.Entries.EntryAt(i);
+            state.Form.Set(key, value);
+        }
+
+        // The arrays may be shared objects the import added to in place.
+        Restore(state.Fields, state.FieldItems);
+        Restore(state.Order, state.OrderItems);
+
+        static void Restore(PdfArray? array, List<PdfObject>? items)
+        {
+            if (array is null || items is null) return;
+            array.Items.Clear();
+            array.Items.AddRange(items);
+        }
     }
 
     /// <summary>
@@ -161,6 +237,10 @@ internal sealed partial class PageImporter
         if (_source.IsPageTreeNode(r.Number)) return PdfNull.Instance;
         if (_source.IsPage(r.Number)) return SameDocument ? r : PdfNull.Instance;
 
+        // A structure element is copied only with the content it tags; a generic copy would drag
+        // its parent, and so the whole tree, along.
+        if (StructureReference(r) is PdfObject mapped) return mapped;
+
         PdfDictionary? dict = target switch
         {
             PdfDictionary d => d,
@@ -187,6 +267,7 @@ internal sealed partial class PageImporter
         {
             number = _target.NextNumber++;
             _shared[r.Number] = number;
+            _newlyShared?.Add(r.Number);
             work.Enqueue((target, number));
         }
 

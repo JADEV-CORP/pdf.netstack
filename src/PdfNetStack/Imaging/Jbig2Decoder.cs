@@ -14,8 +14,9 @@ internal static class Jbig2Decoder
     /// <summary>The page as packed rows, 1 for black as T.88 codes it, <paramref name="width"/> by <paramref name="height"/>.</summary>
     /// <param name="data">The page's segments.</param>
     /// <param name="globals">Segments shared by the document's pages, decoded first, or null.</param>
+    /// <param name="ct">Observed before each segment.</param>
     /// <exception cref="Jbig2FormatException">The data is damaged, unsupported or exceeds the work the size allows.</exception>
-    public static byte[] Decode(byte[] data, byte[]? globals, int width, int height)
+    public static byte[] Decode(byte[] data, byte[]? globals, int width, int height, CancellationToken ct = default)
     {
         if (width <= 0 || height <= 0) throw new Jbig2FormatException("The image has no size.");
 
@@ -23,7 +24,7 @@ internal static class Jbig2Decoder
         // Scanners that store the whole page as one symbol placed by a text region spend five
         // pages: the symbol, the page, the region, and drawing the symbol and then the region.
         var budget = new Jbig2Budget(Math.Max(1L << 24, 8L * width * height));
-        var page = new Jbig2Page(width, height, budget);
+        var page = new Jbig2Page(width, height, budget) { Cancellation = ct };
         if (globals is not null) page.Run(globals, Start(globals));
         page.Run(data, Start(data));
         return page.Bitmap?.Data ?? throw new Jbig2FormatException("The data has no page information segment.");
@@ -52,6 +53,8 @@ internal static class Jbig2Decoder
 
         public Jbig2Bitmap? Bitmap { get; private set; }
 
+        public CancellationToken Cancellation { get; init; }
+
         private sealed class Segment
         {
             public List<Jbig2Bitmap>? Symbols { get; set; }
@@ -72,6 +75,7 @@ internal static class Jbig2Decoder
         {
             while (!_ended && data.Length - position >= HeaderMinimum)
             {
+                Cancellation.ThrowIfCancellationRequested();
                 // 7.2.2 to 7.2.7: number, flags, referred-to segments, page association, data length.
                 long number = UInt32(data, position);
                 int flags = data[position + 4], type = flags & 0x3F;

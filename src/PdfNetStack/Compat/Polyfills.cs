@@ -102,6 +102,16 @@ namespace System.Collections.Generic
     }
 }
 
+namespace System.Diagnostics.CodeAnalysis
+{
+    // Read by name by the compiler: tells callers of a Try method its out value is set when it returns true.
+    [AttributeUsage(AttributeTargets.Parameter, Inherited = false)]
+    internal sealed class NotNullWhenAttribute(bool returnValue) : Attribute
+    {
+        public bool ReturnValue { get; } = returnValue;
+    }
+}
+
 namespace PdfNetStack
 {
     internal static class PolyfillExtensions
