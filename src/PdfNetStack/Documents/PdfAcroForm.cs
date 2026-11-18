@@ -1,3 +1,4 @@
+using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using PdfNetStack.Drawing;
 using PdfNetStack.Fonts;
@@ -46,6 +47,11 @@ public sealed partial class PdfAcroForm
 {
     internal const int MaxFieldNodes = 50_000;
     private const int MaxDepth = 64;
+
+    // Values that check or clear a check box in Fill, besides its own on value.
+    private static readonly string[] CheckedWords = ["true", "yes", "on", "1"];
+    private static readonly string[] ClearedWords = ["off", "false", "no", "0", ""];
+
     private readonly PdfDocument _doc;
 
     internal PdfAcroForm(PdfDocument doc) => _doc = doc;
@@ -79,11 +85,138 @@ public sealed partial class PdfAcroForm
     public PdfField? this[string name] => Fields.FirstOrDefault(f => string.Equals(f.Name, name, StringComparison.Ordinal));
 
     /// <summary>
+    /// Finds the field with this fully qualified name when it is of the kind
+    /// <typeparamref name="T"/>, without a cast.
+    /// </summary>
+    /// <example>
+    /// <code>
+    /// if (doc.Form.TryGetField("customer.name", out PdfTextField? name)) name.Text = "Ada Lovelace";
+    /// </code>
+    /// </example>
+    /// <typeparam name="T">The field class expected, such as <see cref="PdfTextField"/> or <see cref="PdfCheckBoxField"/>.</typeparam>
+    /// <param name="name">The fully qualified name, compared exactly.</param>
+    /// <param name="field">The field, or null when the method returns false.</param>
+    /// <returns>True when a field has the name and is a <typeparamref name="T"/>; false when none has it or it is of another kind.</returns>
+    public bool TryGetField<T>(string name, [NotNullWhen(true)] out T? field)
+        where T : PdfField
+    {
+        Compat.ThrowIfNull(name, nameof(name));
+        field = this[name] as T;
+        return field is not null;
+    }
+
+    /// <summary>
+    /// Sets several fields by fully qualified name, then flattens the form when asked. All or
+    /// nothing: every name and value is checked first, and when any is wrong an
+    /// <see cref="ArgumentException"/> lists every problem and no field changes.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A name no field has is an error, not skipped, so a typo or a renamed field cannot go
+    /// unnoticed. To fill from a larger set of data, keep the names the form has:
+    /// <c>Fields.Select(f =&gt; f.Name)</c>. Read only fields, push buttons, signature fields and
+    /// fields of unknown type cannot be filled and are errors too.
+    /// </para>
+    /// <para>
+    /// Values by kind: a text field takes the text, cut to its maximum length. A check box is
+    /// checked by its on value, "true", "yes", "on" or "1", and cleared by "off", "false", "no",
+    /// "0" or an empty string, ignoring case. A radio button group takes the value of one of its
+    /// buttons, or an empty string or "Off" for none. A combo box or list box takes an export value
+    /// or the text shown for it, or an empty string for none; an editable combo box takes any
+    /// text. A null value clears the field. Values are set in the dictionary's order, each
+    /// redrawing its field.
+    /// </para>
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// doc.Form.Fill(new Dictionary&lt;string, string&gt;
+    /// {
+    ///     ["name"] = "Ada Lovelace",
+    ///     ["subscribe"] = "yes",
+    ///     ["country"] = "BE",
+    /// }, flatten: true);
+    /// </code>
+    /// </example>
+    /// <param name="values">Field names and their new values.</param>
+    /// <param name="flatten">Flatten the form once filled, as <see cref="Flatten()"/> does.</param>
+    /// <exception cref="ArgumentException">A name is unknown, a field cannot be filled, or a value does not fit its field. Nothing was changed.</exception>
+    public void Fill(IReadOnlyDictionary<string, string> values, bool flatten = false)
+    {
+        Compat.ThrowIfNull(values, nameof(values));
+        var byName = new Dictionary<string, PdfField>(StringComparer.Ordinal);
+        foreach (PdfField field in Fields) byName.TryAdd(field.Name, field);
+
+        var problems = new List<string>();
+        var changes = new List<Action>(values.Count);
+        foreach (KeyValuePair<string, string> entry in values)
+        {
+            if (!byName.TryGetValue(entry.Key, out PdfField? field))
+            {
+                problems.Add($"no field is named '{entry.Key}'");
+                continue;
+            }
+
+            if (field.ReadOnly)
+            {
+                problems.Add($"the field '{entry.Key}' is read only");
+                continue;
+            }
+
+            if (FillChange(field, entry.Value) is Action change) changes.Add(change);
+            else problems.Add(field is PdfTextField or PdfCheckBoxField or PdfRadioButtonField or PdfChoiceField
+                ? $"the field '{entry.Key}' does not take the value '{entry.Value}'"
+                : $"the field '{entry.Key}' is a {field.Kind} field, which holds no value to fill");
+        }
+
+        if (problems.Count > 0) throw new ArgumentException("The form was not filled: " + string.Join("; ", problems) + ".", nameof(values));
+        foreach (Action change in changes) change();
+        if (flatten) Flatten();
+    }
+
+    /// <summary>What setting <paramref name="value"/> on <paramref name="field"/> does, or null when the field does not take it.</summary>
+    private static Action? FillChange(PdfField field, string? value)
+    {
+        switch (field)
+        {
+            case PdfTextField text:
+                return () => text.Text = value;
+            case PdfCheckBoxField box:
+                bool? on = value is null ? false : CheckBoxState(box, value);
+                return on is bool state ? () => box.Checked = state : null;
+            case PdfRadioButtonField radio:
+                if (string.IsNullOrEmpty(value) || value == "Off") return () => radio.Selected = null;
+                return radio.Options.Contains(value!) ? () => radio.Selected = value : null;
+            case PdfChoiceField choice:
+                if (string.IsNullOrEmpty(value)) return () => choice.Select([]);
+                bool known = (choice.IsComboBox && choice.Editable) || choice.Options.Any(o => o.Value == value || o.Text == value);
+                return known ? () => choice.Select(value!) : null;
+            default:
+                return null;
+        }
+    }
+
+    private static bool? CheckBoxState(PdfCheckBoxField box, string value)
+    {
+        if (string.Equals(value, box.OnValue, StringComparison.Ordinal) || CheckedWords.Contains(value, StringComparer.OrdinalIgnoreCase)) return true;
+        if (ClearedWords.Contains(value, StringComparer.OrdinalIgnoreCase)) return false;
+        return null;
+    }
+
+    /// <summary>
     /// Draws every field's current appearance into its page and removes the form: the values
     /// stay visible and printable but can no longer be edited. Hidden fields are dropped.
     /// </summary>
-    public void Flatten()
+    public void Flatten() => Flatten(CancellationToken.None);
+
+    /// <summary>Flattens the form as <see cref="Flatten()"/> does, unless cancelled before it starts changing the document.</summary>
+    /// <param name="cancellationToken">
+    /// Observed while the fields and their widgets are gathered, up to the first change. From
+    /// there flattening runs to the end, so the document is never left half flattened.
+    /// </param>
+    /// <exception cref="OperationCanceledException">Cancelled; the document is unchanged.</exception>
+    public void Flatten(CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         if (Dictionary is null) return;
         var widgets = new HashSet<int>();
         var byPage = new Dictionary<PdfPage, List<PdfWidget>>();
@@ -98,6 +231,7 @@ public sealed partial class PdfAcroForm
             }
         }
 
+        cancellationToken.ThrowIfCancellationRequested();
         foreach ((PdfPage page, List<PdfWidget> list) in byPage)
         {
             using PdfGraphics g = page.CreateGraphics();

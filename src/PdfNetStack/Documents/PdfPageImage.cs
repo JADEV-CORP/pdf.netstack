@@ -95,7 +95,21 @@ public sealed class PdfPageImage
     /// </summary>
     /// <returns>The pixels, or null for an unknown encoding or an unsupported color space.</returns>
     /// <exception cref="PdfFormatException">The data is damaged or too large.</exception>
-    public PdfBitmap? Decode() => ImageSamples.Decode(_document, Dictionary, _data, _resources) is Raster r ? new PdfBitmap(r) : null;
+    public PdfBitmap? Decode() => Decode(CancellationToken.None);
+
+    /// <summary>
+    /// Decodes the image as <see cref="Decode()"/> does, stopping when
+    /// <paramref name="cancellationToken"/> fires. A large JPEG 2000 or JBIG2 image can take seconds.
+    /// </summary>
+    /// <param name="cancellationToken">
+    /// Observed before and after general compression is undone, inside the JPEG, JPEG 2000,
+    /// JBIG2 and CCITT decoders, and once per row while colors are converted.
+    /// </param>
+    /// <returns>The pixels, or null for an unknown encoding or an unsupported color space.</returns>
+    /// <exception cref="PdfFormatException">The data is damaged or too large.</exception>
+    /// <exception cref="OperationCanceledException">Cancelled before the image was decoded.</exception>
+    public PdfBitmap? Decode(CancellationToken cancellationToken) =>
+        ImageSamples.Decode(_document, Dictionary, _data, _resources, cancellationToken) is Raster r ? new PdfBitmap(r) : null;
 
     private int Int(PdfObject? value) => _document.Resolve(value) is PdfNumber n && n.ToDouble() is >= 0 and <= int.MaxValue and var v ? (int)v : 0;
 
