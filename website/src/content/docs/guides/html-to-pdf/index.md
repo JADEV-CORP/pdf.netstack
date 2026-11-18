@@ -121,13 +121,14 @@ them; set `Bookmarks = false` to write none.
 
 The full list, module by module, is on [CSS support](/guides/html-to-pdf/css-support/).
 
-## Safe for untrusted HTML
+## Untrusted HTML
 
 Without a `ResourceLoader`, nothing is fetched from the network and only files under the base
 folder are read, so converting HTML from users cannot reach internal services or other files.
 Parsing, styling and layout are bounded: nesting depth, selector complexity, `var()` expansion,
-`@import` chains, table spans, grid tracks and background tiling all have limits, so hostile
-markup ends in a finite document rather than a hang or a crash.
+`@import` chains, table spans, grid tracks and background tiling all have limits. They apply to
+each construct, not to a whole conversion, so give conversions of untrusted HTML a timeout and a
+memory limit. Resource limits for untrusted input are being added in 1.3.
 
 ## Limits
 
