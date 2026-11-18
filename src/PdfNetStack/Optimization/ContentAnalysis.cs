@@ -322,7 +322,7 @@ internal sealed class ContentAnalysis
         try
         {
             List<FilterSpec> filters = StreamCodec.GetFilters(stream.Dictionary, _file.Resolve);
-            using DecodedStream decoded = StreamCodec.Decode(stream.Data, filters, DecodeDepth.Full, _decodeLimit, _file.Resolve);
+            using DecodedStream decoded = StreamCodec.Decode(stream.Data, filters, DecodeDepth.Full, _decodeLimit, _file.Resolve, _file.Budget);
             if (decoded.Remaining.Count > 0 || decoded.PendingPredictor is not null) return null;
             _bytes += decoded.Data.Length;
             if (_bytes > MaxBytes) _exhausted = true;
@@ -412,12 +412,14 @@ internal sealed class ContentAnalysis
                 if (t.Kind != TokenKind.Keyword || IsLiteral(parser.Span[t.Start..t.End]))
                 {
                     parser.Position = start;
-                    if (operands.Count >= MaxOperands) operands.RemoveAt(0);
+                    // Half go at once: dropping one at a time moves the whole list per operand.
+                    if (operands.Count >= MaxOperands) operands.RemoveRange(0, MaxOperands / 2);
                     operands.Add(parser.ParseObject());
                     continue;
                 }
 
-                if (++_operations > MaxOperations)
+                // The run's operators also count against the document's budget, in batches.
+                if (++_operations > MaxOperations || (_operations % 1024 == 0 && _file.Budget?.TryChargeOperations(1024) == false))
                 {
                     _exhausted = true;
                     return;

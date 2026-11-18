@@ -11,6 +11,13 @@ public enum OptimizationDisposition
 
     /// <summary>The input was written unchanged because it uses features the optimizer must not touch.</summary>
     UnsupportedRetained,
+
+    /// <summary>
+    /// The input was written unchanged because rewriting it ran into one of
+    /// <see cref="PdfOptimizerOptions.Limits"/>: too large, too much to decode, or out of time.
+    /// <see cref="PdfOptimizationResult.Diagnostics"/> says which.
+    /// </summary>
+    LimitExceeded,
 }
 
 /// <summary>Counters describing what each pass did.</summary>
@@ -128,4 +135,7 @@ public sealed record PdfOptimizationResult(
 {
     /// <summary>Saving in percent of the input size.</summary>
     public double SavingPercent => OriginalBytes == 0 ? 0 : 100.0 * (OriginalBytes - OutputBytes) / OriginalBytes;
+
+    /// <summary>Warnings from the run: limits reached, and what the input needed repaired or had damaged.</summary>
+    public IReadOnlyList<PdfDiagnostic> Diagnostics { get; init; } = [];
 }

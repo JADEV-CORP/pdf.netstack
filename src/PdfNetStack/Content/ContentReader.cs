@@ -16,6 +16,17 @@ internal sealed class ContentOperation
 }
 
 /// <summary>
+/// The tokens the content of one page may take to read, shared by its streams and the forms it
+/// draws. Tokens are counted as read, so a damaged operand read twice counts twice.
+/// </summary>
+internal sealed class ContentBudget(long tokens)
+{
+    public long TokensLeft { get; set; } = tokens;
+
+    public bool Exhausted => TokensLeft < 0;
+}
+
+/// <summary>
 /// Reads a content stream as operators and operands (ISO 32000-1, 7.8.2), tolerantly: a damaged
 /// operand or a stray delimiter is skipped, as viewers skip them, and the rest still reads.
 /// </summary>
@@ -47,12 +58,21 @@ internal sealed class ContentReader
 
     private readonly PdfParser _parser;
     private readonly ReadOnlyMemory<byte> _data;
+    private readonly ContentBudget? _budget;
 
-    public ContentReader(ReadOnlyMemory<byte> data)
+    // Tokens of the parser already charged to the budget.
+    private long _charged;
+
+    /// <param name="budget">Shared with the page's other streams; null reads without a bound.</param>
+    public ContentReader(ReadOnlyMemory<byte> data, ContentBudget? budget = null)
     {
         _data = data;
         _parser = new PdfParser(data);
+        _budget = budget;
     }
+
+    /// <summary>True when reading stopped because the budget ran out rather than at the end of the data.</summary>
+    public bool BudgetExhausted => _budget is { Exhausted: true };
 
     /// <summary>Reads the next operation into <paramref name="op"/>; false at the end of the data.</summary>
     public bool Next(ContentOperation op)
@@ -62,6 +82,7 @@ internal sealed class ContentReader
         op.InlineData = default;
         while (true)
         {
+            if (!Charge()) return false;
             int start;
             Token t;
             try
@@ -97,6 +118,12 @@ internal sealed class ContentReader
             {
                 AddOperand(op, _parser.ParseObject());
             }
+            catch (PdfFormatException) when (_parser.NestingExceeded)
+            {
+                // Retrying one bracket further in would parse the same deep run again for every
+                // bracket in it, quadratic in its length: step over the whole run at once.
+                if (!SkipNested(start)) return false;
+            }
             catch (PdfFormatException)
             {
                 // A damaged operand: skip past the token that started it.
@@ -104,6 +131,55 @@ internal sealed class ContentReader
             }
         }
     }
+
+    /// <summary>Charges the tokens read since the last call; false once the budget has run out.</summary>
+    private bool Charge()
+    {
+        if (_budget is null) return true;
+        _budget.TokensLeft -= _parser.Tokens - _charged;
+        _charged = _parser.Tokens;
+        return !_budget.Exhausted;
+    }
+
+    /// <summary>
+    /// Steps over an array or dictionary nested too deep to read, in one pass: to the bracket
+    /// that closes it, or to the next operator, since an operand cannot hold one. False when the
+    /// data ends inside a string, after which nothing can be read.
+    /// </summary>
+    private bool SkipNested(int start)
+    {
+        _parser.Position = start;
+        int depth = 0;
+        try
+        {
+            while (true)
+            {
+                int at = _parser.Position;
+                Token t = _parser.NextToken();
+                switch (t.Kind)
+                {
+                    case TokenKind.EndOfInput:
+                        return true;
+                    case TokenKind.ArrayStart or TokenKind.DictStart:
+                        depth++;
+                        break;
+                    case TokenKind.ArrayEnd or TokenKind.DictEnd:
+                        if (--depth <= 0) return true;
+                        break;
+                    case TokenKind.Keyword when !IsValueKeyword(_parser.Span[t.Start..t.End]):
+                        _parser.Position = at;
+                        return true;
+                }
+            }
+        }
+        catch (PdfFormatException)
+        {
+            return false;
+        }
+    }
+
+    private static bool IsValueKeyword(ReadOnlySpan<byte> k) =>
+        k.SequenceEqual("true"u8) || k.SequenceEqual("false"u8) || k.SequenceEqual("null"u8) || (k.Length == 1 && k[0] is (byte)')' or (byte)'{' or (byte)'}');
 
     private static string OperatorName(ReadOnlySpan<byte> keyword) =>
         OperatorKey(keyword) is int key && Operators.TryGetValue(key, out string? name) ? name : Compat.Latin1.GetString(keyword);
@@ -126,8 +202,9 @@ internal sealed class ContentReader
 
     private static void AddOperand(ContentOperation op, PdfObject value)
     {
-        // Operands beyond any operator's need are dropped; the newest matter, as the operator follows them.
-        if (op.Operands.Count >= MaxOperands) op.Operands.RemoveAt(0);
+        // Operands beyond any operator's need are dropped; the newest matter, as the operator
+        // follows them. Half go at once: dropping one at a time moves the whole list per operand.
+        if (op.Operands.Count >= MaxOperands) op.Operands.RemoveRange(0, MaxOperands / 2);
         op.Operands.Add(value);
     }
 

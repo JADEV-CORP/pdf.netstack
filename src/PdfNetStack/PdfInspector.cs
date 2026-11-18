@@ -26,23 +26,56 @@ public sealed record PdfInspection(
     bool UsesXrefStreams,
     bool NeededRepair,
     IReadOnlyDictionary<string, StreamBucket> StreamsByKind,
-    IReadOnlyDictionary<string, int> FilterUsage);
+    IReadOnlyDictionary<string, int> FilterUsage)
+{
+    /// <summary>
+    /// Warnings found while inspecting: a page count the page tree claims but does not hold,
+    /// branches of the page tree that loop or nest too deep, repairs, limits reached.
+    /// </summary>
+    public IReadOnlyList<PdfDiagnostic> Diagnostics { get; init; } = [];
+}
 
 /// <summary>Reads PDF structure for diagnostics and corpus analysis.</summary>
 public static class PdfInspector
 {
     /// <summary>Inspects a PDF held in memory.</summary>
     /// <exception cref="PdfFormatException">The input is not a readable PDF.</exception>
-    public static PdfInspection Inspect(ReadOnlyMemory<byte> input, long maxDecodedStreamBytes = 256L << 20)
+    public static PdfInspection Inspect(ReadOnlyMemory<byte> input, long maxDecodedStreamBytes = 256L << 20) =>
+        Inspect(input, PdfLimits.Default, maxDecodedStreamBytes);
+
+    /// <summary>Inspects a PDF held in memory within <paramref name="limits"/>.</summary>
+    /// <param name="input">The PDF.</param>
+    /// <param name="limits">Ceilings on the input, on decoding and on time.</param>
+    /// <param name="maxDecodedStreamBytes">Ceiling for any single decoded stream.</param>
+    /// <exception cref="PdfFormatException">The input is not a readable PDF.</exception>
+    /// <exception cref="PdfLimitExceededException">The input is over <paramref name="limits"/>.</exception>
+    public static PdfInspection Inspect(ReadOnlyMemory<byte> input, PdfLimits limits, long maxDecodedStreamBytes = 256L << 20)
     {
-        PdfFile file = PdfFile.Open(input, maxDecodedStreamBytes);
+        Compat.ThrowIfNull(limits, nameof(limits));
+        limits.Validate();
+        InputReader.CheckLength(input.Length, limits.MaxInputBytes);
+        var deadline = Deadline.Start(limits);
+        var budget = new ResourceBudget(limits, input.Length, new PdfDiagnostics());
+        PdfFile file = PdfFile.Open(input, maxDecodedStreamBytes, budget);
         bool encrypted = file.Trailer["Encrypt"] is not null and not PdfNull;
-        ObjectGraph graph = ObjectGraph.Collect(file, stripThumbnails: false, stripPieceInfo: false, CancellationToken.None);
+        ObjectGraph graph;
+        using (CancellationTokenSource? timer = deadline.NewTimer())
+        {
+            try
+            {
+                graph = ObjectGraph.Collect(file, stripThumbnails: false, stripPieceInfo: false, timer?.Token ?? CancellationToken.None);
+            }
+            catch (OperationCanceledException) when (timer is { IsCancellationRequested: true })
+            {
+                throw budget.Exceeded(PdfLimitKind.Timeout, "Inspecting the document ran past its time limit (PdfLimits.Timeout).");
+            }
+        }
 
         var kinds = new Dictionary<string, (int Count, long Bytes)>(StringComparer.Ordinal);
         var filters = new Dictionary<string, int>(StringComparer.Ordinal);
         foreach (int number in graph.Order)
         {
+            deadline.ThrowIfPassed(budget);
             if (file.GetObject(number) is not PdfStream s) continue;
             string kind = Classify(file, s.Dictionary);
             kinds[kind] = kinds.TryGetValue(kind, out var k) ? (k.Count + 1, k.Bytes + s.Data.Length) : (1, s.Data.Length);
@@ -58,10 +91,14 @@ public static class PdfInspector
             }
         }
 
+        int pages = PdfOptimizer.CountPages(file, budget.Diagnostics);
+        if (file.WasReconstructed) budget.Diagnostics.Repaired("The cross-reference data was damaged; objects were found by scanning the file.");
+        if (file.LengthsRepaired > 0) budget.Diagnostics.Repaired(Compat.Format("{0} stream length(s) were wrong and were corrected from the data.", file.LengthsRepaired));
+        if (file.UnreadableObjects > 0) budget.Diagnostics.Skipped(Compat.Format("{0} object(s) could not be parsed and read as null.", file.UnreadableObjects));
         return new PdfInspection(
             input.Length,
             file.HeaderVersion,
-            PdfOptimizer.CountPages(file),
+            pages,
             file.Xref.Count(e => e.Value.Type != XrefEntryType.Free),
             graph.Order.Count,
             file.RevisionCount,
@@ -73,7 +110,10 @@ public static class PdfInspector
             file.UsesXrefStreams,
             file.WasReconstructed || file.LengthsRepaired > 0 || file.UnreadableObjects > 0,
             kinds.ToDictionary(p => p.Key, p => new StreamBucket(p.Value.Count, p.Value.Bytes)),
-            filters);
+            filters)
+        {
+            Diagnostics = budget.Diagnostics.Snapshot(),
+        };
     }
 
     private static string Classify(PdfFile file, PdfDictionary d)
