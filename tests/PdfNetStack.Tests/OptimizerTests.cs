@@ -1,5 +1,6 @@
 using System.Text;
 using PdfNetStack.Objects;
+using PdfNetStack.Optimization;
 using PdfNetStack.Parsing;
 
 namespace PdfNetStack.Tests;
@@ -214,6 +215,98 @@ public sealed class OptimizerTests
         byte[] input = b.BuildWithXrefStream(new HashSet<int> { 1, 2, 7, 8 });
 
         (byte[] output, PdfOptimizationResult result) = Run(input);
+
+        Assert.AreEqual(OptimizationDisposition.UnsupportedRetained, result.Disposition, result.Reason);
+        CollectionAssert.AreEqual(input, output);
+    }
+
+    private const string UsageRightsSignature =
+        "<</Type/Sig/Filter/Adobe.PPKLite/SubFilter/adbe.pkcs7.detached/Contents<00>/ByteRange[0 1 2 3]" +
+        "/Reference[<</Type/SigRef/TransformMethod/UR3/TransformParams<</Type/TransformParams/V/2.2/Form[/FillIn]>>>>]>>";
+
+    /// <summary>A file whose catalog carries usage rights, the way Reader Extensions writes them.</summary>
+    private static PdfBuilder UsageRightsFile(string perms = "/UR3 7 0 R")
+    {
+        PdfBuilder b = PdfBuilder.Simple("enabled");
+        b.SetStream(4, "", Repeat("0 0 m 1 1 l S\n", 300));
+        b.Set(1, $"<</Type/Catalog/Pages 2 0 R/Perms<<{perms}>>>>");
+        b.Set(7, UsageRightsSignature);
+        return b;
+    }
+
+    [TestMethod]
+    public void UsageRightsAreKeptByDefault()
+    {
+        byte[] input = UsageRightsFile().Build();
+
+        (byte[] output, PdfOptimizationResult result) = Run(input);
+
+        Assert.AreEqual(OptimizationDisposition.UnsupportedRetained, result.Disposition, result.Reason);
+        CollectionAssert.AreEqual(input, output);
+    }
+
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public void UsageRightsAreRemovedOnRequest(bool streaming)
+    {
+        byte[] input = UsageRightsFile().Build();
+        PdfOptimizerOptions options = NoThreshold with { RemoveUsageRights = true, Streaming = streaming };
+
+        byte[] output;
+        PdfOptimizationResult result;
+        if (streaming)
+        {
+            using var source = new MemoryStream(input);
+            using var sink = new MemoryStream();
+            result = PdfOptimizer.OptimizeAsync(source, sink, options).GetAwaiter().GetResult();
+            output = sink.ToArray();
+            Assert.IsTrue(result.Statistics.Streamed);
+        }
+        else
+        {
+            (output, result) = Run(input, options);
+        }
+
+        Assert.AreEqual(OptimizationDisposition.Optimized, result.Disposition, result.Reason);
+        Assert.IsLessThan(input.Length, output.Length);
+        StringAssert.Contains(result.Reason, "Usage rights removed");
+        Assert.AreEqual(1, result.Statistics.EntriesStripped);
+
+        // The usage rights are the one difference: the plain check reports them, and nothing else
+        // differs once they are allowed to be missing.
+        StringAssert.Contains(PdfEquivalence.FindDifference(input, output), "Perms");
+        var rules = VerificationRules.Lossless with { IgnoredSourceKeys = ["Perms"] };
+        Assert.IsNull(EquivalenceVerifier.Verify(Open(input), Open(output), rules, 64 << 20, 1, CancellationToken.None, out _));
+
+        PdfFile file = Open(output);
+        Assert.IsFalse(file.WasReconstructed);
+        Assert.IsNull(file.ResolveDictionary(file.Trailer["Root"])!["Perms"]);
+        Assert.AreEqual(-1, output.AsSpan().IndexOf("/ByteRange"u8));
+        Assert.AreEqual(1, PdfDocument.Open(output).Pages.Count);
+    }
+
+    /// <summary>
+    /// Only usage rights are removed: a certification (/DocMDP) or any other signature the file's
+    /// bytes hold, reachable or not, keeps the file as it is.
+    /// </summary>
+    [TestMethod]
+    [DataRow("certified")]
+    [DataRow("signed field")]
+    [DataRow("unreachable signature")]
+    public void FilesWithOtherSignaturesKeepTheirUsageRights(string other)
+    {
+        PdfBuilder b = other == "certified" ? UsageRightsFile("/UR3 7 0 R/DocMDP 8 0 R") : UsageRightsFile();
+        b.Set(8, "<</Type/Sig/Filter/Adobe.PPKLite/Contents<00>/ByteRange[0 1 2 3]>>");
+        if (other == "signed field")
+        {
+            b.Set(1, "<</Type/Catalog/Pages 2 0 R/Perms<</UR3 7 0 R>>/AcroForm<</Fields[9 0 R]/SigFlags 3>>>>");
+            b.Set(9, "<</FT/Sig/T(Signature1)/V 8 0 R/Rect[0 0 0 0]>>");
+        }
+
+        byte[] input = b.Build();
+
+        (byte[] output, PdfOptimizationResult result) = Run(input, NoThreshold with { RemoveUsageRights = true });
 
         Assert.AreEqual(OptimizationDisposition.UnsupportedRetained, result.Disposition, result.Reason);
         CollectionAssert.AreEqual(input, output);

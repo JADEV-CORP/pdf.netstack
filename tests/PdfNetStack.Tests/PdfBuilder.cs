@@ -54,7 +54,8 @@ internal sealed class PdfBuilder
     }
 
     /// <summary>Writes a file with an xref stream; objects listed in <paramref name="packed"/> go into one object stream.</summary>
-    public byte[] BuildWithXrefStream(ISet<int>? packed = null, bool predictor = true, int root = 1)
+    /// <param name="misplaceOwnEntry">Point the xref stream's entry for itself at object 1, as some writers do.</param>
+    public byte[] BuildWithXrefStream(ISet<int>? packed = null, bool predictor = true, int root = 1, bool misplaceOwnEntry = false)
     {
         packed ??= new HashSet<int>();
         var ms = new MemoryStream();
@@ -97,7 +98,7 @@ internal sealed class PdfBuilder
         }
 
         long xrefOffset = ms.Position;
-        entries[xrefNum] = (1, xrefOffset, 0);
+        entries[xrefNum] = misplaceOwnEntry ? entries[1] : (1, xrefOffset, 0);
         const int row = 7;
         var table = new byte[entries.Length * row];
         for (int n = 0; n < entries.Length; n++)
