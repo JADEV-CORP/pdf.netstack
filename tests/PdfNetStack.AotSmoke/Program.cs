@@ -120,6 +120,15 @@ internal static class Smoke
             Check(ExtractText(pdf).Contains(Heading, StringComparison.Ordinal), "the converted text reads back");
         });
 
+        Run("text for retrieval", () =>
+        {
+            byte[] pdf = ConvertHtml(Html, useSystemFonts: false);
+            PdfPageText page = PdfDocument.Open(pdf).ReadText(new PdfTextOptions { Format = PdfTextFormat.Markdown }).First();
+            Check(page.Text.Contains(Heading, StringComparison.Ordinal) && page.ReadingOrder == PdfReadingOrder.StructureTree, "a tagged page reads as Markdown in structure order");
+            var ingestion = new PdfNetStack.DataIngestion.PdfNetStackReader().ReadAsync(new MemoryStream(pdf), "smoke.pdf", "application/pdf").GetAwaiter().GetResult();
+            Check(ingestion.Sections.Count > 0 && ingestion.Sections[0].Elements.Count > 0, "the ingestion reader reads sections");
+        });
+
         Run("hyphenation", () =>
         {
             // Embedded deflate resources, read on first use, and the layouts that take them.

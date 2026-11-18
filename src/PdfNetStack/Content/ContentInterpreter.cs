@@ -181,6 +181,42 @@ internal abstract class ContentInterpreter
     {
     }
 
+    // The four hooks below let a subclass follow the parts of the graphics state the walk itself
+    // ignores (colour, opacity, clipping, optional content), as text extraction does to tell
+    // visible text from hidden text. They do nothing by default.
+
+    /// <summary>
+    /// An operator the walk does not act on itself: path construction and painting, clipping,
+    /// colour, graphics state parameters (gs), shading, and text operators whose operands are not
+    /// valid. Exists so colour, opacity and clip can be followed. <paramref name="operands"/> is
+    /// the reader's list, valid during the call only.
+    /// </summary>
+    protected virtual void OnOperator(string op, List<PdfObject> operands, PdfDictionary? resources)
+    {
+    }
+
+    /// <summary>
+    /// The graphics state was saved: by q, or before a form XObject is drawn. Each save is matched
+    /// by one <see cref="OnRestoreState"/>, so state a subclass keeps beside the walk's is saved
+    /// and restored with it.
+    /// </summary>
+    protected virtual void OnSaveState()
+    {
+    }
+
+    /// <summary>The state saved last was restored: by Q, after a form XObject, or at the end of a stream that left it saved.</summary>
+    protected virtual void OnRestoreState()
+    {
+    }
+
+    /// <summary>
+    /// A form XObject is about to be drawn, <see cref="Ctm"/> already including its /Matrix: its
+    /// /BBox clips what it draws and its /OC may hide it.
+    /// </summary>
+    protected virtual void OnBeginForm(PdfStream form)
+    {
+    }
+
     /// <summary>
     /// A stream's decoded data, or null when it cannot be decoded. What the page has left of its
     /// byte budget is the ceiling given to the decoder, so a page over it stops before allocating.
@@ -237,11 +273,21 @@ internal abstract class ContentInterpreter
             switch (op.Operator)
             {
                 case "q":
-                    if (_saved.Count < MaxStateDepth) _saved.Push((Ctm, Text, TextMatrix, _lineMatrix));
+                    if (_saved.Count < MaxStateDepth)
+                    {
+                        _saved.Push((Ctm, Text, TextMatrix, _lineMatrix));
+                        OnSaveState();
+                    }
+
                     break;
                 case "Q":
                     // A stream cannot restore state saved outside it (ISO 32000-1, 7.8.2).
-                    if (_saved.Count > baseDepth) (Ctm, Text, TextMatrix, _lineMatrix) = _saved.Pop();
+                    if (_saved.Count > baseDepth)
+                    {
+                        (Ctm, Text, TextMatrix, _lineMatrix) = _saved.Pop();
+                        OnRestoreState();
+                    }
+
                     break;
                 case "cm" when Numbers(o, 6) is { } m:
                     Ctm = PdfMatrix.Multiply(new PdfMatrix(m[0], m[1], m[2], m[3], m[4], m[5]), Ctm);
@@ -281,7 +327,12 @@ internal abstract class ContentInterpreter
         }
 
         // Unbalanced q and marked content inside a form or page are closed at its end.
-        while (_saved.Count > baseDepth) (Ctm, Text, TextMatrix, _lineMatrix) = _saved.Pop();
+        while (_saved.Count > baseDepth)
+        {
+            (Ctm, Text, TextMatrix, _lineMatrix) = _saved.Pop();
+            OnRestoreState();
+        }
+
         while (_marked > markedDepth) EndMarked();
         if (depth == 0) _markedOverflow = 0;
     }
@@ -339,10 +390,13 @@ internal abstract class ContentInterpreter
                     PdfMatrix saved = Ctm;
                     TextState text = Text;
                     PdfMatrix textMatrix = TextMatrix, lineMatrix = _lineMatrix;
+                    OnSaveState();
                     if (Numbers(Document.Resolve(xobject.Dictionary["Matrix"]) as PdfArray, 6) is { } m)
                     {
                         Ctm = PdfMatrix.Multiply(new PdfMatrix(m[0], m[1], m[2], m[3], m[4], m[5]), Ctm);
                     }
+
+                    OnBeginForm(xobject);
 
                     // A form without resources uses its parent's (ISO 32000-1, 7.8.3, for old files).
                     PdfDictionary? own = Document.Resolve(xobject.Dictionary["Resources"]) as PdfDictionary;
@@ -352,6 +406,7 @@ internal abstract class ContentInterpreter
                     Text = text;
                     TextMatrix = textMatrix;
                     _lineMatrix = lineMatrix;
+                    OnRestoreState();
                 }
                 finally
                 {
@@ -421,6 +476,9 @@ internal abstract class ContentInterpreter
             case "TJ" when o.Count > 0 && o[^1] is PdfArray items:
                 // The array's own list: handlers only read it.
                 OnShowText(items.Items, resources);
+                break;
+            default:
+                OnOperator(op, o, resources);
                 break;
         }
     }

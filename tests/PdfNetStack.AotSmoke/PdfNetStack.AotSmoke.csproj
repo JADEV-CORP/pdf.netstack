@@ -23,6 +23,8 @@
     <ProjectReference Include="..\..\src\PdfNetStack.Hyphenation\PdfNetStack.Hyphenation.csproj" />
     <ProjectReference Include="..\..\src\PdfNetStack.Ocr\PdfNetStack.Ocr.csproj" />
     <ProjectReference Include="..\..\src\PdfNetStack.Ocr.Tesseract\PdfNetStack.Ocr.Tesseract.csproj" />
+    <ProjectReference Include="..\..\src\PdfNetStack.DataIngestion\PdfNetStack.DataIngestion.csproj" />
+    <ProjectReference Include="..\..\src\PdfNetStack.Extensions.Hosting\PdfNetStack.Extensions.Hosting.csproj" />
   </ItemGroup>
 
   <ItemGroup>
@@ -31,6 +33,8 @@
     <TrimmerRootAssembly Include="PdfNetStack.Hyphenation" />
     <TrimmerRootAssembly Include="PdfNetStack.Ocr" />
     <TrimmerRootAssembly Include="PdfNetStack.Ocr.Tesseract" />
+    <TrimmerRootAssembly Include="PdfNetStack.DataIngestion" />
+    <TrimmerRootAssembly Include="PdfNetStack.Extensions.Hosting" />
   </ItemGroup>
 
 </Project>

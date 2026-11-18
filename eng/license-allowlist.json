@@ -1,6 +1,13 @@
 {
   "comment": "Every runtime package that ships with a PdfNetStack package must be listed here with its verified license. Adding an entry is a license review: check the nuspec license expression, not the project page.",
   "packages": {
+    "Microsoft.Extensions.Configuration.Abstractions": "MIT (nuspec license expression). PdfNetStack.Extensions.Hosting only, through Microsoft.Extensions.Options.ConfigurationExtensions.",
+    "Microsoft.Extensions.Configuration.Binder": "MIT (nuspec license expression). PdfNetStack.Extensions.Hosting only, through Microsoft.Extensions.Options.ConfigurationExtensions; the hosting package does not call it.",
+    "Microsoft.Extensions.DataIngestion.Abstractions": "MIT (nuspec license expression). PdfNetStack.DataIngestion only. Published as a preview only.",
+    "Microsoft.Extensions.DependencyInjection.Abstractions": "MIT (nuspec license expression). PdfNetStack.Extensions.Hosting only.",
+    "Microsoft.Extensions.Options": "MIT (nuspec license expression). PdfNetStack.Extensions.Hosting only.",
+    "Microsoft.Extensions.Options.ConfigurationExtensions": "MIT (nuspec license expression). PdfNetStack.Extensions.Hosting only.",
+    "Microsoft.Extensions.Primitives": "MIT (nuspec license expression). PdfNetStack.Extensions.Hosting only, through Microsoft.Extensions.Options.",
     "Microsoft.ML.OnnxRuntime": "MIT (LICENSE in the package; native binaries carry ThirdPartyNotices.txt, all permissive). PdfNetStack.Ocr, and bundled with its LICENSE and ThirdPartyNotices.txt in PdfNetStack.Ocr.Tool.",
     "Microsoft.ML.OnnxRuntime.Managed": "MIT (LICENSE.txt in the package). PdfNetStack.Ocr and PdfNetStack.Ocr.Tool.",
     "Microsoft.NET.ILLink.Tasks": "MIT (build time only)",
@@ -14,7 +21,14 @@
   },
   "onlyIn": {
     "Microsoft.ML.OnnxRuntime": ["src/PdfNetStack.Ocr/PdfNetStack.Ocr.csproj", "src/PdfNetStack.Ocr.Tool/PdfNetStack.Ocr.Tool.csproj", "src/PdfNetStack.Ocr.Tesseract/PdfNetStack.Ocr.Tesseract.csproj"],
-    "Microsoft.ML.OnnxRuntime.Managed": ["src/PdfNetStack.Ocr/PdfNetStack.Ocr.csproj", "src/PdfNetStack.Ocr.Tool/PdfNetStack.Ocr.Tool.csproj", "src/PdfNetStack.Ocr.Tesseract/PdfNetStack.Ocr.Tesseract.csproj"]
+    "Microsoft.ML.OnnxRuntime.Managed": ["src/PdfNetStack.Ocr/PdfNetStack.Ocr.csproj", "src/PdfNetStack.Ocr.Tool/PdfNetStack.Ocr.Tool.csproj", "src/PdfNetStack.Ocr.Tesseract/PdfNetStack.Ocr.Tesseract.csproj"],
+    "Microsoft.Extensions.Configuration.Abstractions": ["src/PdfNetStack.Extensions.Hosting/PdfNetStack.Extensions.Hosting.csproj"],
+    "Microsoft.Extensions.Configuration.Binder": ["src/PdfNetStack.Extensions.Hosting/PdfNetStack.Extensions.Hosting.csproj"],
+    "Microsoft.Extensions.DataIngestion.Abstractions": ["src/PdfNetStack.DataIngestion/PdfNetStack.DataIngestion.csproj"],
+    "Microsoft.Extensions.DependencyInjection.Abstractions": ["src/PdfNetStack.Extensions.Hosting/PdfNetStack.Extensions.Hosting.csproj"],
+    "Microsoft.Extensions.Options": ["src/PdfNetStack.Extensions.Hosting/PdfNetStack.Extensions.Hosting.csproj"],
+    "Microsoft.Extensions.Options.ConfigurationExtensions": ["src/PdfNetStack.Extensions.Hosting/PdfNetStack.Extensions.Hosting.csproj"],
+    "Microsoft.Extensions.Primitives": ["src/PdfNetStack.Extensions.Hosting/PdfNetStack.Extensions.Hosting.csproj"]
   },
   "bundledFiles": {
     "ch_PP-OCRv5_det_mobile.onnx": "Apache-2.0. PaddleOCR (Copyright (c) 2016 PaddlePaddle Authors), ONNX conversion by RapidOCR (Copyright (c) 2021 RapidAI). PdfNetStack.Ocr.Models and PdfNetStack.Ocr.Tool only, each with LICENSE.txt and NOTICE.txt.",
