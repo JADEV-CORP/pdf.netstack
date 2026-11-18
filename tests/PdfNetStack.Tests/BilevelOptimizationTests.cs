@@ -17,6 +17,9 @@ public sealed class BilevelOptimizationTests
     private const long Limit = 64 << 20;
     private static readonly PdfOptimizerOptions NoThreshold = new() { MinSavingPercent = 0 };
 
+    /// <summary>Bilevel images coded as CCITT Group 4 only, for the tests of that encoder and its proof.</summary>
+    private static readonly PdfOptimizerOptions Group4Only = NoThreshold with { UseJbig2 = false };
+
     private static string Fixture(string folder, string name) => Path.Combine(AppContext.BaseDirectory, "Fixtures", folder, name);
 
     /// <summary>
@@ -136,7 +139,7 @@ public sealed class BilevelOptimizationTests
         byte[] rows = ScanRows(1700, 2200);
         byte[] input = Page(Bilevel(1700, 2200, "/Filter/FlateDecode"), PdfBuilder.Deflate(rows), 612, 792);
 
-        (byte[] output, PdfOptimizationResult result) = PdfOptimizer.Optimize(input, NoThreshold);
+        (byte[] output, PdfOptimizationResult result) = PdfOptimizer.Optimize(input, Group4Only);
 
         Assert.AreEqual(OptimizationDisposition.Optimized, result.Disposition, result.Reason);
         Assert.AreEqual(1, result.Statistics.ImagesRecodedAsGroup4);
@@ -174,11 +177,20 @@ public sealed class BilevelOptimizationTests
         foreach ((string dictionary, byte[] data, bool blackIs1) in cases)
         {
             byte[] input = Page(dictionary, data, 300, 233);
-            (byte[] output, PdfOptimizationResult result) = PdfOptimizer.Optimize(input, NoThreshold);
+            (byte[] output, PdfOptimizationResult result) = PdfOptimizer.Optimize(input, Group4Only);
             Assert.AreEqual(1, result.Statistics.ImagesRecodedAsGroup4, dictionary + ": " + result.Reason);
             PdfStream image = Image(output);
             Assert.AreEqual("CCITTFaxDecode", image.Dictionary.GetName("Filter"), dictionary);
             Assert.AreEqual(blackIs1, Parms(image)["BlackIs1"] is PdfBoolean { Value: true }, dictionary);
+            CollectionAssert.AreEqual(Pixels(input), Pixels(output), dictionary);
+            Assert.IsNull(PdfEquivalence.FindDifference(input, output), dictionary);
+
+            // JBIG2 has no BlackIs1: a reader takes the inverse of the T.88 bitmap, whatever the samples mean.
+            (output, result) = PdfOptimizer.Optimize(input, NoThreshold);
+            Assert.AreEqual(1, result.Statistics.ImagesRecodedAsJbig2, dictionary + ": " + result.Reason);
+            image = Image(output);
+            Assert.AreEqual("JBIG2Decode", image.Dictionary.GetName("Filter"), dictionary);
+            Assert.IsNull(image.Dictionary["DecodeParms"], dictionary);
             CollectionAssert.AreEqual(Pixels(input), Pixels(output), dictionary);
             Assert.IsNull(PdfEquivalence.FindDifference(input, output), dictionary);
         }
@@ -195,7 +207,7 @@ public sealed class BilevelOptimizationTests
         string parms = $"/DecodeParms<</K {k}/Columns 301/Rows 97{(endOfLine ? "/EndOfLine true" : "")}{(byteAlign ? "/EncodedByteAlign true" : "")}>>";
         byte[] input = Page(Bilevel(301, 97, "/Filter/CCITTFaxDecode" + parms), data, 301, 97);
 
-        (byte[] output, PdfOptimizationResult result) = PdfOptimizer.Optimize(input, NoThreshold);
+        (byte[] output, PdfOptimizationResult result) = PdfOptimizer.Optimize(input, Group4Only);
 
         Assert.AreEqual(1, result.Statistics.ImagesRecodedAsGroup4, result.Reason);
         PdfStream image = Image(output);
@@ -217,7 +229,7 @@ public sealed class BilevelOptimizationTests
             b.Set(23, "true");
         });
 
-        (byte[] output, PdfOptimizationResult result) = PdfOptimizer.Optimize(input, NoThreshold);
+        (byte[] output, PdfOptimizationResult result) = PdfOptimizer.Optimize(input, Group4Only);
 
         Assert.AreEqual(OptimizationDisposition.Optimized, result.Disposition, result.Reason);
         Assert.AreEqual(1, result.Statistics.ImagesRecodedAsGroup4, result.Reason);
@@ -240,18 +252,20 @@ public sealed class BilevelOptimizationTests
         {
             byte[] input = Page(Bilevel(301, 97, $"/Filter/CCITTFaxDecode/DecodeParms<<{parms}>>"), g3, 301, 97);
             (_, PdfOptimizationResult result) = PdfOptimizer.Optimize(input, NoThreshold);
-            Assert.AreEqual(0, result.Statistics.ImagesRecodedAsGroup4, parms);
+            Assert.AreEqual(0, Recoded(result), parms);
         }
 
         // Cut short: viewers fill in what is missing in their own ways.
         byte[] cut = Page(Bilevel(301, 97, "/Filter/CCITTFaxDecode/DecodeParms<</K 4/Columns 301/Rows 97/EndOfLine true>>"), g3.AsSpan(0, g3.Length / 2).ToArray(), 301, 97);
-        Assert.AreEqual(0, PdfOptimizer.Optimize(cut, NoThreshold).Result.Statistics.ImagesRecodedAsGroup4);
+        Assert.AreEqual(0, Recoded(PdfOptimizer.Optimize(cut, NoThreshold).Result));
 
         // Short samples, read as zeros by some readers and not drawn by others.
         byte[] rows = ScanRows(400, 300);
         byte[] shortRaw = Page(Bilevel(400, 300, "/Filter/FlateDecode"), PdfBuilder.Deflate(rows.AsSpan(0, rows.Length - 50).ToArray()), 200, 150);
-        Assert.AreEqual(0, PdfOptimizer.Optimize(shortRaw, NoThreshold).Result.Statistics.ImagesRecodedAsGroup4);
+        Assert.AreEqual(0, Recoded(PdfOptimizer.Optimize(shortRaw, NoThreshold).Result));
     }
+
+    private static int Recoded(PdfOptimizationResult result) => result.Statistics.ImagesRecodedAsGroup4 + result.Statistics.ImagesRecodedAsJbig2;
 
     /// <summary>A source with a raw bilevel image and an output where it is the given CCITT data, otherwise identical.</summary>
     private static (byte[] Source, byte[] Output) Pair(byte[] rows, int width, int height, byte[] ccitt, string parms)
@@ -298,7 +312,7 @@ public sealed class BilevelOptimizationTests
         byte[] g4 = CcittEncoder.EncodeGroup4(rows, 2400, 3000, false, 1 << 24)!;
         byte[] input = Page(Bilevel(2400, 3000, "/Filter/CCITTFaxDecode/DecodeParms<</K -1/Columns 2400/Rows 3000>>"), g4, 288, 360);
 
-        (byte[] output, PdfOptimizationResult result) = PdfOptimizer.Optimize(input, NoThreshold with { MaxImageDpi = 150 });
+        (byte[] output, PdfOptimizationResult result) = PdfOptimizer.Optimize(input, Group4Only with { MaxImageDpi = 150 });
 
         Assert.AreEqual(OptimizationDisposition.Optimized, result.Disposition, result.Reason);
         Assert.AreEqual(1, result.Statistics.ImagesDownsampled);
@@ -328,7 +342,7 @@ public sealed class BilevelOptimizationTests
         byte[] g4 = CcittEncoder.EncodeGroup4(rows, 2400, 3000, false, 1 << 24)!;
         byte[] input = Page(Bilevel(2400, 3000, "/Filter/CCITTFaxDecode/DecodeParms<</K -1/Columns 2400/Rows 3000>>"), g4, 288, 360);
 
-        (byte[] output, PdfOptimizationResult result) = PdfOptimizer.Optimize(input, NoThreshold with { MaxImageDpi = 150, MaxBilevelImageDpi = 300 });
+        (byte[] output, PdfOptimizationResult result) = PdfOptimizer.Optimize(input, Group4Only with { MaxImageDpi = 150, MaxBilevelImageDpi = 300 });
 
         Assert.AreEqual(OptimizationDisposition.Optimized, result.Disposition, result.Reason);
         StringAssert.Contains(result.Reason, "1 image(s) downsampled to 150 dpi, bilevel images to 300 dpi");
@@ -542,5 +556,105 @@ public sealed class BilevelOptimizationTests
                 Assert.IsNull(PdfEquivalence.FindDifference(input, output, Limit, false, round % 2 == 0 ? 0.5 : null), result.Reason);
             }
         }
+    }
+
+    [TestMethod]
+    public void RawScanBecomesJbig2WithTheSamePixels()
+    {
+        byte[] rows = ScanRows(1700, 2200);
+        byte[] input = Page(Bilevel(1700, 2200, "/Filter/FlateDecode"), PdfBuilder.Deflate(rows), 612, 792);
+
+        (byte[] output, PdfOptimizationResult result) = PdfOptimizer.Optimize(input, NoThreshold);
+
+        Assert.AreEqual(OptimizationDisposition.Optimized, result.Disposition, result.Reason);
+        Assert.AreEqual(1, result.Statistics.ImagesRecodedAsJbig2);
+        Assert.AreEqual(0, result.Statistics.ImagesRecodedAsGroup4);
+        Assert.AreEqual("Rewritten and verified equivalent to the source.", result.Reason);
+        PdfStream image = Image(output);
+        Assert.AreEqual("JBIG2Decode", image.Dictionary.GetName("Filter"));
+        Assert.IsNull(image.Dictionary["DecodeParms"], "generic coding needs no JBIG2Globals");
+        Assert.IsTrue(Jbig2Encoder.IsPlainGeneric(image.Data.Span, 1700, 2200));
+        CollectionAssert.AreEqual(Pixels(input), Pixels(output));
+        Assert.IsNull(PdfEquivalence.FindDifference(input, output));
+
+        // Smaller than the same page as Group 4, which is what it is kept for.
+        (byte[] group4, _) = PdfOptimizer.Optimize(input, Group4Only);
+        Assert.IsLessThan(Image(group4).Data.Length * 9 / 10, image.Data.Length);
+    }
+
+    [TestMethod]
+    public void Jbig2NeedsPdf14()
+    {
+        // A PDF 1.3 file written without object streams stays 1.3, which has no JBIG2Decode.
+        byte[] rows = ScanRows(900, 700, seed: 2);
+        var b = new PdfBuilder { Version = "1.3" };
+        b.Set(1, "<</Type/Catalog/Pages 2 0 R>>");
+        b.Set(2, "<</Type/Pages/Kids[3 0 R]/Count 1>>");
+        b.SetStream(10, Bilevel(900, 700, "/Filter/FlateDecode"), PdfBuilder.Deflate(rows));
+        b.SetStream(4, "", "q 300 0 0 233 0 0 cm /Im0 Do Q"u8.ToArray());
+        b.Set(3, "<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]/Resources<</XObject<</Im0 10 0 R>>>>/Contents 4 0 R>>");
+        byte[] input = b.Build();
+
+        (byte[] classic, PdfOptimizationResult result) = PdfOptimizer.Optimize(input, NoThreshold with { UseObjectStreams = false });
+        Assert.AreEqual(1, result.Statistics.ImagesRecodedAsGroup4, result.Reason);
+        Assert.AreEqual(0, result.Statistics.ImagesRecodedAsJbig2);
+        Assert.AreEqual("CCITTFaxDecode", Image(classic).Dictionary.GetName("Filter"));
+
+        // Object streams raise the output to 1.5, where it may be used.
+        (_, result) = PdfOptimizer.Optimize(input, NoThreshold);
+        Assert.AreEqual(1, result.Statistics.ImagesRecodedAsJbig2, result.Reason);
+    }
+
+    /// <summary>A source with a raw bilevel image and an output where it is the given JBIG2 data, otherwise identical.</summary>
+    private static (byte[] Source, byte[] Output) Jbig2Pair(byte[] rows, int width, int height, byte[] jbig2, string parms = "")
+    {
+        byte[] source = Page(Bilevel(width, height, "/Filter/FlateDecode"), PdfBuilder.Deflate(rows), 300, 300);
+        byte[] output = Page(Bilevel(width, height, "/Filter/JBIG2Decode" + parms), jbig2, 300, 300, b => b.SetStream(20, "", [0, 0, 0, 0, 48]));
+        return (source, output);
+    }
+
+    [TestMethod]
+    public void ProofComparesEveryJbig2Pixel()
+    {
+        byte[] rows = ScanRows(301, 211);
+        byte[] good = BilevelImages.Jbig2(rows, 301, 211, 1 << 20)!;
+        (byte[] source, byte[] output) = Jbig2Pair(rows, 301, 211, good);
+        Assert.IsNull(PdfEquivalence.FindDifference(source, output));
+
+        // One pixel off.
+        byte[] changed = (byte[])rows.Clone();
+        changed[(100 * 38) + 20] ^= 0x10;
+        StringAssert.Contains(PdfEquivalence.FindDifference(Jbig2Pair(changed, 301, 211, good).Source, output), "bilevel image pixels differ");
+
+        // Data a reader could take in its own way: cut short, or coded as MMR.
+        StringAssert.Contains(PdfEquivalence.FindDifference(source, Jbig2Pair(rows, 301, 211, good.AsSpan(0, good.Length - 30).ToArray()).Output), "does not decode exactly");
+        byte[] mmr = (byte[])good.Clone();
+        mmr[11 + 19 + 11 + 17] = 0x01;
+        StringAssert.Contains(PdfEquivalence.FindDifference(source, Jbig2Pair(rows, 301, 211, mmr).Output), "does not decode exactly");
+
+        // With JBIG2Globals the parameters are compared as written.
+        StringAssert.Contains(PdfEquivalence.FindDifference(source, Jbig2Pair(rows, 301, 211, good, "/DecodeParms<</JBIG2Globals 20 0 R>>").Output), "encoded filter chain differs");
+    }
+
+    [TestMethod]
+    public void OversampledFaxPageIsReducedToJbig2()
+    {
+        byte[] rows = ScanRows(2400, 3000, seed: 3);
+        byte[] g4 = CcittEncoder.EncodeGroup4(rows, 2400, 3000, false, 1 << 24)!;
+        byte[] input = Page(Bilevel(2400, 3000, "/Filter/CCITTFaxDecode/DecodeParms<</K -1/Columns 2400/Rows 3000>>"), g4, 288, 360);
+
+        (byte[] output, PdfOptimizationResult result) = PdfOptimizer.Optimize(input, NoThreshold with { MaxBilevelImageDpi = 300 });
+
+        Assert.AreEqual(OptimizationDisposition.Optimized, result.Disposition, result.Reason);
+        Assert.AreEqual(1, result.Statistics.ImagesDownsampled);
+        PdfStream image = Image(output);
+        Assert.AreEqual("JBIG2Decode", image.Dictionary.GetName("Filter"));
+        double[] coverage = BilevelResampler.Coverage(rows, 2400, 3000, 1200, 1500);
+        byte[] expected = BilevelResampler.Threshold(coverage, 1200, 1500, onesAreForeground: false);
+        Assert.IsTrue(BilevelImages.SamePixels(expected, BilevelImages.Jbig2Pixels(image.Data.Span, 1200, 1500, Limit)!, 1200, 1500));
+        Assert.IsNull(PdfEquivalence.FindDifference(input, output, Limit, false, 0.95));
+
+        (byte[] group4, _) = PdfOptimizer.Optimize(input, Group4Only with { MaxBilevelImageDpi = 300 });
+        Assert.IsLessThan(Image(group4).Data.Length, image.Data.Length);
     }
 }

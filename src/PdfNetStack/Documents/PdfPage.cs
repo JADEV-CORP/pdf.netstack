@@ -5,7 +5,7 @@ using PdfNetStack.Objects;
 namespace PdfNetStack;
 
 /// <summary>One page of a <see cref="PdfDocument"/>.</summary>
-public sealed class PdfPage
+public sealed partial class PdfPage
 {
     private PdfAnnotationCollection? _annotations;
 

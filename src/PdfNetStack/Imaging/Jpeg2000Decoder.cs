@@ -144,6 +144,20 @@ internal sealed class Jpeg2000RasterChannel
 }
 
 /// <summary>
+/// The decoder's working buffers: a band of rows per resolution and use, and the code-block
+/// decoder's state. They grow to the largest tile met and every tile reuses them, each use writing
+/// or clearing what it reads, so they may as well serve the next image: an optimization decoding
+/// many JPEG 2000 images of a size then allocates them once per worker rather than per image.
+/// One decode at a time.
+/// </summary>
+internal sealed class Jpeg2000Workspace
+{
+    public Jpeg2000BlockDecoder Block { get; } = new();
+
+    public Jpeg2000Buffers Buffers { get; } = new();
+}
+
+/// <summary>
 /// Decodes JPEG 2000 (ITU-T T.800, part 1): JP2 files and raw codestreams. Tier-2 packet
 /// decoding in every progression order with precincts, layers, PPM, PPT, SOP and EPH; tier-1
 /// EBCOT with all code-block styles; scalar and reversible dequantization with ROI shifts; the
@@ -185,6 +199,33 @@ internal static class Jpeg2000Decoder
     /// <exception cref="Jpeg2000FormatException">The data is damaged, too large or unsupported.</exception>
     public static (Raster? Raster, ColorSpace? Space) DecodeForPdf(byte[] data, ColorSpace? space, long byteLimit, int bandRows = 0, long maxPixels = ImageSamples.MaxPixels, CancellationToken ct = default) =>
         Guarded(() => Pdf(data, space, byteLimit, bandRows, maxPixels, ct));
+
+    /// <summary>
+    /// The image as <see cref="Jpeg2000Image.ToRaster"/> gives it with scaling, written straight
+    /// from each band of rows into the raster: no plane of the whole image is held, which would
+    /// take four bytes a sample. Null unless the image is <paramref name="width"/> by
+    /// <paramref name="height"/> with exactly <paramref name="channels"/> channels, none of them
+    /// opacity, in colors that are not sYCC, and its samples fit <paramref name="byteLimit"/>.
+    /// </summary>
+    /// <param name="workspace">Working buffers to decode with and leave grown for the next decode, or null for new ones.</param>
+    /// <exception cref="Jpeg2000FormatException">The data is damaged, too large or unsupported.</exception>
+    public static Raster? DecodeRaster(ReadOnlySpan<byte> data, int width, int height, int channels, long byteLimit, Jpeg2000Workspace? workspace = null)
+    {
+        byte[] bytes = data.ToArray();
+        return Guarded(() =>
+        {
+            (Jpeg2000Codestream stream, Jp2Header? header) = Open(bytes, ImageSamples.MaxPixels);
+            Jpeg2000Image image = Assemble(stream, null, header, applyPalette: true);
+            if (image.Width != width || image.Height != height || image.ColorSpace == 18) return null;
+            if (image.Channels.Count != channels || image.Channels.Any(c => c.Opacity)) return null;
+            long outputBytes = (long)width * height * channels;
+            if (outputBytes > byteLimit || outputBytes > Compat.MaxArrayLength) return null;
+            if (image.Channels.Any(c => c.Width <= 0 || c.Height <= 0)) throw new Jpeg2000FormatException("A channel has no samples.");
+            var sink = new RasterSink(image, channels, scale: true, sycc: false);
+            Decode(stream, sink, byteLimit, outputBytes, 0, sink.Allocate, CancellationToken.None, workspace);
+            return sink.Raster;
+        });
+    }
 
     private static (Raster? Raster, ColorSpace? Space) Pdf(byte[] data, ColorSpace? space, long byteLimit, int bandRows, long maxPixels, CancellationToken ct)
     {
@@ -287,7 +328,8 @@ internal static class Jpeg2000Decoder
     /// <summary>Decodes every tile into the sink, within <paramref name="byteLimit"/> bytes with the sink's own.</summary>
     /// <param name="sinkBytes">What the sink holds.</param>
     /// <param name="allocate">Allocates the sink's buffers once the first check has passed.</param>
-    private static void Decode(Jpeg2000Codestream stream, ISink sink, long byteLimit, long sinkBytes, int bandRows, Action allocate, CancellationToken ct)
+    /// <param name="workspace">Working buffers to reuse, or null for new ones.</param>
+    private static void Decode(Jpeg2000Codestream stream, ISink sink, long byteLimit, long sinkBytes, int bandRows, Action allocate, CancellationToken ct, Jpeg2000Workspace? workspace = null)
     {
         long workingLimit = byteLimit - sinkBytes;
 
@@ -306,8 +348,9 @@ internal static class Jpeg2000Decoder
         allocate();
         if (Array.Exists(stream.Tiles, t => t is null)) sink.Missing();
 
-        var block = new Jpeg2000BlockDecoder();
-        var buffers = new Jpeg2000Buffers();
+        workspace ??= new Jpeg2000Workspace();
+        Jpeg2000BlockDecoder block = workspace.Block;
+        Jpeg2000Buffers buffers = workspace.Buffers;
         long blockLimit = Math.Max(4096, byteLimit / 128);
         for (int t = 0; t < stream.Tiles.Length; t++)
         {

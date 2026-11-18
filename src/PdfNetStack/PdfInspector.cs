@@ -151,7 +151,9 @@ public static class PdfEquivalence
     /// Inheritable page attributes may move from page tree nodes onto the pages, as long as every
     /// page ends up with the same values. A bilevel image stored as samples or CCITT data may be
     /// coded again as CCITT data when both decode to exactly the same pixels, with parameters and
-    /// data every reader takes alike. docs/FIDELITY.md gives the exact rules.
+    /// data every reader takes alike. Two encrypted files that the empty user password opens are
+    /// compared decrypted, and must be protected alike: the same encryption dictionary, file key
+    /// and first /ID entry. docs/FIDELITY.md gives the exact rules.
     /// </remarks>
     /// <param name="original">The source PDF.</param>
     /// <param name="candidate">The PDF to check against it.</param>
@@ -169,6 +171,7 @@ public static class PdfEquivalence
     {
         PdfFile a = PdfFile.Open(original, maxDecodedStreamBytes);
         PdfFile b = PdfFile.Open(candidate, maxDecodedStreamBytes);
+        UnlockBoth(a, b);
         VerificationRules rules = VerificationRules.Lossless with { Images = LossyImages.AllowanceFor(a, allowJpegRequantization, null, CancellationToken.None) };
         return EquivalenceVerifier.Verify(a, b, rules, maxDecodedStreamBytes, Environment.ProcessorCount, CancellationToken.None, out _);
     }
@@ -200,7 +203,29 @@ public static class PdfEquivalence
         if (minImageSsim is { } ssim && (double.IsNaN(ssim) || ssim is <= 0 or > 1)) throw new ArgumentOutOfRangeException(nameof(minImageSsim));
         PdfFile a = PdfFile.Open(original, maxDecodedStreamBytes);
         PdfFile b = PdfFile.Open(candidate, maxDecodedStreamBytes);
+        UnlockBoth(a, b);
         VerificationRules rules = VerificationRules.Lossless with { Images = LossyImages.AllowanceFor(a, allowJpegRequantization, minImageSsim, CancellationToken.None) };
         return EquivalenceVerifier.Verify(a, b, rules, maxDecodedStreamBytes, Environment.ProcessorCount, CancellationToken.None, out _);
+    }
+
+    /// <summary>
+    /// Unlocks two encrypted files with the empty user password, which opens most of them, so they
+    /// are compared decrypted; otherwise they are compared as stored. One that opens while the
+    /// other does not is itself a difference the proof reports.
+    /// </summary>
+    private static void UnlockBoth(PdfFile a, PdfFile b)
+    {
+        if (a.Trailer["Encrypt"] is null or PdfNull || b.Trailer["Encrypt"] is null or PdfNull) return;
+        foreach (PdfFile file in new[] { a, b })
+        {
+            try
+            {
+                file.Unlock(null);
+            }
+            catch (Exception ex) when (ex is PdfPasswordException or NotSupportedException or PdfFormatException)
+            {
+                // Left locked.
+            }
+        }
     }
 }

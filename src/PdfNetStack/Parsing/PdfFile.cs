@@ -32,6 +32,9 @@ internal sealed class PdfFile
     private readonly long _decodeLimit;
     private readonly Dictionary<int, XrefEntry> _xref = new();
     private readonly Dictionary<int, PdfObject> _cache = new();
+
+    // Every parse of this file shares one string and one PdfName per distinct name.
+    private readonly NameTable _names = new();
     private readonly Dictionary<int, ObjectStreamIndex> _objectStreams = new();
     private readonly HashSet<int> _resolving = new();
     private bool _loadingXref;
@@ -170,14 +173,14 @@ internal sealed class PdfFile
     private T ParseAt<T>(long offset, long limit, Func<PdfParser, long, T> body)
     {
         limit = Math.Min(limit, _source.Length);
-        if (_inMemory) return body(new PdfParser(_data[..(int)Math.Max(0, limit)], (int)Math.Min(offset, int.MaxValue)), 0);
+        if (_inMemory) return body(new PdfParser(_data[..(int)Math.Max(0, limit)], (int)Math.Min(offset, int.MaxValue)) { Names = _names }, 0);
 
         for (long size = FirstWindow; ; size *= 8)
         {
             long end = Math.Min(limit, offset + size);
             ReadOnlyMemory<byte> window = _source.Read(offset, end);
             bool whole = end >= limit || size >= MaxWindow;
-            var parser = new PdfParser(window);
+            var parser = new PdfParser(window) { Names = _names };
             try
             {
                 T result = body(parser, offset);
@@ -198,6 +201,13 @@ internal sealed class PdfFile
     public StandardSecurity? Security { get; private set; }
 
     private int _encryptNumber = -1;
+    private int _cryptFilterStreams;
+
+    /// <summary>
+    /// Streams read so far that chose their own crypt filter (a leading /Crypt filter), which
+    /// decryption removes. A rewrite would encrypt them with the default filter instead.
+    /// </summary>
+    public int CryptFilterStreams => Volatile.Read(ref _cryptFilterStreams);
 
     /// <summary>
     /// Authenticates against the /Encrypt dictionary. Every object read afterwards is decrypted.
@@ -715,8 +725,9 @@ internal sealed class PdfFile
         foreach ((int num, XrefEntry e) in _xref.Where(x => x.Value.Type == XrefEntryType.InFile).OrderBy(x => x.Value.Field1))
         {
             if (e.Field1 < 0 || e.Field1 >= _source.Length) return false;
-            bool header = ParseAt(e.Field1, _source.Length, (parser, _) =>
-                parser.TryReadInteger(out long n) && n == num && parser.TryReadInteger(out _) && parser.TryReadKeyword("obj"u8));
+
+            // In memory the header is read in place: no window, and no closure per object.
+            bool header = _inMemory ? IsHeader(new PdfParser(_data, (int)e.Field1), num) : HeaderInWindow(e.Field1, num);
             if (!header) return false;
         }
 
@@ -731,6 +742,12 @@ internal sealed class PdfFile
 
         return true;
     }
+
+    private bool HeaderInWindow(long offset, int number) => ParseAt(offset, _source.Length, (parser, _) => IsHeader(parser, number));
+
+    /// <summary>True when "<paramref name="number"/> g obj" starts at the parser's position.</summary>
+    private static bool IsHeader(PdfParser parser, int number) =>
+        parser.TryReadInteger(out long n) && n == number && parser.TryReadInteger(out _) && parser.TryReadKeyword("obj"u8);
 
     /// <summary>
     /// Rebuilds the cross-reference table by scanning for "n g obj" headers. The last
@@ -891,7 +908,7 @@ internal sealed class PdfFile
         if (offset < 0 || offset >= _source.Length) throw new PdfFormatException("Object offset outside the file.");
         if (!_inMemory) return ReadIndirectObjectFromStream(offset, expectedNumber);
         ReadOnlyMemory<byte> region = _data[..(int)RegionEnd(offset)];
-        var parser = new PdfParser(region, (int)offset);
+        var parser = new PdfParser(region, (int)offset) { Names = _names };
         if (!parser.TryReadInteger(out long num) || !parser.TryReadInteger(out long gen) || !parser.TryReadKeyword("obj"u8))
         {
             throw new PdfFormatException($"No object header at offset {offset}.");
@@ -970,6 +987,7 @@ internal sealed class PdfFile
         PdfObject? parms = Resolve(dict["DecodeParms"]);
         bool isCrypt = filter is PdfName { Value: "Crypt" } || (filter is PdfArray { Count: > 0 } fa && Resolve(fa[0]) is PdfName { Value: "Crypt" });
         if (!isCrypt) return true;
+        Interlocked.Increment(ref _cryptFilterStreams);
 
         PdfDictionary? cryptParms = parms switch
         {
@@ -1130,7 +1148,7 @@ internal sealed class PdfFile
 
         int start = os.First + os.Offsets[i];
         if (start < 0 || start >= os.Data.Length) throw new PdfFormatException("Object stream offset out of range.");
-        var parser = new PdfParser(os.Data, start);
+        var parser = new PdfParser(os.Data, start) { Names = _names };
         return parser.ParseObject();
     }
 

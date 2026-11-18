@@ -7,10 +7,10 @@ namespace PdfNetStack.Optimization;
 
 /// <summary>
 /// What the content of a document uses: the resource names each resource dictionary is looked
-/// up with, which streams are content streams and nothing else, and which glyphs each composite
-/// font with an identity encoding shows. The optimizer runs it before it changes anything, and
-/// the verifier runs it again on its own parse of the source, so every structural change is
-/// checked against an analysis of the original.
+/// up with, which streams are content streams and nothing else, and which codes each font shows:
+/// single bytes for simple fonts, two byte codes for composite fonts with an identity encoding.
+/// The optimizer runs it before it changes anything, and the verifier runs it again on its own
+/// parse of the source, so every structural change is checked against an analysis of the original.
 /// </summary>
 /// <remarks>
 /// Content is executed from the page tree and from annotation appearances, following form
@@ -34,6 +34,9 @@ internal sealed class ContentAnalysis
     private const int MaxOperands = 4096;
     private const int MaxStateDepth = 256;
 
+    /// <summary>Bytes the programs of shared streams may hold together; past it, streams are read again on each run.</summary>
+    private const long MaxProgramBytes = 64L << 20;
+
     private readonly PdfFile _file;
     private readonly ReferenceIndex _references;
     private readonly long _decodeLimit;
@@ -47,8 +50,15 @@ internal sealed class ContentAnalysis
     private readonly HashSet<(PdfObject Holder, PdfDictionary? Resources)> _reached = [];
     private readonly Queue<(PdfObject Holder, IReadOnlyList<PdfStream> Parts, PdfDictionary? Resources)> _deferred = new();
     private readonly Dictionary<PdfDictionary, HashSet<int>> _codes = new();
+    private readonly Dictionary<PdfDictionary, HashSet<int>> _simpleCodes = new();
     private readonly HashSet<PdfDictionary> _unreliableFonts = [];
     private readonly Dictionary<PdfDictionary, HashSet<PdfDictionary>> _fallbacks = new();
+    private readonly NameTable _nameTable = new();
+    private readonly Dictionary<PdfStream, ContentProgram> _programs = new();
+    private readonly HashSet<(PdfObject Holder, PdfDictionary? Resources)> _named = [];
+    private readonly Operand[]?[] _operandBuffers = new Operand[]?[MaxDepth + 2];
+    private readonly ContentProgram?[] _scratch = new ContentProgram?[MaxDepth + 2];
+    private long _programBytes;
     private long _bytes;
     private long _operations;
     private bool _exhausted;
@@ -84,7 +94,13 @@ internal sealed class ContentAnalysis
     /// <summary>Codes shown with each composite font whose encoding is Identity-H or Identity-V.</summary>
     public IReadOnlyDictionary<PdfDictionary, HashSet<int>> IdentityCodes => _codes;
 
-    /// <summary>Composite fonts some of whose text could not be decoded into codes.</summary>
+    /// <summary>Single byte codes shown with each simple font (Type 1, TrueType, Type 3).</summary>
+    public IReadOnlyDictionary<PdfDictionary, HashSet<int>> SimpleCodes => _simpleCodes;
+
+    /// <summary>
+    /// Fonts some of whose text could not be decoded into codes: composite fonts shown with
+    /// strings of odd length, or with a CMap other than Identity-H or Identity-V.
+    /// </summary>
     public IReadOnlyCollection<PdfDictionary> UnreliableFonts => _unreliableFonts;
 
     /// <summary>True when the font object <paramref name="fontNumber"/> is selectable only through category dictionaries this analysis saw completely.</summary>
@@ -266,7 +282,26 @@ internal sealed class ContentAnalysis
             return;
         }
 
-        List<byte[]>? decoded = Decode(parts);
+        // A form, pattern or glyph procedure runs once for each resources and font it is used
+        // with. It is decoded and read once; later runs replay what it does.
+        PdfStream? shared = holder as PdfStream;
+        if (shared is not null && _programs.TryGetValue(shared, out ContentProgram? cached))
+        {
+            if (!Recharge(cached))
+            {
+                if (resources is not null) _keepAll.Add(resources);
+                GlyphUsageComplete = false;
+                return;
+            }
+
+            bool fresh = _named.Add((holder, resources));
+            if (fresh) UseNames(cached.Names, resources, copy: true);
+            Replay(cached, resources, font, depth);
+            if (fresh && resources is not null) FollowNames(cached.Names, resources);
+            return;
+        }
+
+        List<Decoded>? decoded = Decode(parts);
         if (decoded is null)
         {
             // Content nobody can read still names resources a reader might find; keep them all.
@@ -275,67 +310,143 @@ internal sealed class ContentAnalysis
             return;
         }
 
-        byte[] content = Join(decoded, (byte)'\n');
-        var found = new HashSet<string>(StringComparer.Ordinal);
-        ScanNames(content, found);
-
-        // Readers that join the parts without a separator can see a name run across two parts.
-        if (decoded.Count > 1) ScanNames(Join(decoded, null), found);
-        if (resources is not null)
+        try
         {
-            if (_names.TryGetValue(resources, out HashSet<string>? names)) names.UnionWith(found);
-            else _names[resources] = found;
+            Run(holder, shared, decoded, resources, font, depth);
         }
-
-        Interpret(content, resources, font, depth);
-        if (resources is not null) FollowNames(found, resources);
+        finally
+        {
+            foreach (Decoded part in decoded) part.Stream.Dispose();
+        }
     }
 
-    private List<byte[]>? Decode(IReadOnlyList<PdfStream> parts)
+    /// <summary>Reads decoded content for the first time, keeping its program when the stream is shared.</summary>
+    private void Run(PdfObject holder, PdfStream? shared, List<Decoded> decoded, PdfDictionary? resources, PdfDictionary? font, int depth)
     {
-        var decoded = new List<byte[]>(parts.Count);
+        ReadOnlyMemory<byte> content = Join(decoded, (byte)'\n');
+        var found = new HashSet<string>(StringComparer.Ordinal);
+        ScanNames(content.Span, found, _nameTable);
+
+        // Readers that join the parts without a separator can see a name run across two parts.
+        if (decoded.Count > 1) ScanNames(Join(decoded, null).Span, found, _nameTable);
+
+        // The set handed to the resources grows with what other content adds to them; a kept
+        // program holds a copy of its own.
+        bool keep = shared is not null && decoded[0].Charged >= 0 && _programBytes < MaxProgramBytes;
+        ContentProgram program = keep
+            ? new ContentProgram(new HashSet<string>(found, StringComparer.Ordinal), decoded[0].Charged, decoded[0].Stream.Data.Length)
+            : Scratch(depth, found);
+
+        // The names content uses count once per resources: a run under another font adds none.
+        bool first = _named.Add((holder, resources));
+        if (first) UseNames(found, resources, copy: false);
+        if (Interpret(content, program, resources, font, depth) && keep && program.Recording)
+        {
+            _programs[shared!] = program;
+            _programBytes += program.Size;
+        }
+
+        if (first && resources is not null) FollowNames(found, resources);
+    }
+
+    /// <param name="copy">Hand over a copy, so <paramref name="found"/> never grows with other content's names.</param>
+    private void UseNames(HashSet<string> found, PdfDictionary? resources, bool copy)
+    {
+        if (resources is null) return;
+        if (_names.TryGetValue(resources, out HashSet<string>? names)) names.UnionWith(found);
+        else _names[resources] = copy ? new HashSet<string>(found, StringComparer.Ordinal) : found;
+    }
+
+    /// <summary>
+    /// Charges the budgets a replayed program would have charged decoding its stream again, so
+    /// limits are reached exactly where reading the stream anew would reach them. False when the
+    /// analysis' own byte budget ran out, as decoding would then have given up.
+    /// </summary>
+    private bool Recharge(ContentProgram program)
+    {
+        if (program.Charged > 0) _file.Budget?.ChargeDecodedBytes(program.Charged);
+        _bytes += program.Length;
+        if (_bytes > MaxBytes) _exhausted = true;
+        return !_exhausted;
+    }
+
+    /// <summary>A decoded part, held until its run ends, with what decoding it charged to the document's budget.</summary>
+    private readonly record struct Decoded(DecodedStream Stream, long Charged);
+
+    private List<Decoded>? Decode(IReadOnlyList<PdfStream> parts)
+    {
+        var decoded = new List<Decoded>(parts.Count);
         foreach (PdfStream part in parts)
         {
-            byte[]? data = DecodeOne(part);
-            if (data is null) return null;
-            decoded.Add(data);
+            Decoded? data = DecodeOne(part);
+            if (data is null)
+            {
+                foreach (Decoded done in decoded) done.Stream.Dispose();
+                return null;
+            }
+
+            decoded.Add(data.Value);
         }
 
         return decoded;
     }
 
-    private static byte[] Join(List<byte[]> parts, byte? separator)
+    private static ReadOnlyMemory<byte> Join(List<Decoded> parts, byte? separator)
     {
-        if (parts.Count == 1) return parts[0];
+        if (parts.Count == 1) return parts[0].Stream.Data;
         using var joined = new MemoryStream();
-        foreach (byte[] data in parts)
+        foreach (Decoded part in parts)
         {
-            joined.Write(data, 0, data.Length);
+            joined.Write(part.Stream.Data.Span);
             if (separator is { } b) joined.WriteByte(b);
         }
 
         return joined.ToArray();
     }
 
-    private byte[]? DecodeOne(PdfStream stream)
+    private Decoded? DecodeOne(PdfStream stream)
     {
+        DecodedStream? decoded = null;
         try
         {
             List<FilterSpec> filters = StreamCodec.GetFilters(stream.Dictionary, _file.Resolve);
-            using DecodedStream decoded = StreamCodec.Decode(stream.Data, filters, DecodeDepth.Full, _decodeLimit, _file.Resolve, _file.Budget);
+            decoded = StreamCodec.Decode(stream.Data, filters, DecodeDepth.Full, _decodeLimit, _file.Resolve, _file.Budget);
             if (decoded.Remaining.Count > 0 || decoded.PendingPredictor is not null) return null;
             _bytes += decoded.Data.Length;
             if (_bytes > MaxBytes) _exhausted = true;
-            return _exhausted ? null : decoded.Data.ToArray();
+            if (_exhausted) return null;
+
+            // Read in place: the content is only tokenized, and what a program keeps is copied out.
+            var result = new Decoded(decoded, Charge(filters, decoded.Data.Length));
+            decoded = null;
+            return result;
         }
         catch (StreamDecodeException)
         {
             return null;
         }
+        finally
+        {
+            decoded?.Dispose();
+        }
     }
 
+    /// <summary>
+    /// What decoding charged to the document's budget, which settles each filter's output at the
+    /// bytes it wrote: nothing without a filter, the decoded length with one and no predictor,
+    /// as content streams have. -1 for anything else, whose program is then not kept.
+    /// </summary>
+    private long Charge(List<FilterSpec> filters, int length) => filters.Count switch
+    {
+        0 => 0,
+        1 when StreamCodec.ReadPredictor(_file.Resolve(filters[0].Parms) as PdfDictionary, _file.Resolve).Predictor <= 1 => length,
+        _ => -1,
+    };
+
     /// <summary>Every '/' followed by regular characters is a name some tokenization may produce.</summary>
-    internal static void ScanNames(ReadOnlySpan<byte> s, HashSet<string> names)
+    internal static void ScanNames(ReadOnlySpan<byte> s, HashSet<string> names) => ScanNames(s, names, null);
+
+    private static void ScanNames(ReadOnlySpan<byte> s, HashSet<string> names, NameTable? table)
     {
         int i = 0;
         while (true)
@@ -345,7 +456,7 @@ internal sealed class ContentAnalysis
             int start = i + slash + 1;
             int end = start;
             while (end < s.Length && PdfSyntax.IsRegular(s[end])) end++;
-            names.Add(PdfParser.DecodeName(s[start..end]));
+            names.Add(table is null ? PdfParser.DecodeName(s[start..end]) : table.Get(s[start..end]));
             i = end;
             if (i >= s.Length) return;
         }
@@ -394,94 +505,192 @@ internal sealed class ContentAnalysis
     /// <summary>
     /// Follows the font through the content and records the codes shown with it. Form XObjects
     /// run from Do inherit the current font; anything the walk cannot read for certain makes the
-    /// glyph usage incomplete.
+    /// glyph usage incomplete. What the content does is written to <paramref name="program"/>
+    /// as it is applied, so a stream used again elsewhere can be replayed without reading it.
     /// </summary>
-    private void Interpret(byte[] content, PdfDictionary? resources, PdfDictionary? font, int depth)
+    /// <returns>False when the run ended for a reason other than its content, so its program is partial.</returns>
+    private bool Interpret(ReadOnlyMemory<byte> content, ContentProgram program, PdfDictionary? resources, PdfDictionary? font, int depth)
     {
         var parser = new PdfParser(content);
-        var operands = new List<PdfObject>();
-        var saved = new Stack<PdfDictionary?>();
-        PdfDictionary? current = font;
+        var state = new RunState(program, resources, font, depth);
+        Operand[] operands = OperandBuffer(depth);
+        int count = 0;
+        int pending = 0;
+        bool applying = false;
         try
         {
             while (true)
             {
                 int start = parser.Position;
                 Token t = parser.NextToken();
-                if (t.Kind == TokenKind.EndOfInput) return;
+                if (t.Kind == TokenKind.EndOfInput)
+                {
+                    Emit(new Effect(Step.End, pending));
+                    return !_exhausted;
+                }
+
                 if (t.Kind != TokenKind.Keyword || IsLiteral(parser.Span[t.Start..t.End]))
                 {
                     parser.Position = start;
-                    // Half go at once: dropping one at a time moves the whole list per operand.
-                    if (operands.Count >= MaxOperands) operands.RemoveRange(0, MaxOperands / 2);
-                    operands.Add(parser.ParseObject());
+
+                    // Operands are kept as spans of the content and read only for the operators
+                    // below that need them. Half go at once past the limit: dropping one at a
+                    // time moves the whole list per operand.
+                    if (count >= MaxOperands)
+                    {
+                        Array.Copy(operands, MaxOperands / 2, operands, 0, count - (MaxOperands / 2));
+                        count -= MaxOperands / 2;
+                    }
+
+                    TokenKind kind = parser.SkipObject();
+                    operands[count++] = new Operand(kind, t.Start, parser.Position);
                     continue;
                 }
 
-                // The run's operators also count against the document's budget, in batches.
-                if (++_operations > MaxOperations || (_operations % 1024 == 0 && _file.Budget?.TryChargeOperations(1024) == false))
-                {
-                    _exhausted = true;
-                    return;
-                }
-
-                string op = Operator(parser.Span[t.Start..t.End]);
-                switch (op)
+                pending++;
+                bool go = true;
+                switch (Operator(parser.Span[t.Start..t.End]))
                 {
                     case "q":
-                        if (saved.Count >= MaxStateDepth)
-                        {
-                            GlyphUsageComplete = false;
-                            return;
-                        }
-
-                        saved.Push(current);
+                        go = Emit(new Effect(Step.Save, pending));
                         break;
                     case "Q":
-                        if (saved.Count > 0) current = saved.Pop();
+                        go = Emit(new Effect(Step.Restore, pending));
                         break;
                     case "Tf":
-                        if (operands.Count < 2 || operands[^2] is not PdfName fontName)
-                        {
-                            GlyphUsageComplete = false;
-                            return;
-                        }
-
-                        current = Lookup(resources, "Font", fontName.Value) as PdfDictionary ?? Missing;
+                        go = count >= 2 && operands[count - 2].Kind == TokenKind.Name
+                            ? Emit(new Effect(Step.SelectFont, pending, NameOf(parser, operands[count - 2])))
+                            : Emit(new Effect(Step.Stop, pending));
                         break;
-                    case "gs" when operands.Count > 0 && operands[^1] is PdfName stateName:
-                        if (Lookup(resources, "ExtGState", stateName.Value) is PdfDictionary state &&
-                            _file.Resolve(state["Font"]) is PdfArray { Count: > 0 } selection)
-                        {
-                            current = _file.Resolve(selection[0]) as PdfDictionary ?? Missing;
-                        }
-
+                    case "gs" when count > 0 && operands[count - 1].Kind == TokenKind.Name:
+                        go = Emit(new Effect(Step.SelectState, pending, NameOf(parser, operands[count - 1])));
                         break;
                     case "Tj" or "'" or "\"" or "TJ":
-                        foreach (PdfObject operand in operands) Show(current, operand);
-                        break;
-                    case "Do" when operands.Count > 0 && operands[^1] is PdfName formName:
-                        if (Lookup(resources, "XObject", formName.Value) is PdfStream form && IsForm(form.Dictionary) && form.Dictionary.GetName("Subtype") == "Form")
-                        {
-                            Run(form, [form], OwnResources(form.Dictionary, resources) ?? resources, current, depth + 1);
-                        }
+                    {
+                        int first = program.StringCount;
+                        int resume = parser.Position;
+                        for (int i = 0; i < count; i++) CollectStrings(parser, operands[i], program);
+                        parser.Position = resume;
 
+                        // Showing nothing does nothing: its operators wait for the next effect.
+                        if (program.StringCount > first) go = Emit(new Effect(Step.Show, pending, null, first, program.StringCount - first));
+                        break;
+                    }
+
+                    case "Do" when count > 0 && operands[count - 1].Kind == TokenKind.Name:
+                        go = Emit(new Effect(Step.Draw, pending, NameOf(parser, operands[count - 1])));
                         break;
                     case "BI":
-                        if (!SkipInlineImage(parser)) return;
+                        if (!SkipInlineImage(parser)) go = Emit(new Effect(Step.Stop, pending));
                         break;
                     case ")" or "{" or "}":
                         // Stray delimiters: readers recover in different ways.
-                        GlyphUsageComplete = false;
-                        return;
+                        go = Emit(new Effect(Step.Stop, pending));
+                        break;
                 }
 
-                operands.Clear();
+                if (!go) return !_exhausted;
+                count = 0;
+            }
+        }
+        catch (PdfFormatException)
+        {
+            if (applying)
+            {
+                // Failed in content this one drew, which another context may draw differently.
+                program.Recording = false;
+                GlyphUsageComplete = false;
+                return !_exhausted;
+            }
+
+            Emit(new Effect(Step.Stop, pending));
+            return !_exhausted;
+        }
+
+        // Records the effect, then applies it. The operators read since the last effect are
+        // charged first, as reading them charged them one by one.
+        bool Emit(Effect effect)
+        {
+            pending = 0;
+            program.Add(effect);
+            applying = true;
+            bool go = Apply(effect, ref state);
+            applying = false;
+            if (!program.Recording) program.ClearStrings();
+            return go;
+        }
+    }
+
+    /// <summary>Runs a program read before, in a new context: the same steps, budgets and failures as reading its stream again.</summary>
+    private void Replay(ContentProgram program, PdfDictionary? resources, PdfDictionary? font, int depth)
+    {
+        var state = new RunState(program, resources, font, depth);
+        try
+        {
+            foreach (Effect effect in program.Effects)
+            {
+                if (!Apply(effect, ref state)) return;
             }
         }
         catch (PdfFormatException)
         {
             GlyphUsageComplete = false;
+        }
+    }
+
+    /// <summary>Applies one effect in the run's context; false when the run must stop.</summary>
+    private bool Apply(in Effect effect, ref RunState state)
+    {
+        for (int i = 0; i < effect.Operators; i++)
+        {
+            // The run's operators also count against the document's budget, in batches.
+            if (++_operations > MaxOperations || (_operations % 1024 == 0 && _file.Budget?.TryChargeOperations(1024) == false))
+            {
+                _exhausted = true;
+                return false;
+            }
+        }
+
+        switch (effect.Step)
+        {
+            case Step.Save:
+                if (state.Saved.Count >= MaxStateDepth)
+                {
+                    GlyphUsageComplete = false;
+                    return false;
+                }
+
+                state.Saved.Push(state.Font);
+                return true;
+            case Step.Restore:
+                if (state.Saved.Count > 0) state.Font = state.Saved.Pop();
+                return true;
+            case Step.SelectFont:
+                state.Font = Lookup(state.Resources, "Font", effect.Name!) as PdfDictionary ?? Missing;
+                return true;
+            case Step.SelectState:
+                if (Lookup(state.Resources, "ExtGState", effect.Name!) is PdfDictionary graphicsState &&
+                    _file.Resolve(graphicsState["Font"]) is PdfArray { Count: > 0 } selection)
+                {
+                    state.Font = _file.Resolve(selection[0]) as PdfDictionary ?? Missing;
+                }
+
+                return true;
+            case Step.Show:
+                for (int i = 0; i < effect.Count; i++) Show(state.Font, state.Program.String(effect.First + i));
+                return true;
+            case Step.Draw:
+                if (Lookup(state.Resources, "XObject", effect.Name!) is PdfStream form && IsForm(form.Dictionary) && form.Dictionary.GetName("Subtype") == "Form")
+                {
+                    Run(form, [form], OwnResources(form.Dictionary, state.Resources) ?? state.Resources, state.Font, state.Depth + 1);
+                }
+
+                return true;
+            case Step.Stop:
+                GlyphUsageComplete = false;
+                return false;
+            default:
+                return false;
         }
     }
 
@@ -519,56 +728,218 @@ internal sealed class ContentAnalysis
     private PdfObject? Lookup(PdfDictionary? resources, string category, string name) =>
         resources is not null && _file.Resolve(resources[category]) is PdfDictionary c ? _file.Resolve(c[name]) : null;
 
-    private void Show(PdfDictionary? font, PdfObject operand)
+    private string NameOf(PdfParser parser, Operand name) => _nameTable.Get(parser.Span[(name.Start + 1)..name.End]);
+
+    /// <summary>
+    /// Adds the non-empty strings an operand shows to the program: the operand itself, or the
+    /// strings anywhere in an array, in order. Numbers, names and dictionaries show nothing.
+    /// </summary>
+    private static void CollectStrings(PdfParser parser, Operand operand, ContentProgram program)
     {
-        switch (operand)
+        switch (operand.Kind)
         {
-            case PdfString s when s.Value.Length > 0:
-                if (font is null)
-                {
-                    GlyphUsageComplete = false;
-                    return;
-                }
-
-                if (font.GetName("Subtype") != "Type0" || font.GetName("Encoding") is not ("Identity-H" or "Identity-V")) return;
-                if (!_codes.TryGetValue(font, out HashSet<int>? codes))
-                {
-                    codes = [];
-                    _codes[font] = codes;
-                }
-
-                if (s.Value.Length % 2 != 0) _unreliableFonts.Add(font);
-                for (int i = 0; i + 1 < s.Value.Length; i += 2) codes.Add((s.Value[i] << 8) | s.Value[i + 1]);
+            case TokenKind.LiteralString or TokenKind.HexString:
+                program.AddString(parser.Span[operand.Start..operand.End], operand.Kind);
                 break;
-            case PdfArray items:
-                foreach (PdfObject item in items) Show(font, item);
+            case TokenKind.ArrayStart:
+                parser.Position = operand.Start + 1;
+                CollectArray(parser, program);
                 break;
         }
     }
 
+    /// <summary>Strings of an array the operand read already proved well formed, from after its '['.</summary>
+    private static void CollectArray(PdfParser parser, ContentProgram program)
+    {
+        while (true)
+        {
+            int at = parser.Position;
+            Token t = parser.NextToken();
+            switch (t.Kind)
+            {
+                case TokenKind.ArrayEnd or TokenKind.EndOfInput:
+                    return;
+                case TokenKind.LiteralString or TokenKind.HexString:
+                    program.AddString(parser.Span[t.Start..t.End], t.Kind);
+                    break;
+                case TokenKind.ArrayStart:
+                    CollectArray(parser, program);
+                    break;
+                case TokenKind.DictStart:
+                    // A dictionary in a text array shows nothing, whatever strings it holds.
+                    parser.Position = at;
+                    parser.SkipObject();
+                    break;
+            }
+        }
+    }
+
+    private void Show(PdfDictionary? font, ReadOnlySpan<byte> s)
+    {
+        if (font is null)
+        {
+            GlyphUsageComplete = false;
+            return;
+        }
+
+        if (font.GetName("Subtype") != "Type0")
+        {
+            if (!_simpleCodes.TryGetValue(font, out HashSet<int>? bytes))
+            {
+                bytes = [];
+                _simpleCodes[font] = bytes;
+            }
+
+            foreach (byte b in s) bytes.Add(b);
+            return;
+        }
+
+        // Codes of other CMaps need the CMap to split the string; such fonts are never subset or merged.
+        if (font.GetName("Encoding") is not ("Identity-H" or "Identity-V"))
+        {
+            _unreliableFonts.Add(font);
+            return;
+        }
+
+        if (!_codes.TryGetValue(font, out HashSet<int>? codes))
+        {
+            codes = [];
+            _codes[font] = codes;
+        }
+
+        if (s.Length % 2 != 0) _unreliableFonts.Add(font);
+        for (int i = 0; i + 1 < s.Length; i += 2) codes.Add((s[i] << 8) | s[i + 1]);
+    }
+
+    /// <summary>Operand buffers, one per level of form nesting, reused from run to run.</summary>
+    private Operand[] OperandBuffer(int depth) => _operandBuffers[depth] ??= new Operand[MaxOperands];
+
+    /// <summary>A program that is applied but not kept, for page content; one per level of nesting.</summary>
+    private ContentProgram Scratch(int depth, HashSet<string> names)
+    {
+        ContentProgram program = _scratch[depth] ??= new ContentProgram(names, 0, 0) { Recording = false };
+        program.Reset(names);
+        return program;
+    }
+
+    /// <summary>An operand: the kind of its first token and where it lies in the content.</summary>
+    private readonly record struct Operand(TokenKind Kind, int Start, int End);
+
+    private enum Step : byte
+    {
+        Save,
+        Restore,
+        SelectFont,
+        SelectState,
+        Show,
+        Draw,
+        Stop,
+        End,
+    }
+
+    /// <summary>
+    /// One thing content does that the analysis follows. <see cref="Operators"/> counts the
+    /// operators read since the previous effect, this one's own included.
+    /// </summary>
+    private readonly record struct Effect(Step Step, int Operators, string? Name = null, int First = 0, int Count = 0);
+
+    /// <summary>The state of one run of a program: its context, the current font and the saved fonts.</summary>
+    private struct RunState(ContentProgram program, PdfDictionary? resources, PdfDictionary? font, int depth)
+    {
+        public readonly ContentProgram Program = program;
+        public readonly PdfDictionary? Resources = resources;
+        public readonly int Depth = depth;
+        public readonly Stack<PdfDictionary?> Saved = new();
+        public PdfDictionary? Font = font;
+    }
+
+    /// <summary>
+    /// What one content stream does, in order, independent of the resources and font it runs
+    /// with: font and state selections by name, strings shown, forms drawn, saves and restores,
+    /// and where reading stopped. Kept for streams run in more than one context.
+    /// </summary>
+    private sealed class ContentProgram(HashSet<string> names, long charged, int length)
+    {
+        private readonly List<int> _ends = [];
+        private byte[] _bytes = new byte[256];
+        private int _used;
+
+        /// <summary>Every name the stream's bytes hold.</summary>
+        public HashSet<string> Names { get; private set; } = names;
+
+        /// <summary>What decoding the stream charged to the document's budget.</summary>
+        public long Charged { get; } = charged;
+
+        /// <summary>The stream's decoded length.</summary>
+        public int Length { get; } = length;
+
+        public List<Effect> Effects { get; } = [];
+
+        /// <summary>False once the program is not kept: effects are applied and dropped.</summary>
+        public bool Recording { get; set; } = true;
+
+        public int StringCount => _ends.Count;
+
+        /// <summary>Bytes the program holds, about.</summary>
+        public long Size => (Effects.Count * 32L) + (_ends.Count * 4L) + _used + (Names.Count * 48L);
+
+        public ReadOnlySpan<byte> String(int index) => _bytes.AsSpan(index == 0 ? 0 : _ends[index - 1], _ends[index] - (index == 0 ? 0 : _ends[index - 1]));
+
+        public void Add(Effect effect)
+        {
+            if (!Recording) return;
+            Effects.Add(effect);
+            if (Size > MaxProgramBytes / 4)
+            {
+                // Too big to keep: what is applied stays right, nothing more is recorded.
+                Recording = false;
+                Effects.Clear();
+            }
+        }
+
+        /// <summary>Decodes a string token and keeps it when it is not empty.</summary>
+        public void AddString(ReadOnlySpan<byte> token, TokenKind kind)
+        {
+            int room = token.Length;
+            if (_used + room > _bytes.Length) Array.Resize(ref _bytes, (int)Math.Min(Compat.MaxArrayLength, Math.Max((long)_bytes.Length * 2, (long)_used + room)));
+            Span<byte> target = _bytes.AsSpan(_used);
+            int length = kind == TokenKind.LiteralString ? PdfParser.DecodeLiteralString(token[1..], target) : PdfParser.DecodeHexString(token[1..], target);
+            if (length == 0) return;
+            _used += length;
+            _ends.Add(_used);
+        }
+
+        public void ClearStrings()
+        {
+            _ends.Clear();
+            _used = 0;
+        }
+
+        public void Reset(HashSet<string> names)
+        {
+            Names = names;
+            ClearStrings();
+            Effects.Clear();
+        }
+    }
+
     /// <summary>Steps over BI ... ID data EI. False when the end of the data is ambiguous.</summary>
-    private bool SkipInlineImage(PdfParser parser)
+    private static bool SkipInlineImage(PdfParser parser)
     {
         var image = new PdfDictionary();
         while (true)
         {
             Token t = parser.NextToken();
-            if (t.Kind == TokenKind.EndOfInput) return Ambiguous();
+            if (t.Kind == TokenKind.EndOfInput) return false;
             if (t.Kind == TokenKind.Keyword && parser.Span[t.Start..t.End].SequenceEqual("ID"u8)) break;
-            if (t.Kind != TokenKind.Name) return Ambiguous();
+            if (t.Kind != TokenKind.Name) return false;
             image.Set(PdfParser.DecodeName(parser.Span[(t.Start + 1)..t.End]), parser.ParseObject());
         }
 
         (_, int keywordEnd, bool unambiguous) = InlineImageBounds.Find(parser.Span, parser.Position + 1, image);
-        if (!unambiguous) return Ambiguous();
+        if (!unambiguous) return false;
         parser.Position = keywordEnd;
         return true;
-
-        bool Ambiguous()
-        {
-            GlyphUsageComplete = false;
-            return false;
-        }
     }
 
     /// <summary>Turns the names seen per resource dictionary into prunable category dictionaries.</summary>

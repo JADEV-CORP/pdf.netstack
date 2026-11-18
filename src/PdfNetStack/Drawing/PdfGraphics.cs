@@ -88,6 +88,9 @@ public sealed class PdfGraphics : IDisposable
     private readonly Stack<State> _saved = new();
     private readonly Dictionary<(string Key, double Value), string> _alphaStates = new();
     private readonly HashSet<string> _ownCategories = new(StringComparer.Ordinal);
+
+    // Marked content open on this stream, innermost last: tags, artifacts and sequences opened internally.
+    private readonly List<Mark> _marks = [];
     private readonly Dictionary<FontResource, string> _fontNames = new();
     private string? _glyphlessName;
     private PdfDictionary? _resources;
@@ -535,20 +538,146 @@ public sealed class PdfGraphics : IDisposable
     internal void BeginMarkedContent(string tag, int mcid)
     {
         ThrowIfDisposed();
+        _marks.Add(new Mark(MarkKind.Other, null));
         _w.Name(tag).Raw("<</MCID").Number(mcid).Raw(">>").Op("BDC");
     }
 
-    /// <summary>Opens an artifact: content that is not part of the document's text, such as backgrounds and running headers (ISO 32000-1, 14.8.2.2).</summary>
-    internal void BeginArtifact()
+    /// <summary>
+    /// Adds a structure element under the innermost open tag, or under the document's root
+    /// element when none is open, and opens it: what is drawn until <see cref="EndTag"/> is its
+    /// content. Elements are read in the order they are added.
+    /// </summary>
+    /// <remarks>
+    /// A tag opened while another is open becomes its child, and the outer element's content
+    /// resumes after <see cref="EndTag"/>, so a link inside a paragraph reads in place. Marked
+    /// content itself never nests: the outer sequence is closed and reopened around the inner one.
+    /// </remarks>
+    /// <returns>The new element, to set alternate text, a language or table attributes on.</returns>
+    /// <exception cref="InvalidOperationException">An artifact is open, or the graphics draw into a form rather than a page.</exception>
+    /// <example>
+    /// <code>
+    /// g.BeginTag(PdfStructureType.P);
+    /// g.DrawString("Read the ", font, 11, PdfColor.Black, 72, 100);
+    /// g.BeginTag(PdfStructureType.Link);
+    /// g.DrawString("terms", font, 11, PdfColor.Rgb(0, 0, 0.8), 118, 100);
+    /// g.EndTag();
+    /// g.EndTag();
+    /// </code>
+    /// </example>
+    public PdfStructureElement BeginTag(PdfStructureType type)
     {
         ThrowIfDisposed();
-        _w.Name("Artifact").Op("BMC");
+        CheckCanTag();
+        PdfStructureElement element = OpenParent().Add(type);
+        BeginTag(element);
+        return element;
+    }
+
+    /// <summary>
+    /// Adds a structure element of a custom type under the innermost open tag, or the document's
+    /// root element, and opens it. Map the type to a standard one with
+    /// <see cref="PdfStructureTree.MapRole"/> before saving as PDF/UA.
+    /// </summary>
+    /// <param name="type">A standard type name, or a custom one of letters, digits, '_', '-' and '.'.</param>
+    /// <returns>The new element.</returns>
+    /// <exception cref="ArgumentException"><paramref name="type"/> is not a plain name.</exception>
+    /// <exception cref="InvalidOperationException">An artifact is open, or the graphics draw into a form rather than a page.</exception>
+    public PdfStructureElement BeginTag(string type)
+    {
+        ThrowIfDisposed();
+        CheckCanTag();
+        PdfStructureElement element = OpenParent().Add(type);
+        BeginTag(element);
+        return element;
+    }
+
+    /// <summary>
+    /// Opens an existing structure element, created with <see cref="PdfStructureElement.Add(PdfStructureType)"/>:
+    /// what is drawn until <see cref="EndTag"/> is added to its content. An element may be opened
+    /// several times, on several pages, as a paragraph that continues on the next page is.
+    /// </summary>
+    /// <exception cref="ArgumentException">The element belongs to another document.</exception>
+    /// <exception cref="InvalidOperationException">An artifact is open, or the graphics draw into a form rather than a page.</exception>
+    public void BeginTag(PdfStructureElement element)
+    {
+        ThrowIfDisposed();
+        Compat.ThrowIfNull(element, nameof(element));
+        if (!ReferenceEquals(element.Tree.Document, _doc)) throw new ArgumentException("The element belongs to another document.", nameof(element));
+        CheckCanTag();
+
+        // Marked content with an MCID cannot hold another: the outer sequence pauses.
+        if (_marks.Count > 0 && _marks[_marks.Count - 1] is { Kind: MarkKind.Tag, Open: true } outer) Close(outer);
+        var mark = new Mark(MarkKind.Tag, element);
+        _marks.Add(mark);
+        Open(mark);
+    }
+
+    /// <summary>Closes the tag opened last, and resumes the tag it was opened in.</summary>
+    /// <exception cref="InvalidOperationException">No tag is open, or an artifact opened after it is still open.</exception>
+    public void EndTag()
+    {
+        ThrowIfDisposed();
+        if (_marks.Count == 0 || _marks[_marks.Count - 1].Kind != MarkKind.Tag) throw new InvalidOperationException("EndTag without a matching BeginTag.");
+        Mark mark = _marks[_marks.Count - 1];
+        _marks.RemoveAt(_marks.Count - 1);
+        if (mark.Open) Close(mark);
+        Resume();
+    }
+
+    /// <summary>
+    /// Opens an artifact: content that is not part of the document's text, such as backgrounds,
+    /// rules and running headers (ISO 32000-1, 14.8.2.2). Assistive technology skips it. Close it
+    /// with <see cref="EndArtifact"/>.
+    /// </summary>
+    public void BeginArtifact() => BeginArtifact(PdfArtifactType.Unspecified);
+
+    /// <summary>
+    /// Opens an artifact of a kind (ISO 32000-1, Table 330): page numbers and running heads are
+    /// <see cref="PdfArtifactType.Pagination"/>, <see cref="PdfArtifactType.Header"/> or
+    /// <see cref="PdfArtifactType.Footer"/>; rules and decoration <see cref="PdfArtifactType.Layout"/>.
+    /// An open tag pauses until <see cref="EndArtifact"/>, as artifacts cannot be inside tagged content.
+    /// </summary>
+    public void BeginArtifact(PdfArtifactType type)
+    {
+        ThrowIfDisposed();
+        if (_marks.Count > 0 && _marks[_marks.Count - 1] is { Kind: MarkKind.Tag, Open: true } outer) Close(outer);
+        _marks.Add(new Mark(MarkKind.Artifact, null));
+        (string? kind, string? subtype) = type switch
+        {
+            PdfArtifactType.Pagination => ("Pagination", null),
+            PdfArtifactType.Header => ("Pagination", "Header"),
+            PdfArtifactType.Footer => ("Pagination", "Footer"),
+            PdfArtifactType.Watermark => ("Pagination", "Watermark"),
+            PdfArtifactType.Layout => ("Layout", null),
+            PdfArtifactType.Page => ("Page", null),
+            PdfArtifactType.Background => ("Background", null),
+            _ => ((string?)null, (string?)null),
+        };
+        if (kind is null)
+        {
+            _w.Name("Artifact").Op("BMC");
+            return;
+        }
+
+        _w.Name("Artifact").Raw("<</Type /" + kind + (subtype is null ? "" : " /Subtype /" + subtype) + ">>").Op("BDC");
+    }
+
+    /// <summary>Closes the artifact opened last, and resumes the tag that was open before it.</summary>
+    /// <exception cref="InvalidOperationException">No artifact is open, or a tag opened after it is still open.</exception>
+    public void EndArtifact()
+    {
+        ThrowIfDisposed();
+        if (_marks.Count == 0 || _marks[_marks.Count - 1].Kind != MarkKind.Artifact) throw new InvalidOperationException("EndArtifact without a matching BeginArtifact.");
+        _marks.RemoveAt(_marks.Count - 1);
+        _w.Op("EMC");
+        Resume();
     }
 
     /// <summary>Opens content that shows only while an optional content group or membership dictionary is on (ISO 32000-1, 8.11.3.2).</summary>
     internal void BeginOptionalContent(PdfObject group)
     {
         ThrowIfDisposed();
+        _marks.Add(new Mark(MarkKind.Other, null));
         _w.Name("OC").Name(AddResource("Properties", "Oc", group)).Op("BDC");
     }
 
@@ -560,11 +689,69 @@ public sealed class PdfGraphics : IDisposable
         SetAlpha("CA", alpha, ref _state.StrokeAlpha);
     }
 
-    /// <summary>Closes the marked content sequence opened last.</summary>
+    /// <summary>Closes the marked content sequence opened last, whatever opened it.</summary>
     internal void EndMarkedContent()
     {
         ThrowIfDisposed();
-        _w.Op("EMC");
+        if (_marks.Count == 0)
+        {
+            _w.Op("EMC");
+            return;
+        }
+
+        Mark mark = _marks[_marks.Count - 1];
+        _marks.RemoveAt(_marks.Count - 1);
+        if (mark.Kind != MarkKind.Tag) _w.Op("EMC");
+        else if (mark.Open) Close(mark);
+        Resume();
+    }
+
+    /// <summary>Tags need a page, and cannot be inside an artifact or other marked content; checked before anything is added to the tree.</summary>
+    private void CheckCanTag()
+    {
+        if (_page is null) throw new InvalidOperationException("Tags are opened on a page's graphics. Draw the form on the page inside a tag instead.");
+        if (_marks.Exists(m => m.Kind == MarkKind.Artifact)) throw new InvalidOperationException("Tagged content cannot be inside an artifact; end the artifact first.");
+        if (_marks.Exists(m => m.Kind == MarkKind.Other)) throw new InvalidOperationException("A tag cannot be opened inside other marked content.");
+    }
+
+    /// <summary>The element new tags go under: the innermost open tag's, or the tree's root.</summary>
+    private PdfStructureElement OpenParent()
+    {
+        for (int i = _marks.Count - 1; i >= 0; i--)
+        {
+            if (_marks[i].Element is PdfStructureElement element) return element;
+        }
+
+        return _doc.Structure.Root;
+    }
+
+    /// <summary>Begins a marked content sequence for a tag, with a new MCID on this page.</summary>
+    private void Open(Mark mark)
+    {
+        PdfStructureElement element = mark.Element!;
+        mark.Start = _w.Length;
+        (mark.Mcid, mark.PageSet) = element.Tree.Mark(_page!, element);
+
+        // The tag names the element's type; one the content writer cannot write as is reads as a span.
+        string type = element.Type;
+        string tag = type.Length > 0 && type.All(c => c is (>= 'A' and <= 'Z') or (>= 'a' and <= 'z') or (>= '0' and <= '9') or '_' or '-' or '.') ? type : "Span";
+        _w.Name(tag).Raw("<</MCID").Number(mark.Mcid).Raw(">>").Op("BDC");
+        mark.Body = _w.Length;
+        mark.Open = true;
+    }
+
+    /// <summary>Ends a tag's sequence; one that holds nothing is taken back, with its MCID, rather than written empty.</summary>
+    private void Close(Mark mark)
+    {
+        if (_w.Length == mark.Body && mark.Element!.Tree.Unmark(_page!, mark.Element, mark.Mcid, mark.PageSet)) _w.Truncate(mark.Start);
+        else _w.Op("EMC");
+        mark.Open = false;
+    }
+
+    /// <summary>Reopens the tag an inner tag or artifact paused, if it is now the innermost.</summary>
+    private void Resume()
+    {
+        if (_marks.Count > 0 && _marks[_marks.Count - 1] is { Kind: MarkKind.Tag, Open: false } paused) Open(paused);
     }
 
     /// <summary>
@@ -761,6 +948,16 @@ public sealed class PdfGraphics : IDisposable
         if (_disposed) return;
         _disposed = true;
         _doc.UnregisterGraphics(this);
+
+        // Marked content left open ends here, inside the state it began in, so the stream stays balanced.
+        for (int i = _marks.Count - 1; i >= 0; i--)
+        {
+            Mark mark = _marks[i];
+            if (mark.Kind != MarkKind.Tag) _w.Op("EMC");
+            else if (mark.Open) Close(mark);
+        }
+
+        _marks.Clear();
         while (_saved.Count > 0)
         {
             _saved.Pop();
@@ -1113,6 +1310,37 @@ public sealed class PdfGraphics : IDisposable
     }
 
     private void ThrowIfDisposed() => Compat.ThrowIfDisposed(_disposed, this);
+
+    private enum MarkKind
+    {
+        /// <summary>A structure element's content, with an MCID.</summary>
+        Tag,
+
+        /// <summary>An artifact.</summary>
+        Artifact,
+
+        /// <summary>A sequence opened inside the library, such as optional content.</summary>
+        Other,
+    }
+
+    /// <summary>An open marked content sequence. A tag paused by an inner tag or artifact stays listed, not open.</summary>
+    private sealed class Mark(MarkKind kind, PdfStructureElement? element)
+    {
+        public MarkKind Kind { get; } = kind;
+
+        public PdfStructureElement? Element { get; } = element;
+
+        public bool Open { get; set; }
+
+        public int Mcid { get; set; }
+
+        public bool PageSet { get; set; }
+
+        /// <summary>Where the BDC begins in the stream, and where the content after it begins.</summary>
+        public int Start { get; set; }
+
+        public int Body { get; set; }
+    }
 
     /// <summary>Mirror of the PDF graphics state, so unchanged parameters are not written again.</summary>
     private sealed class State

@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Signature providers for keys that never leave their vault or HSM, and the two step flow for
+    remote signing. A class library: copy the provider you need into your application.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>SigningSamples</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Azure.Security.KeyVault.Keys" Version="4.10.2" />
+    <PackageReference Include="AWSSDK.KeyManagementService" Version="4.1.1.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\PdfNetStack\PdfNetStack.csproj" />
+  </ItemGroup>
+
+</Project>

@@ -57,8 +57,40 @@ internal static class TextLayout
         return sb.ToString();
     }
 
+    /// <summary>
+    /// The blocks of a page in reading order, each as lines of words: the lines <see cref="Lines"/>
+    /// reads, parted where the layout parts columns and bands of text.
+    /// </summary>
+    public static List<List<List<PdfWord>>> BlockLines(IReadOnlyList<PdfLetter> letters)
+    {
+        var blocks = new List<List<List<PdfWord>>>();
+        foreach (List<Item[]> block in VisualBlocks(letters))
+        {
+            var lines = new List<List<PdfWord>>();
+            foreach (Item[] line in block)
+            {
+                var words = new List<PdfWord>();
+                Words(line, words, null);
+                if (words.Count > 0) lines.Add(words);
+            }
+
+            if (lines.Count > 0) blocks.Add(lines);
+        }
+
+        return blocks;
+    }
+
     /// <summary>The lines of every direction and block in reading order, each in visual order.</summary>
     private static IEnumerable<Item[]> VisualLines(IReadOnlyList<PdfLetter> letters)
+    {
+        foreach (List<Item[]> block in VisualBlocks(letters))
+        {
+            foreach (Item[] line in block) yield return line;
+        }
+    }
+
+    /// <summary>The blocks of every direction in reading order, each as its lines in visual order.</summary>
+    private static IEnumerable<List<Item[]>> VisualBlocks(IReadOnlyList<PdfLetter> letters)
     {
         // The direction of each letter's text, needed by both the blocks and the words.
         var kinds = new Kind[letters.Count];
@@ -88,10 +120,7 @@ internal static class TextLayout
 
         foreach ((PdfPoint direction, List<int> members) in groups)
         {
-            foreach (List<int> block in Blocks(letters, kinds, direction, members))
-            {
-                foreach (Item[] line in GroupLines(letters, kinds, direction, block)) yield return line;
-            }
+            foreach (List<int> block in Blocks(letters, kinds, direction, members)) yield return GroupLines(letters, kinds, direction, block);
         }
     }
 
@@ -192,7 +221,7 @@ internal static class TextLayout
                 List<int> bands = Bands(from, to, em);
                 if (bands.Count > 2)
                 {
-                    for (int i = 0; i + 1 < bands.Count; i++) Cut(bands[i], bands[i + 1], depth + 1, result);
+                    CutBands(bands, em, depth, result);
                     return;
                 }
             }
@@ -206,6 +235,49 @@ internal static class TextLayout
 
             block.Sort();
             result.Add(block);
+        }
+
+        /// <summary>
+        /// Cuts each band, except that consecutive bands parting into columns at a common gutter
+        /// are cut as one region. Paragraphs side by side in two columns often end on the same
+        /// line, so the gaps after them run across the whole region and band it before its columns
+        /// show; read band by band, the columns would interleave paragraph by paragraph.
+        /// </summary>
+        private void CutBands(List<int> bands, double em, int depth, List<List<int>> result)
+        {
+            for (int b = 0; b + 1 < bands.Count;)
+            {
+                int end = b + 1;
+                if (Gutter(bands[b], bands[b + 1], em) is (double left, double right))
+                {
+                    while (end + 1 < bands.Count && Gutter(bands[end], bands[end + 1], em) is (double l, double r) && Math.Min(right, r) - Math.Max(left, l) >= em)
+                    {
+                        (left, right) = (Math.Max(left, l), Math.Min(right, r));
+                        end++;
+                    }
+                }
+
+                // The bands joined must part into columns as a whole, or they are cut one by one
+                // as before, so a cut never comes back to the same bands. Looking sorted them left
+                // to right; sorted top down again, each band holds its own boxes, since bands are
+                // parted by gaps.
+                if (end - b > 1 && Widest(bands[b], bands[end], Median(bands[b], bands[end])) is null)
+                {
+                    for (int i = bands[b]; i < bands[end]; i++) _keys[i] = -boxes[i].V1;
+                    Sort(bands[b], bands[end]);
+                    end = b + 1;
+                }
+
+                Cut(bands[b], bands[end], depth + 1, result);
+                b = end;
+            }
+        }
+
+        /// <summary>The gutter <see cref="Columns"/> would part a region at, from the left column's reach to the right column's start; or null.</summary>
+        private (double Left, double Right)? Gutter(int from, int to, double em)
+        {
+            if (Chars(from, to) < 2 * MinColumnLines * MinLettersPerLine || Widest(from, to, em) is not (int split, double reach)) return null;
+            return (reach, boxes[split].U0);
         }
 
         private int Chars(int from, int to)
@@ -222,18 +294,7 @@ internal static class TextLayout
         /// </summary>
         private (int Split, bool RightToLeft)? Columns(int from, int to, double em)
         {
-            for (int i = from; i < to; i++) _keys[i] = boxes[i].U0;
-            Sort(from, to);
-            double reach = double.MinValue, widest = 0;
-            int split = -1;
-            for (int i = from; i < to; i++)
-            {
-                double gap = boxes[i].U0 - reach;
-                if (i > from && gap >= em && gap > widest && Prose(from, i, em) && Prose(i, to, em)) (widest, split) = (gap, i);
-                reach = Math.Max(reach, boxes[i].U1);
-            }
-
-            if (split < 0) return null;
+            if (Widest(from, to, em) is not (int split, _)) return null;
             int rightToLeftChars = 0;
             for (int i = from; i < to; i++)
             {
@@ -241,6 +302,26 @@ internal static class TextLayout
             }
 
             return (split, rightToLeftChars * 2 > Chars(from, to));
+        }
+
+        /// <summary>
+        /// Sorts the region left to right and finds its widest gutter of at least an em between
+        /// two columns of prose: the start of the right column, and how far the left one reaches.
+        /// </summary>
+        private (int Split, double Reach)? Widest(int from, int to, double em)
+        {
+            for (int i = from; i < to; i++) _keys[i] = boxes[i].U0;
+            Sort(from, to);
+            double reach = double.MinValue, widest = 0, before = 0;
+            int split = -1;
+            for (int i = from; i < to; i++)
+            {
+                double gap = boxes[i].U0 - reach;
+                if (i > from && gap >= em && gap > widest && Prose(from, i, em) && Prose(i, to, em)) (widest, split, before) = (gap, i, reach);
+                reach = Math.Max(reach, boxes[i].U1);
+            }
+
+            return split < 0 ? null : (split, before);
         }
 
         /// <summary>

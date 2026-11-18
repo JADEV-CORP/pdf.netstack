@@ -95,6 +95,18 @@ internal static class Smoke
             Check(output.Length < source.Length, "the lossy output is smaller");
         });
 
+        Run("optimize encrypted", () =>
+        {
+            // An uncompressed stream gives the rewrite something to save, so the proof runs.
+            PdfDocument doc = PdfDocument.Open(source);
+            doc.Catalog.Set("Notes", doc.AddObject(PdfStream.FromData(Encoding.ASCII.GetBytes(new string('x', 20000)), compress: false)));
+            doc.Security.Encrypt("", "owner");
+            byte[] encrypted = doc.ToArray(new PdfSaveOptions { Optimize = false });
+            (byte[] output, PdfOptimizationResult result) = Optimize(encrypted, PdfOptimizerOptions.Default);
+            Check(result.Disposition == OptimizationDisposition.Optimized && result.Statistics.Reencrypted, result.Reason);
+            Check(PdfDocument.Open(output, "owner").Security.HasOwnerAccess, "the owner password still opens the output");
+        });
+
         Run("extract text", () =>
         {
             string text = ExtractText(source);
@@ -118,6 +130,15 @@ internal static class Smoke
         {
             byte[] pdf = ConvertHtml(Html, useSystemFonts: false);
             Check(ExtractText(pdf).Contains(Heading, StringComparison.Ordinal), "the converted text reads back");
+        });
+
+        Run("text for retrieval", () =>
+        {
+            byte[] pdf = ConvertHtml(Html, useSystemFonts: false);
+            PdfPageText page = PdfDocument.Open(pdf).ReadText(new PdfTextOptions { Format = PdfTextFormat.Markdown }).First();
+            Check(page.Text.Contains(Heading, StringComparison.Ordinal) && page.ReadingOrder == PdfReadingOrder.StructureTree, "a tagged page reads as Markdown in structure order");
+            var ingestion = new PdfNetStack.DataIngestion.PdfNetStackReader().ReadAsync(new MemoryStream(pdf), "smoke.pdf", "application/pdf").GetAwaiter().GetResult();
+            Check(ingestion.Sections.Count > 0 && ingestion.Sections[0].Elements.Count > 0, "the ingestion reader reads sections");
         });
 
         Run("hyphenation", () =>

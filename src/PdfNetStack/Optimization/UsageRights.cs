@@ -22,7 +22,8 @@ internal static class UsageRights
     /// <returns>Whether /Perms was removed.</returns>
     public static bool Remove(PdfFile file, int byteRanges)
     {
-        if (file.Trailer["Encrypt"] is not null and not PdfNull) return false;
+        // A locked file's catalog is read as stored; an unlocked one is read decrypted.
+        if (file.Trailer["Encrypt"] is not null and not PdfNull && file.Security is null) return false;
         if (file.ResolveDictionary(file.Trailer["Root"]) is not { } catalog) return false;
         if (file.ResolveDictionary(catalog["Perms"]) is not { Count: > 0 } perms) return false;
 

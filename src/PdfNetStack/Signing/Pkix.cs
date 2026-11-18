@@ -17,7 +17,9 @@ internal static class Pkix
     public const string OcspSigningUsage = "1.3.6.1.5.5.7.3.9";
     public const string OcspNoCheck = "1.3.6.1.5.5.7.48.1.5";
     public const string RsaEncryption = "1.2.840.113549.1.1.1";
-    private const string RsaPss = "1.2.840.113549.1.1.10";
+    public const string RsaPss = "1.2.840.113549.1.1.10";
+    public const string Mgf1 = "1.2.840.113549.1.1.8";
+    public const string EcPublicKey = "1.2.840.10045.2.1";
     private const string AuthorityInformationAccess = "1.3.6.1.5.5.7.1.1";
     private const string OcspAccessMethod = "1.3.6.1.5.5.7.48.1";
     private const string CrlDistributionPoints = "2.5.29.31";
@@ -169,7 +171,7 @@ internal static class Pkix
             case "1.2.840.10045.4.3.2": hash = HashAlgorithmName.SHA256; ecdsa = true; break;
             case "1.2.840.10045.4.3.3": hash = HashAlgorithmName.SHA384; ecdsa = true; break;
             case "1.2.840.10045.4.3.4": hash = HashAlgorithmName.SHA512; ecdsa = true; break;
-            case "1.2.840.10045.2.1" when cmsDigest is HashAlgorithmName h: hash = h; ecdsa = true; break;
+            case EcPublicKey when cmsDigest is HashAlgorithmName h: hash = h; ecdsa = true; break;
             default: return false;
         }
 
@@ -206,19 +208,42 @@ internal static class Pkix
             switch (p.Tag)
             {
                 case 0xA0: hash = HashFromOid(p.At(0).At(0).OidValue()); break;
-                case 0xA1: mask = p.At(0).At(0).OidValue() == "1.2.840.113549.1.1.8" ? HashFromOid(p.At(0).At(1).At(0).OidValue()) : null; break;
+                case 0xA1: mask = p.At(0).At(0).OidValue() == Mgf1 ? HashFromOid(p.At(0).At(1).At(0).OidValue()) : null; break;
                 case 0xA2: salt = p.At(0).SmallInteger(); break;
             }
         }
 
         if (hash is not HashAlgorithmName h || mask != h) throw new FormatException("RSASSA-PSS parameters are not supported.");
-        int length = h == HashAlgorithmName.SHA512 ? 64 : h == HashAlgorithmName.SHA384 ? 48 : 32;
-        if (salt != length) throw new FormatException("RSASSA-PSS salt length is not supported.");
+        if (salt != HashLength(h)) throw new FormatException("RSASSA-PSS salt length is not supported.");
         return h;
     }
 
-    /// <summary>ECDSA signatures in X.509 and CMS are SEQUENCE { r INTEGER, s INTEGER }; .NET verifies r || s.</summary>
-    private static byte[]? DerToP1363(byte[] der, int size)
+    /// <summary>The length in bytes of a SHA-2 hash.</summary>
+    public static int HashLength(HashAlgorithmName hash) => hash == HashAlgorithmName.SHA512 ? 64 : hash == HashAlgorithmName.SHA384 ? 48 : 32;
+
+    /// <summary>
+    /// Whether two byte strings are equal, taking the same time wherever they differ, so the time
+    /// a comparison takes says nothing about how much of a digest an attacker got right.
+    /// </summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining | System.Runtime.CompilerServices.MethodImplOptions.NoOptimization)]
+    public static bool FixedTimeEquals(ReadOnlySpan<byte> left, ReadOnlySpan<byte> right)
+    {
+#if NET8_0_OR_GREATER
+        return CryptographicOperations.FixedTimeEquals(left, right);
+#else
+        if (left.Length != right.Length) return false;
+        int difference = 0;
+        for (int i = 0; i < left.Length; i++) difference |= left[i] ^ right[i];
+        return difference == 0;
+#endif
+    }
+
+    /// <summary>
+    /// ECDSA signatures in X.509 and CMS are SEQUENCE { r INTEGER, s INTEGER }; .NET verifies r || s.
+    /// Null when the value is not two integers that fit the curve.
+    /// </summary>
+    /// <exception cref="FormatException">The bytes are not DER.</exception>
+    public static byte[]? DerToP1363(byte[] der, int size)
     {
         List<DerNode> parts = DerNode.Parse(der).Children();
         if (parts.Count != 2) return null;

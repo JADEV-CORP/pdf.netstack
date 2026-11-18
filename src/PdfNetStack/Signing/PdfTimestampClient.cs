@@ -9,28 +9,47 @@ namespace PdfNetStack.Signing;
 /// application/timestamp-query that returns the application/timestamp-reply body. The library
 /// itself never opens a connection.
 /// </summary>
+/// <remarks>
+/// A client made with a synchronous delegate works everywhere. A client made with an asynchronous
+/// delegate works with the asynchronous methods of <see cref="PdfSigner"/> and with
+/// <see cref="GetTokenAsync(byte[], CancellationToken)"/>; the synchronous methods refuse it with
+/// <see cref="InvalidOperationException"/> rather than block a thread on a network request.
+/// </remarks>
 /// <example>
 /// <code>
 /// var http = new HttpClient();
-/// var tsa = new PdfTimestampClient(request =>
+/// var tsa = new PdfTimestampClient(async (request, cancellationToken) =>
 /// {
 ///     using var content = new ByteArrayContent(request);
 ///     content.Headers.ContentType = new MediaTypeHeaderValue("application/timestamp-query");
-///     using HttpResponseMessage reply = http.PostAsync("https://tsa.example/", content).GetAwaiter().GetResult();
+///     using HttpResponseMessage reply = await http.PostAsync("https://tsa.example/", content, cancellationToken);
 ///     reply.EnsureSuccessStatusCode();
-///     return reply.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult();
+///     return await reply.Content.ReadAsByteArrayAsync(cancellationToken);
 /// });
 /// </code>
 /// </example>
 public sealed class PdfTimestampClient
 {
-    private readonly Func<byte[], byte[]> _send;
+    private readonly Func<byte[], byte[]>? _send;
+    private readonly Func<byte[], CancellationToken, Task<byte[]>>? _sendAsync;
 
     /// <summary>Creates a client that sends each DER encoded TimeStampReq through <paramref name="send"/> and reads the DER TimeStampResp it returns.</summary>
     public PdfTimestampClient(Func<byte[], byte[]> send)
     {
         Compat.ThrowIfNull(send, nameof(send));
         _send = send;
+    }
+
+    /// <summary>
+    /// Creates a client that sends each DER encoded TimeStampReq through <paramref name="sendAsync"/>
+    /// and reads the DER TimeStampResp it returns. The delegate receives the caller's cancellation
+    /// token, so a request in flight stops when the signing call is cancelled. Only the
+    /// asynchronous methods accept such a client.
+    /// </summary>
+    public PdfTimestampClient(Func<byte[], CancellationToken, Task<byte[]>> sendAsync)
+    {
+        Compat.ThrowIfNull(sendAsync, nameof(sendAsync));
+        _sendAsync = sendAsync;
     }
 
     /// <summary>The hash sent to the authority. Default SHA-256.</summary>
@@ -45,6 +64,9 @@ public sealed class PdfTimestampClient
     /// </summary>
     public int ReservedSize { get; init; } = 12288;
 
+    /// <summary>True when the client was made with an asynchronous delegate, which the synchronous methods refuse.</summary>
+    internal bool IsAsynchronous => _send is null;
+
     /// <summary>
     /// Timestamps <paramref name="data"/>: sends its hash with a random nonce and returns the
     /// DER encoded token after checking the reply. The reply must grant the request, echo the
@@ -52,29 +74,75 @@ public sealed class PdfTimestampClient
     /// stamping only (a critical extended key usage).
     /// </summary>
     /// <exception cref="CryptographicException">The authority refused the request or its reply is invalid.</exception>
+    /// <exception cref="InvalidOperationException">The client was made with an asynchronous delegate; call <see cref="GetTokenAsync(byte[], CancellationToken)"/>.</exception>
     public byte[] GetToken(byte[] data)
     {
         Compat.ThrowIfNull(data, nameof(data));
-        return GetTokenForDigest(Pkix.Hash(PdfSigner.HashName(Digest), data));
+        if (_send is null) throw Asynchronous();
+        byte[] imprint = Pkix.Hash(PdfSigner.HashName(Digest), data);
+        byte[] request = Request(imprint, out byte[] nonce);
+        return Accept(_send(request), imprint, nonce);
     }
 
-    /// <summary>Timestamps a hash made with <see cref="Digest"/>.</summary>
-    internal byte[] GetTokenForDigest(byte[] imprint)
+    /// <summary>
+    /// Timestamps <paramref name="data"/> as <see cref="GetToken(byte[])"/> does, through either
+    /// kind of delegate. A synchronous delegate runs on the calling thread.
+    /// </summary>
+    /// <param name="data">The bytes to timestamp; for a signature timestamp, the signature value.</param>
+    /// <param name="cancellationToken">Passed to an asynchronous delegate; observed before the request is sent.</param>
+    /// <exception cref="CryptographicException">The authority refused the request or its reply is invalid.</exception>
+    /// <exception cref="OperationCanceledException">Cancelled; no token was returned.</exception>
+    public async Task<byte[]> GetTokenAsync(byte[] data, CancellationToken cancellationToken = default)
+    {
+        Compat.ThrowIfNull(data, nameof(data));
+        return await GetTokenForDigestAsync(Pkix.Hash(PdfSigner.HashName(Digest), data), cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Timestamps a hash made with <see cref="Digest"/>. With a synchronous delegate the returned
+    /// task is already complete, which the synchronous signing methods rely on.
+    /// </summary>
+    internal Task<byte[]> GetTokenForDigestAsync(byte[] imprint, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        byte[] request = Request(imprint, out byte[] nonce);
+        if (_send is not null) return Task.FromResult(Accept(_send(request), imprint, nonce));
+        return SendAsync(request, imprint, nonce, cancellationToken);
+    }
+
+    /// <summary>Refuses an asynchronous client in a synchronous call, which would otherwise block a thread on the request.</summary>
+    internal static InvalidOperationException Asynchronous() =>
+        new("The time stamp authority client sends asynchronously; use the asynchronous signing methods or a client made with a synchronous delegate.");
+
+    private async Task<byte[]> SendAsync(byte[] request, byte[] imprint, byte[] nonce, CancellationToken cancellationToken)
+    {
+        byte[] reply = await _sendAsync!(request, cancellationToken).ConfigureAwait(false);
+        return Accept(reply, imprint, nonce);
+    }
+
+    /// <summary>A TimeStampReq for a hash, with a fresh nonce.</summary>
+    private byte[] Request(byte[] imprint, out byte[] nonce)
     {
         HashAlgorithmName hash = PdfSigner.HashName(Digest);
 
         // A positive 64 bit nonce ties the reply to this request.
-        byte[] nonce = Compat.RandomBytes(8);
+        nonce = Compat.RandomBytes(8);
         nonce[0] &= 0x7F;
         nonce[0] |= 0x01;
-        byte[] request = Der.Seq(
+        return Der.Seq(
             Der.Int(1),
             Der.Seq(Der.Seq(Der.Oid(Pkix.HashOid(hash)), Der.NullValue()), Der.Octets(imprint)),
             PolicyOid is string policy ? Der.Oid(policy) : [],
             Der.IntRaw(nonce),
             Der.Bool(true));
+    }
 
-        byte[] reply = _send(request) ?? throw new CryptographicException("The time stamp authority sent no reply.");
+    /// <summary>The token in a reply, after checking it answers the request.</summary>
+    /// <exception cref="CryptographicException">The authority refused the request or its reply is invalid.</exception>
+    private byte[] Accept(byte[]? reply, byte[] imprint, byte[] nonce)
+    {
+        if (reply is null) throw new CryptographicException("The time stamp authority sent no reply.");
+        HashAlgorithmName hash = PdfSigner.HashName(Digest);
         try
         {
             DerNode response = DerNode.Parse(reply);

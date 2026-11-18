@@ -106,6 +106,7 @@ internal static class FontProgramMerger
         var changed = new HashSet<int>();
         var read = new Dictionary<int, TrueTypeGlyphs>();
         Dictionary<int, HashSet<int>> programs = MergeablePrograms(file, analysis, decodeLimit, read);
+
         if (programs.Count < 2) return (0, changed);
 
         var groups = new Dictionary<string, List<(int Number, TrueTypeGlyphs Glyphs, HashSet<int> Used)>>(StringComparer.Ordinal);
@@ -315,6 +316,123 @@ internal sealed class TrueTypeGlyphs
     private ReadOnlySpan<byte> Table(string tag) =>
         _tables.TryGetValue(tag, out (int Offset, int Length) t) ? _font.Data.AsSpan(t.Offset, t.Length) : default;
 
+    /// <summary>A table's bytes, empty when the program has no such table.</summary>
+    public ReadOnlySpan<byte> RawTable(string tag) => Table(tag);
+
+    /// <summary>
+    /// Tables a PDF reader never applies: glyph substitution and positioning (the content stream
+    /// places every glyph itself, ISO 32000-1, 9.9), and the font's digital signature, which any
+    /// change voids. A subset may leave them out.
+    /// </summary>
+    public static readonly HashSet<string> UnusedByReaders = new(StringComparer.Ordinal)
+    {
+        "GSUB", "GPOS", "GDEF", "BASE", "JSTF", "MATH", "kern", "morx", "mort", "kerx", "feat", "DSIG",
+    };
+
+    /// <summary>
+    /// The program with outlines and metrics for <paramref name="keep"/> only and every glyph id
+    /// unchanged: glyf, loca (long offsets) and hmtx are rebuilt, head records the loca format,
+    /// <see cref="UnusedByReaders"/> tables are left out and every other table is copied as it is.
+    /// </summary>
+    public byte[] Subset(HashSet<int> keep)
+    {
+        int count = GlyphCount;
+        int full = _font.NumberOfHMetrics;
+        ReadOnlySpan<byte> hmtxSource = Table("hmtx");
+        var glyf = new FontWriter(1024);
+        var loca = new FontWriter(4 * (count + 1));
+        var hmtx = new FontWriter(hmtxSource.Length);
+        for (int gid = 0; gid < count; gid++)
+        {
+            loca.U32((uint)glyf.Length);
+            bool kept = keep.Contains(gid);
+            if (kept)
+            {
+                (int start, int end) = _font.GlyphRange(gid);
+                glyf.Bytes(_font.Data.AsSpan(_tables["glyf"].Offset + start, end - start));
+                glyf.Pad(4);
+            }
+
+            GlyphSlot slot = Slot(gid);
+
+            // Glyphs past the last full metric inherit its advance, so that entry always stays.
+            if (gid < full) hmtx.U16(kept || gid == full - 1 ? slot.Advance : 0);
+            hmtx.U16((ushort)(kept ? slot.SideBearing : 0));
+        }
+
+        loca.U32((uint)glyf.Length);
+
+        // Anything past the metrics the glyph count calls for is copied, as readers ignore it alike.
+        if (hmtxSource.Length > hmtx.Length) hmtx.Bytes(hmtxSource[hmtx.Length..]);
+
+        byte[] head = Table("head").ToArray();
+        head[50] = 0;
+        head[51] = 1; // indexToLocFormat: long offsets
+
+        var tables = new List<(string Tag, uint Checksum, byte[] Data)>
+        {
+            ("head", 0, head),
+            ("hmtx", 0, hmtx.ToArray()),
+            ("loca", 0, loca.ToArray()),
+            ("glyf", 0, glyf.ToArray()),
+        };
+        foreach (string tag in _tables.Keys)
+        {
+            if (tag is "head" or "hmtx" or "loca" or "glyf" || UnusedByReaders.Contains(tag)) continue;
+            tables.Add((tag, 0, Table(tag).ToArray()));
+        }
+
+        return SfntBuilder.Build(U32(_font.Data, 0), tables);
+    }
+
+    /// <summary>
+    /// Null when <paramref name="candidate"/> is a subset of <paramref name="original"/> that
+    /// renders every glyph in <paramref name="glyphs"/> exactly as it does, however a reader picks
+    /// glyphs: the same sfnt version and glyph count, every table byte identical except glyf,
+    /// loca and hmtx (head up to its checksum and loca format), only tables readers never apply
+    /// left out, nothing added, and for each glyph the same outline bytes (up to zero padding),
+    /// advance width and left side bearing.
+    /// </summary>
+    public static string? FindSubsetDifference(ReadOnlySpan<byte> original, ReadOnlySpan<byte> candidate, HashSet<int> glyphs)
+    {
+        TrueTypeGlyphs? a = Parse(original.ToArray());
+        TrueTypeGlyphs? b = Parse(candidate.ToArray());
+        if (a is null || b is null) return "is not a readable TrueType program";
+        if (U32(a._font.Data, 0) != U32(b._font.Data, 0)) return "has a different sfnt version";
+        if (a.GlyphCount != b.GlyphCount) return "has a different number of glyphs";
+        foreach (string tag in b._tables.Keys)
+        {
+            if (!a._tables.ContainsKey(tag)) return $"gained table '{tag}'";
+        }
+
+        foreach (string tag in a._tables.Keys)
+        {
+            if (tag is "glyf" or "loca" or "hmtx") continue;
+            if (!b._tables.ContainsKey(tag))
+            {
+                if (UnusedByReaders.Contains(tag)) continue;
+                return $"lost table '{tag}'";
+            }
+
+            ReadOnlySpan<byte> x = a.Table(tag), y = b.Table(tag);
+            if (tag == "head")
+            {
+                // The checksum adjustment and the loca format describe the file, not the glyphs.
+                if (x.Length != y.Length || !x[..8].SequenceEqual(y[..8]) || !x[12..50].SequenceEqual(y[12..50]) || !x[52..].SequenceEqual(y[52..])) return "table 'head' differs";
+                continue;
+            }
+
+            if (!x.SequenceEqual(y)) return $"table '{tag}' differs";
+        }
+
+        foreach (int gid in glyphs)
+        {
+            if (!SameSlot(a.Slot(gid), b.Slot(gid))) return $"glyph {gid} differs";
+        }
+
+        return null;
+    }
+
     /// <summary>The glyph's bytes and metrics, or <see cref="GlyphSlot.OutOfRange"/> past the last glyph.</summary>
     public GlyphSlot Slot(int gid)
     {
@@ -483,7 +601,8 @@ internal sealed class TrueTypeGlyphs
 
     /// <summary>
     /// Null when <paramref name="candidate"/> renders every glyph in <paramref name="glyphs"/>
-    /// exactly as <paramref name="original"/> does: the same tables outside the rebuilt ones,
+    /// exactly as <paramref name="original"/> does: the same tables outside the rebuilt ones
+    /// (those readers never apply may be left out),
     /// the same scaling and hinting fields, hinting limits at least as wide, and for each glyph
     /// the same outline bytes (up to zero padding), advance and side bearing.
     /// </summary>
@@ -493,7 +612,8 @@ internal sealed class TrueTypeGlyphs
         TrueTypeGlyphs? b = Parse(candidate.ToArray());
         if (a is null || b is null) return "is not a readable TrueType program";
 
-        var tagsA = a._tables.Keys.Where(t => !Rebuilt.Contains(t)).OrderBy(t => t, StringComparer.Ordinal).ToList();
+        // A program subset before it was merged may lack the tables readers never apply.
+        var tagsA = a._tables.Keys.Where(t => !Rebuilt.Contains(t) && (b._tables.ContainsKey(t) || !UnusedByReaders.Contains(t))).OrderBy(t => t, StringComparer.Ordinal).ToList();
         var tagsB = b._tables.Keys.Where(t => !Rebuilt.Contains(t)).OrderBy(t => t, StringComparer.Ordinal).ToList();
         if (!tagsA.SequenceEqual(tagsB)) return "has a different set of tables";
         foreach (string tag in tagsA)
