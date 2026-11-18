@@ -132,8 +132,8 @@ public sealed record PdfLimits
     public int MaxTextCharsPerPage { get; init; } = 4_000_000;
 
     /// <summary>
-    /// Longest one call may run: opening a document, one extraction (<see cref="PdfPage.ExtractText"/>,
-    /// <see cref="PdfPage.GetWords"/>, <see cref="PdfPage.GetLetters"/>, <see cref="PdfPage.GetImages"/>),
+    /// Longest one call may run: opening a document, one extraction (<see cref="PdfPage.ExtractText()"/>,
+    /// <see cref="PdfPage.GetWords()"/>, <see cref="PdfPage.GetLetters()"/>, <see cref="PdfPage.GetImages()"/>),
     /// one inspection or one optimization. Past it the call raises
     /// <see cref="PdfLimitExceededException"/>, except the optimizer, which writes its lossless
     /// result when time runs out during lossy work and otherwise the input unchanged.

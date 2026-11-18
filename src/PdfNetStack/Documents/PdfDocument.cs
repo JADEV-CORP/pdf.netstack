@@ -148,7 +148,7 @@ public sealed class PdfDocument : IDisposable
     /// Warnings about the document, oldest first: limits that cut work short, damaged parts that
     /// were skipped, repairs made to read the file. The document stays usable; a warning says
     /// what a reader of it may be missing. Added as they are found, during opening and later
-    /// calls such as <see cref="PdfPage.ExtractText"/>; <see cref="PdfLoadOptions.OnWarning"/>
+    /// calls such as <see cref="PdfPage.ExtractText()"/>; <see cref="PdfLoadOptions.OnWarning"/>
     /// hears each one as it comes. At most 1000 are kept.
     /// </summary>
     public IReadOnlyList<PdfDiagnostic> Diagnostics => Budget.Diagnostics.Snapshot();
