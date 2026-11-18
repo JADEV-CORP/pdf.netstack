@@ -410,7 +410,10 @@ internal sealed class Cff2Converter
     }
 
     /// <summary>A charstring number: an integer form when exact, else 16.16 fixed.</summary>
-    private void WriteNumber(double v)
+    private void WriteNumber(double v) => CharstringNumber(_w, v);
+
+    /// <summary>A Type 2 charstring number: an integer form when exact, else 16.16 fixed, rounded.</summary>
+    internal static void CharstringNumber(FontWriter w, double v)
     {
         double fixedValue = Math.Round(v * 65536) / 65536;
         if (fixedValue == Math.Floor(fixedValue) && fixedValue >= -32768 && fixedValue <= 32767)
@@ -419,26 +422,26 @@ internal sealed class Cff2Converter
             switch (i)
             {
                 case >= -107 and <= 107:
-                    _w.U8(i + 139);
+                    w.U8(i + 139);
                     return;
                 case >= 108 and <= 1131:
-                    _w.U8(((i - 108) >> 8) + 247);
-                    _w.U8((i - 108) & 0xFF);
+                    w.U8(((i - 108) >> 8) + 247);
+                    w.U8((i - 108) & 0xFF);
                     return;
                 case >= -1131 and <= -108:
-                    _w.U8(((-i - 108) >> 8) + 251);
-                    _w.U8((-i - 108) & 0xFF);
+                    w.U8(((-i - 108) >> 8) + 251);
+                    w.U8((-i - 108) & 0xFF);
                     return;
                 default:
-                    _w.U8(28);
-                    _w.U16(i);
+                    w.U8(28);
+                    w.U16(i);
                     return;
             }
         }
 
         int value = (int)Math.Max(int.MinValue, Math.Min(int.MaxValue, Math.Round(v * 65536)));
-        _w.U8(255);
-        _w.U32((uint)value);
+        w.U8(255);
+        w.U32((uint)value);
     }
 
     /// <summary>A charstring operand: the integer forms or 16.16 fixed (255).</summary>
@@ -700,7 +703,7 @@ internal sealed class Cff2Converter
         return w.ToArray();
     }
 
-    private static void DictOp(FontWriter w, int op)
+    internal static void DictOp(FontWriter w, int op)
     {
         if (op >= 1200)
         {
@@ -714,14 +717,14 @@ internal sealed class Cff2Converter
     }
 
     /// <summary>An offset as a 5 byte integer, so sizes do not depend on the offsets.</summary>
-    private static void DictOffset(FontWriter w, int value)
+    internal static void DictOffset(FontWriter w, int value)
     {
         w.U8(29);
         w.U32((uint)value);
     }
 
     /// <summary>A DICT number: the shortest integer form, or a real in nibbles.</summary>
-    private static void DictNumber(FontWriter w, double v)
+    internal static void DictNumber(FontWriter w, double v)
     {
         if (v == Math.Floor(v) && Math.Abs(v) <= int.MaxValue)
         {
@@ -773,7 +776,7 @@ internal sealed class Cff2Converter
     }
 
     /// <summary>A CFF (version 1) INDEX.</summary>
-    private static byte[] WriteIndex(List<byte[]> items)
+    internal static byte[] WriteIndex(List<byte[]> items)
     {
         if (items.Count == 0) return [0, 0];
         long total = items.Sum(i => (long)i.Length) + 1;

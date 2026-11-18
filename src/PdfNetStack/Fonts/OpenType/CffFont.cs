@@ -160,12 +160,157 @@ internal sealed class CffFont
     /// <summary>The charstring of a glyph.</summary>
     public byte[] CharString(int glyph) => _charStrings.Item(_cff, glyph).ToArray();
 
+    private byte[][]? _globalSubrItems;
+    private int[]? _fdOfGlyph;
+    private readonly Dictionary<int, PrivateData> _privates = [];
+
+    /// <summary>A font dictionary's Private DICT entries, local subroutines and width defaults.</summary>
+    internal sealed record PrivateData(List<DictEntry> Entries, byte[][] Subrs, double DefaultWidth, double NominalWidth);
+
+    /// <summary>The global subroutines.</summary>
+    public IReadOnlyList<byte[]> GlobalSubrs => _globalSubrItems ??= Items(_globalSubrs);
+
+    private byte[][] Items(Index index)
+    {
+        var items = new byte[index.Count][];
+        for (int i = 0; i < items.Length; i++) items[i] = index.Item(_cff, i).ToArray();
+        return items;
+    }
+
+    /// <summary>Number of font dictionaries: the FDArray of a CID-keyed font, else one.</summary>
+    public int FontDictCount => IsCidKeyed ? FdArray().Count : 1;
+
+    /// <summary>The font dictionary of each glyph (FDSelect); all zero for a name-keyed font.</summary>
+    public int[] FontDictOfGlyph()
+    {
+        if (_fdOfGlyph is not null) return _fdOfGlyph;
+        var fds = new int[_glyphCount];
+        if (IsCidKeyed)
+        {
+            ReadOnlySpan<byte> d = _cff;
+            int at = Dict.Int(_top, OpFdSelect) ?? throw new FontFormatException("CID-keyed CFF has no FDSelect.");
+            int format = U8(d, at);
+            int count = FontDictCount;
+            if (format == 0)
+            {
+                for (int g = 0; g < fds.Length; g++) fds[g] = U8(d, at + 1 + g);
+            }
+            else if (format == 3)
+            {
+                int ranges = U16(d, at + 1);
+                for (int r = 0; r < ranges; r++)
+                {
+                    int first = U16(d, at + 3 + 3 * r), fd = U8(d, at + 5 + 3 * r), next = U16(d, at + 6 + 3 * r);
+                    if (r == 0 && first != 0) throw new FontFormatException("CFF FDSelect does not start at glyph 0.");
+                    for (int g = first; g < next && g < fds.Length; g++) fds[g] = fd;
+                }
+            }
+            else
+            {
+                throw new FontFormatException("CFF FDSelect format is invalid.");
+            }
+
+            foreach (int fd in fds)
+            {
+                if (fd >= count) throw new FontFormatException("CFF FDSelect names a missing font dictionary.");
+            }
+        }
+
+        return _fdOfGlyph = fds;
+    }
+
+    private List<List<DictEntry>> FdArray()
+    {
+        int at = Dict.Int(_top, OpFdArray) ?? throw new FontFormatException("CID-keyed CFF has no FDArray.");
+        ReadOnlySpan<byte> d = _cff;
+        Index fds = Index.Read(d, ref at);
+        var dicts = new List<List<DictEntry>>(fds.Count);
+        for (int i = 0; i < fds.Count; i++) dicts.Add(Dict.Read(fds.Item(d, i)));
+        return dicts;
+    }
+
+    /// <summary>The Top DICT of a name-keyed font, or the FDArray entries of a CID-keyed one.</summary>
+    internal List<List<DictEntry>> FontDicts() => IsCidKeyed ? FdArray() : [_top];
+
+    internal List<DictEntry> TopDict => _top;
+
+    /// <summary>The Private DICT of font dictionary <paramref name="fd"/>, read once.</summary>
+    internal PrivateData Private(int fd)
+    {
+        if (_privates.TryGetValue(fd, out PrivateData? cached)) return cached;
+        List<DictEntry> owner = FontDicts()[fd];
+        DictEntry? entry = Dict.Find(owner, OpPrivate);
+        var entries = new List<DictEntry>();
+        byte[][] subrs = [];
+        if (entry is not null)
+        {
+            int[] operands = entry.Value.Ints();
+            if (operands.Length != 2) throw new FontFormatException("CFF Private operator is invalid.");
+            ReadOnlySpan<byte> d = _cff;
+            entries = Dict.Read(Slice(d, operands[1], operands[0]));
+            if (Dict.Int(entries, OpSubrs) is { } relative)
+            {
+                int at = operands[1] + relative;
+                subrs = Items(Index.Read(d, ref at));
+            }
+        }
+
+        double defaultWidth = (double)(Dict.Find(entries, 20)?.Numbers() is [.., var dw] ? dw : 0m);
+        double nominalWidth = (double)(Dict.Find(entries, 21)?.Numbers() is [.., var nw] ? nw : 0m);
+        return _privates[fd] = new PrivateData(entries, subrs, defaultWidth, nominalWidth);
+    }
+
+    /// <summary>Runs a glyph's charstring with its font dictionary's subroutines and widths.</summary>
+    /// <exception cref="FontFormatException">The charstring cannot be read exactly.</exception>
+    public Type2Interpreter Interpret(int glyph)
+    {
+        PrivateData p = Private(FontDictOfGlyph()[glyph]);
+        return Type2Interpreter.Run(CharString(glyph), GlobalSubrs, p.Subrs, p.DefaultWidth, p.NominalWidth);
+    }
+
+    /// <summary>The glyph names of a name-keyed font, by glyph id; null for a CID-keyed one.</summary>
+    public string?[]? Names() => IsCidKeyed ? null : GlyphNames();
+
+    /// <summary>The raw bytes of the Name INDEX, String INDEX and Global Subr INDEX, which a subset keeps.</summary>
+    internal (byte[] Names, byte[] Strings) RawIndexes() => (_names.Raw(_cff).ToArray(), _strings.Raw(_cff).ToArray());
+
+    /// <summary>
+    /// The custom Encoding bytes of a name-keyed font, null for a predefined one (offset 0 or 1),
+    /// whose number <paramref name="predefined"/> receives.
+    /// </summary>
+    private byte[]? RawEncoding(out int predefined)
+    {
+        predefined = Dict.Int(_top, OpEncoding) ?? 0;
+        if (predefined <= 1) return null;
+        ReadOnlySpan<byte> d = _cff;
+        int start = predefined, at = start;
+        int format = U8(d, at++);
+        at += (format & 0x7F) switch
+        {
+            0 => 1 + U8(d, at),
+            1 => 1 + 2 * U8(d, at),
+            _ => throw new FontFormatException("CFF encoding format is invalid."),
+        };
+        if ((format & 0x80) != 0) at += 1 + 3 * U8(d, at);
+        return Slice(d, start, at - start).ToArray();
+    }
+
     /// <summary>Writes the subset: outlines for <paramref name="keep"/> only, same glyph ids.</summary>
-    public byte[] Subset(ISet<int> keep)
+    public byte[] Subset(ISet<int> keep) => Subset(keep, null, null);
+
+    /// <summary>
+    /// Writes the subset: outlines for <paramref name="keep"/> only, same glyph ids. A name-keyed
+    /// font keeps its built-in encoding. Subroutines outside <paramref name="localSubrs"/> (per
+    /// font dictionary) and <paramref name="globalSubrs"/> become a bare return, so every
+    /// subroutine keeps its number; null keeps them all.
+    /// </summary>
+    public byte[] Subset(ISet<int> keep, IReadOnlyList<HashSet<int>>? localSubrs, HashSet<int>? globalSubrs)
     {
         ReadOnlySpan<byte> d = _cff;
         var charStrings = new List<byte[]>(_glyphCount);
         for (int g = 0; g < _glyphCount; g++) charStrings.Add(g == 0 || keep.Contains(g) ? _charStrings.Item(d, g).ToArray() : [14]);
+        int encodingPredefined = 0;
+        byte[]? encoding = IsCidKeyed ? null : RawEncoding(out encodingPredefined);
 
         byte[]? charset = RawCharset();
         byte[]? fdSelect = IsCidKeyed ? RawFdSelect() : null;
@@ -179,23 +324,26 @@ internal sealed class CffFont
             for (int i = 0; i < fds.Count; i++)
             {
                 List<DictEntry> fd = Dict.Read(fds.Item(d, i));
-                (byte[] priv, byte[]? subrs) = ReadPrivate(fd);
+                (byte[] priv, byte[]? subrs) = ReadPrivate(fd, localSubrs is null ? null : i < localSubrs.Count ? localSubrs[i] : []);
                 fonts.Add((fd, priv, subrs));
             }
         }
         else
         {
-            (byte[] priv, byte[]? subrs) = ReadPrivate(_top);
+            (byte[] priv, byte[]? subrs) = ReadPrivate(_top, localSubrs is null ? null : localSubrs.Count > 0 ? localSubrs[0] : []);
             fonts.Add((_top, priv, subrs));
         }
 
         // Offsets are written as 5 byte integers, so sizes do not depend on the offsets themselves.
-        byte[] names = _names.Raw(d).ToArray(), strings = _strings.Raw(d).ToArray(), globals = _globalSubrs.Raw(d).ToArray();
+        byte[] names = _names.Raw(d).ToArray(), strings = _strings.Raw(d).ToArray();
+        byte[] globals = globalSubrs is null ? _globalSubrs.Raw(d).ToArray() : Index.Write(Blank(GlobalSubrs, globalSubrs));
         byte[] charStringIndex = Index.Write(charStrings);
-        int topSize = Index.Write([BuildTop(0, 0, 0, 0, 0, 0)]).Length;
+        int topSize = Index.Write([BuildTop(0, 0, 0, 0, 0, 0, 0)]).Length;
         int position = 4 + names.Length + topSize + strings.Length + globals.Length;
         int charsetOffset = charset is null ? 0 : position;
         position += charset?.Length ?? 0;
+        int encodingOffset = encoding is null ? encodingPredefined : position;
+        position += encoding?.Length ?? 0;
         int fdSelectOffset = fdSelect is null ? 0 : position;
         position += fdSelect?.Length ?? 0;
         int charStringsOffset = position;
@@ -238,24 +386,26 @@ internal sealed class CffFont
         w.U8(4);
         w.U8(4);
         w.Bytes(names);
-        w.Bytes(Index.Write([BuildTop(charsetOffset, charStringsOffset, fonts[0].Private.Length, privateOffset, fdArrayOffset, fdSelectOffset)]));
+        w.Bytes(Index.Write([BuildTop(charsetOffset, encodingOffset, charStringsOffset, fonts[0].Private.Length, privateOffset, fdArrayOffset, fdSelectOffset)]));
         w.Bytes(strings);
         w.Bytes(globals);
         if (charset is not null) w.Bytes(charset);
+        if (encoding is not null) w.Bytes(encoding);
         if (fdSelect is not null) w.Bytes(fdSelect);
         w.Bytes(charStringIndex);
         if (fdArrayIndex is not null) w.Bytes(fdArrayIndex);
         foreach (byte[] p in privates) w.Bytes(p);
         return w.ToArray();
 
-        byte[] BuildTop(int charsetAt, int charStringsAt, int privateSize, int privateAt, int fdArrayAt, int fdSelectAt)
+        byte[] BuildTop(int charsetAt, int encodingAt, int charStringsAt, int privateSize, int privateAt, int fdArrayAt, int fdSelectAt)
         {
             var top = new List<DictEntry>();
             foreach (DictEntry e in _top)
             {
                 switch (e.Op)
                 {
-                    case OpEncoding: // ignored for CIDFontType0C; the default applies
+                    case OpEncoding when IsCidKeyed: // ignored for CIDFontType0C; the default applies
+                    case OpEncoding when encoding is not null:
                     case OpCharset when charset is not null:
                     case OpCharStrings or OpPrivate or OpFdArray or OpFdSelect:
                         continue;
@@ -266,6 +416,7 @@ internal sealed class CffFont
             }
 
             if (charset is not null) top.Add(DictEntry.Offsets(OpCharset, charsetAt));
+            if (encoding is not null) top.Add(DictEntry.Offsets(OpEncoding, encodingAt));
             top.Add(DictEntry.Offsets(OpCharStrings, charStringsAt));
             if (IsCidKeyed)
             {
@@ -297,8 +448,19 @@ internal sealed class CffFont
         return copy;
     }
 
-    /// <summary>A Private DICT, rewritten so its local subroutines follow it directly, and those subroutines.</summary>
-    private (byte[] Private, byte[]? Subrs) ReadPrivate(List<DictEntry> owner)
+    /// <summary>The subroutines, with those outside <paramref name="used"/> replaced by a bare return.</summary>
+    private static List<byte[]> Blank(IReadOnlyList<byte[]> subrs, HashSet<int> used)
+    {
+        var items = new List<byte[]>(subrs.Count);
+        for (int i = 0; i < subrs.Count; i++) items.Add(used.Contains(i) ? subrs[i] : [11]);
+        return items;
+    }
+
+    /// <summary>
+    /// A Private DICT, rewritten so its local subroutines follow it directly, and those
+    /// subroutines, all of them or only <paramref name="used"/> with the rest blanked.
+    /// </summary>
+    private (byte[] Private, byte[]? Subrs) ReadPrivate(List<DictEntry> owner, HashSet<int>? used = null)
     {
         DictEntry? entry = Dict.Find(owner, OpPrivate);
         if (entry is null) return (Dict.Write([]), null);
@@ -311,7 +473,8 @@ internal sealed class CffFont
         if (subrs is null) return (Dict.Write(priv), null);
 
         int subrsAt = offset + subrs.Value;
-        byte[] subrIndex = Index.Read(d, ref subrsAt).Raw(d).ToArray();
+        Index index = Index.Read(d, ref subrsAt);
+        byte[] subrIndex = used is null ? index.Raw(d).ToArray() : Index.Write(Blank(Items(index), used));
         var rewritten = priv.Where(e => e.Op != OpSubrs).ToList();
         int length = Dict.Write(rewritten).Length + DictEntry.Offsets(OpSubrs, 0).Length;
         rewritten.Add(DictEntry.Offsets(OpSubrs, length));
@@ -451,7 +614,7 @@ internal sealed class CffFont
     }
 
     /// <summary>One DICT operator with its operands, kept as their original bytes.</summary>
-    private readonly record struct DictEntry(int Op, byte[] Operands)
+    internal readonly record struct DictEntry(int Op, byte[] Operands)
     {
         public int Length => Operands.Length + (Op >= 1200 ? 2 : 1);
 
@@ -469,6 +632,66 @@ internal sealed class CffFont
             }
 
             return new DictEntry(op, bytes);
+        }
+
+        /// <summary>The operands as exact decimals, reals included.</summary>
+        public decimal[] Numbers()
+        {
+            var values = new List<decimal>();
+            ReadOnlySpan<byte> o = Operands;
+            for (int i = 0; i < o.Length;)
+            {
+                int b0 = o[i];
+                if (b0 == 30)
+                {
+                    var text = new System.Text.StringBuilder();
+                    for (i++; ; i++)
+                    {
+                        int b = U8(o, i);
+                        int hi = b >> 4, lo = b & 0xF;
+                        if (!Nibble(hi, text)) break;
+                        if (!Nibble(lo, text)) break;
+                    }
+
+                    i++;
+                    if (!decimal.TryParse(text.ToString(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out decimal real))
+                    {
+                        throw new FontFormatException("CFF real number is invalid.");
+                    }
+
+                    values.Add(real);
+                    continue;
+                }
+
+                int start = i;
+                values.Add(new DictEntry(0, Slice(o, start, OperandLength(o, i)).ToArray()).Ints()[0]);
+                i += OperandLength(o, i);
+            }
+
+            return [.. values];
+
+            static bool Nibble(int n, System.Text.StringBuilder text)
+            {
+                switch (n)
+                {
+                    case <= 9: text.Append((char)('0' + n)); return true;
+                    case 0xA: text.Append('.'); return true;
+                    case 0xB: text.Append('E'); return true;
+                    case 0xC: text.Append("E-"); return true;
+                    case 0xE: text.Append('-'); return true;
+                    case 0xF: return false;
+                    default: throw new FontFormatException("CFF real number is invalid.");
+                }
+            }
+
+            static int OperandLength(ReadOnlySpan<byte> o, int i) => o[i] switch
+            {
+                28 => 3,
+                29 => 5,
+                >= 32 and <= 246 => 1,
+                >= 247 and <= 254 => 2,
+                _ => throw new FontFormatException("CFF DICT operand is invalid."),
+            };
         }
 
         /// <summary>The operands as integers; reals are not expected for the operators this is used on.</summary>
@@ -510,7 +733,7 @@ internal sealed class CffFont
         }
     }
 
-    private static class Dict
+    internal static class Dict
     {
         public static List<DictEntry> Read(ReadOnlySpan<byte> d)
         {

@@ -288,7 +288,8 @@ public static partial class PdfOptimizer
             int pruned = 0, fontsMerged = 0;
             HashSet<int> compact = [], encoded = [];
             bool mergeFonts = options.MergeFontSubsets && options.DeduplicateObjects;
-            if (options.PruneUnusedResources || options.CompactContentStreams || mergeFonts)
+            FontPassResult fonts = FontPassResult.None;
+            if (options.PruneUnusedResources || options.CompactContentStreams || mergeFonts || options.SubsetFonts || options.ConvertType1Fonts)
             {
                 ContentAnalysis analysis = ContentAnalysis.Run(file, graph.Order, [], options.MaxDecodedStreamBytes, ct);
                 if (options.PruneUnusedResources && (pruned = ResourcePruner.Run(analysis)) > 0)
@@ -296,6 +297,8 @@ public static partial class PdfOptimizer
                     graph = ObjectGraph.Collect(file, options.RemovePageThumbnails, options.RemovePieceInfo, ct);
                 }
 
+                // Subsetting and Type 1 conversion come first: subsets of one font may then merge.
+                fonts = FontPasses.Run(file, analysis, graph.Order, options, pdfA1, ct);
                 if (mergeFonts) (fontsMerged, encoded) = FontProgramMerger.Run(file, analysis, options.ZlibLevel, options.MaxDecodedStreamBytes, ct);
                 if (options.CompactContentStreams) compact = analysis.ContentStreams;
             }
@@ -408,6 +411,9 @@ public static partial class PdfOptimizer
                 ResourcesPruned = pruned,
                 ContentStreamsCompacted = recompressed.Compacted,
                 FontProgramsMerged = fontsMerged,
+                FontProgramsSubset = fonts.Subset,
+                Type1FontsConverted = fonts.Converted,
+                FontsLeftWhole = fonts.Kept,
                 Streamed = true,
             };
 
@@ -445,6 +451,8 @@ public static partial class PdfOptimizer
                     // A content stream merged with one that was compacted is written compacted too.
                     AllowContentCompaction = compact.Count > 0,
                     AllowFontMerging = fontsMerged > 0,
+                    AllowFontSubsetting = fonts.Subset > 0,
+                    AllowFontConversion = fonts.Converted > 0,
                     AllowBilevelRecoding = recompressed.Group4 > 0,
                     AllowXObjectNameRemoval = namesRemoved > 0,
                 };
@@ -461,7 +469,7 @@ public static partial class PdfOptimizer
                 stats = stats with { ObjectsVerified = compared, Phases = timings with { Verify = phase.Elapsed } };
             }
 
-            string reason = Reason(options, recompressed);
+            string reason = Reason(options, recompressed) + fonts.Note();
             if (usageRightsRemoved) reason += " Usage rights removed.";
             return new StreamedOutcome(OptimizationDisposition.Optimized, true, reason, pageCount, stats, candidateHash, candidateLength);
         }
