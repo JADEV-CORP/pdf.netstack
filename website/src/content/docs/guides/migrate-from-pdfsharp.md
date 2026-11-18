@@ -223,7 +223,7 @@ doc.Save("report-letterhead.pdf");
 ```csharp title="PDFsharp 6.2.4"
 PdfDocument doc = PdfReader.Open("application.pdf", PdfDocumentOpenMode.Modify);
 var name = (PdfTextField)doc.AcroForm.Fields["name"]!;
-name.Text = "Jamal Abdelkhalek";
+name.Text = "Jane Doe";
 var subscribe = (PdfCheckBoxField)doc.AcroForm.Fields["subscribe"]!;
 subscribe.Checked = true;
 doc.AcroForm.Elements.SetBoolean("/NeedAppearances", true);   // let the viewer draw the values
@@ -234,7 +234,9 @@ doc.Save("application-filled.pdf");
 ```
 
 The appearance is drawn from the field's own border, background, font and alignment, so the
-value looks the same in every viewer. See [Forms](/guides/forms/).
+value looks the same in every viewer. From 1.3, `doc.Form.Fill` sets many fields from a dictionary
+in one call, checking every name and value first, and `TryGetField` replaces the cast. See
+[Forms](/guides/forms/).
 
 ## Encryption
 
@@ -297,8 +299,9 @@ in reading order, and words and letters with their positions. See
 - **Drawing on screen or to bitmaps.** `PdfGraphics` draws only on PDF pages and forms. PdfNetStack
   does not render pages to images.
 - **RC4 output.** Files encrypted with RC4 open, but new encryption is AES-256 or AES-128 only.
-- **Tagged PDF across documents.** `Merge`, `Split` and `Pages.Import` do not carry the structure
-  tree today, so pages taken from a tagged document come out untagged.
+- **Tagged PDF across documents, before 1.3.** In 1.2, `Merge`, `Split` and `Pages.Import` do not
+  carry the structure tree, so pages taken from a tagged document come out untagged. From 1.3
+  they keep the structure elements of the pages they copy.
 
 Signatures and PDF/A have their own APIs: see [Signatures](/guides/signatures/), which signs to
 PAdES B-B up to B-LTA, and [PDF/A](/guides/pdf-a/), where `PdfSaveOptions.Conformance` sets the
@@ -325,7 +328,7 @@ Each library reads what the other writes, so a job can move one step at a time.
 - A full `Save` with the optimizer, the default, builds the file in memory. See
   [Memory and performance](/concepts/memory-and-performance/) for sizing.
 - PdfNetStack has no MigraDoc, charting or rendering counterpart, and writes no RC4.
-- Pages merged or imported from tagged documents lose their tags.
+- Before 1.3, pages merged or imported from tagged documents lose their tags.
 
 ## Related
 

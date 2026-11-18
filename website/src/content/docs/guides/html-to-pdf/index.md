@@ -9,6 +9,8 @@ faq:
     a: No. It is a layout engine written in C# that parses HTML, applies CSS and lays out pages itself. Scripts are not run, so the HTML must already contain the content to print.
   - q: Does HTML to PDF work on Linux and in containers?
     a: Yes. The package is managed code with no native binaries, so it runs wherever .NET runs. Set UseSystemFonts to false and supply fonts for output that is the same on every machine.
+  - q: How close is the output to Chrome on existing HTML templates?
+    a: On 20 public invoice and report templates from wkhtmltopdf and DinkToPdf projects, compared page by page with Chrome, 10 render the same, 7 with small differences in spacing, font weight or page breaks, and 3 cut wide tables, which Chrome shrinks to fit and PdfNetStack does not yet. Check your own templates before switching.
   - q: Is the text in the PDF searchable?
     a: Yes. Text is written as real text with the fonts embedded or referenced, so it selects, copies and searches, and the output is a tagged PDF by default.
 ---
@@ -50,8 +52,11 @@ grid, a table with striped rows and a gradient. Its `<title>`, `<meta name="auth
 | `ConvertToPdf(html, stream, options)` | An HTML string | The PDF written to a stream |
 | `ConvertToDocument(html, options)` | An HTML string | A `PdfDocument` to change before saving |
 | `ConvertFileToDocument(path, options)` | An HTML file, read as UTF-8 unless it starts with a byte order mark | A `PdfDocument`, with the file's folder as the base |
+| `ConvertToPdfAsync(html, stream, options, token)` | An HTML string | The PDF written to a stream with asynchronous writes only, for response bodies |
+| `ConvertToDocumentAsync(html, options, token)` | An HTML string | 1.3. A `PdfDocument`, with no thread waiting while the call waits its turn or lays out |
 
-All of them take an optional `HtmlConverterOptions`.
+All of them take an optional `HtmlConverterOptions`, and from 1.3 every one has an overload with
+a `CancellationToken`.
 
 ## Options
 
@@ -68,6 +73,10 @@ All of them take an optional `HtmlConverterOptions`.
 | `UseSystemFonts` | true | With false, output depends only on the HTML, the fonts you pass and the standard 14 fonts, and is the same on every machine |
 | `Bookmarks` | true | Headings become bookmarks, following the `bookmark-level` property |
 | `Tagged` | true | Writes a tagged PDF with a structure tree in reading order |
+| `ResourceLoaderAsync` | null | 1.3. Like `ResourceLoader`, asynchronous and given the conversion's token; used in its place when set |
+| `MaxPages` | 10000 | A document that needs more pages ends with `HtmlConversionException` |
+| `MaxStyleWork` | null | 1.3. The most style work a conversion may do. Null scales with the input: 50 million units plus 250 per character of the HTML and of `StyleSheet` |
+| `MaxLayoutWork` | null | 1.3. The most layout work a conversion may do. Null scales with the input: 1 million units plus 20 per character of the HTML |
 
 Resource loading and fonts are covered in [Fonts and assets](/guides/html-to-pdf/fonts-and-assets/).
 
@@ -121,18 +130,59 @@ them; set `Bookmarks = false` to write none.
 
 The full list, module by module, is on [CSS support](/guides/html-to-pdf/css-support/).
 
+## How close it is to a browser
+
+Tested on 18 November 2026 on 20 public invoice, receipt, letter, certificate and report templates
+from wkhtmltopdf and DinkToPdf era projects, each compared page by page with Chrome's print to
+PDF: 10 render the same, 7 render with small differences (spacing, font weight, where a page
+breaks) and 3 render with content cut off. The 3 are reports with tables wider than the page,
+which Chrome and wkhtmltopdf shrink to fit and PdfNetStack does not yet. No template failed or
+took more than a second.
+
+What differs today:
+
+- Content wider than the page is cut at the page edge, not shrunk to fit.
+- Floats and table rows are never split across pages: they move whole to the next page.
+- A family with a single face gets no synthetic bold or italic.
+- `system-ui` and the other generic families map to the standard 14 fonts, not to the platform's
+  interface font. Name the fonts you want.
+- The root element's background fills the page, as in wkhtmltopdf; Chrome leaves the page white.
+
+From 1.3, media queries and viewport units see the page area, as Chrome and wkhtmltopdf do when
+they print, so Bootstrap's 768 px breakpoints no longer apply on A4. Check your own templates
+before you switch.
+
 ## Untrusted HTML
 
-Without a `ResourceLoader`, nothing is fetched from the network and only files under the base
-folder are read, so converting HTML from users cannot reach internal services or other files.
-Parsing, styling and layout are bounded: nesting depth, selector complexity, `var()` expansion,
-`@import` chains, table spans, grid tracks and background tiling all have limits. They apply to
-each construct, not to a whole conversion, so give conversions of untrusted HTML a timeout and a
-memory limit. Resource limits for untrusted input are being added in 1.3.
+Without a `ResourceLoader` or `ResourceLoaderAsync`, nothing is fetched from the network and only
+files under the base folder are read, so converting HTML from users cannot reach internal services
+or other files. Parsing, styling and layout are bounded: nesting depth, selector complexity,
+`var()` expansion, `@import` chains, table spans, grid tracks and background tiling all have
+limits.
+
+From 1.3 a whole conversion is bounded too:
+
+- `MaxStyleWork` and `MaxLayoutWork` cap the style and layout work, scaled with the length of the
+  input. Style sheets built to be slow to match, or markup built to be laid out again and again,
+  end with `HtmlConversionException` naming the option. Ordinary documents use about a hundredth
+  of the style budget and a fiftieth of the layout budget.
+- `MaxPages` (10000) caps the output.
+- `HtmlConverter.MaxConcurrentConversions` (default: the processor count) caps the conversions
+  running at once in the process. More wait their turn; async callers wait without holding a
+  thread and can cancel while they wait. Raise it when `ResourceLoaderAsync` spends much of a
+  conversion waiting on the network.
+- Every entry point takes a `CancellationToken`, observed while waiting for a turn and through
+  parsing, styling, layout, painting and resource loading. Pass the request's token and a
+  timeout.
+
+`PdfLimits` does not apply to HTML conversion. Run conversions of HTML from users in a process or
+container with a memory limit as well.
 
 ## Limits
 
 - No JavaScript: pages must be rendered HTML, not built in the browser.
+- Content wider than the page is cut, not shrunk to fit, and floats and table rows are not split
+  across pages. See [how close it is to a browser](#how-close-it-is-to-a-browser).
 - No multi-column layout or vertical writing modes yet.
 - Images: JPEG, PNG, GIF, BMP, TIFF and WebP (the first frame of animations), and SVG drawn as
   vectors without filters, masks or patterns.
