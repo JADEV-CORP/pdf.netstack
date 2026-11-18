@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
@@ -56,7 +57,10 @@ public sealed record PdfSignatureOptions
     /// <summary>The hash. Default SHA-256.</summary>
     public PdfDigestAlgorithm Digest { get; init; } = PdfDigestAlgorithm.Sha256;
 
-    /// <summary>Intermediate certificates to embed, so validators can build the chain to a trusted root.</summary>
+    /// <summary>
+    /// Intermediate certificates to embed, so validators can build the chain to a trusted root.
+    /// With an <see cref="IPdfSignatureProvider"/>, they follow the provider's own chain, without repeats.
+    /// </summary>
     public IReadOnlyList<X509Certificate2> Chain { get; init; } = [];
 
     /// <summary>A visible signature, or null for an invisible one.</summary>
@@ -67,7 +71,9 @@ public sealed record PdfSignatureOptions
 
     /// <summary>
     /// A time stamp authority to timestamp the signature value (PAdES B-T); null for none (B-B).
-    /// The token goes in the CMS signature as an unsigned attribute.
+    /// The token goes in the CMS signature as an unsigned attribute. A client made with an
+    /// asynchronous delegate needs the asynchronous signing methods. In a deferred signature, this
+    /// only sizes the space reserved; the client passed to the second step fetches the token.
     /// </summary>
     public PdfTimestampClient? Timestamp { get; init; }
 }
@@ -138,11 +144,12 @@ public sealed class PdfSignatureInfo
 /// </summary>
 /// <remarks>
 /// The private key may be RSA or ECDSA, from a file or any key store X509Certificate2 can reach
-/// (Windows certificate store, smart cards through their providers). Encrypted documents are not
-/// supported. Time stamp authorities and revocation data are reached through the application;
-/// the library never opens a network connection.
+/// (Windows certificate store, smart cards through their providers), or anywhere an
+/// <see cref="IPdfSignatureProvider"/> reaches: a key vault, a cloud KMS, an HSM, a remote signing
+/// service. Encrypted documents are not supported. Time stamp authorities and revocation data are
+/// reached through the application; the library never opens a network connection.
 /// </remarks>
-public static class PdfSigner
+public static partial class PdfSigner
 {
     /// <summary>Signs <paramref name="pdf"/> and returns the signed file.</summary>
     /// <exception cref="ArgumentException">The certificate has no usable private key.</exception>
@@ -164,16 +171,59 @@ public static class PdfSigner
     /// <exception cref="NotSupportedException">The document is encrypted.</exception>
     /// <exception cref="CryptographicException">A timestamp was requested and the authority refused it or replied with an invalid token.</exception>
     /// <exception cref="OperationCanceledException">Cancelled; nothing was signed.</exception>
+    /// <exception cref="InvalidOperationException"><see cref="PdfSignatureOptions.Timestamp"/> was made with an asynchronous delegate; use <see cref="SignAsync(byte[], IPdfSignatureProvider, PdfSignatureOptions?, CancellationToken)"/>.</exception>
     public static byte[] Sign(byte[] pdf, X509Certificate2 certificate, PdfSignatureOptions? options, CancellationToken cancellationToken)
     {
         Compat.ThrowIfNull(pdf, nameof(pdf));
         Compat.ThrowIfNull(certificate, nameof(certificate));
         options ??= new PdfSignatureOptions();
         if (!certificate.HasPrivateKey) throw new ArgumentException("The certificate has no private key.", nameof(certificate));
+        if (options.Timestamp is { IsAsynchronous: true }) throw PdfTimestampClient.Asynchronous();
+        var signer = new PdfCertificateSignatureProvider(certificate);
         cancellationToken.ThrowIfCancellationRequested();
+        return Synchronously(SignCoreAsync(pdf, signer, options, cancellationToken)).ToArray();
+    }
 
+    /// <summary>
+    /// Signs with any provider: prepares the update, has the provider sign the hash of the signed
+    /// attributes, checks the value, timestamps it when asked and fills the signature in. The
+    /// synchronous <see cref="Sign(byte[], X509Certificate2, PdfSignatureOptions?, CancellationToken)"/>
+    /// runs it with the certificate's own key and a synchronous time stamp authority.
+    /// </summary>
+    private static async Task<UpdatedFile> SignCoreAsync(ReadOnlyMemory<byte> pdf, IPdfSignatureProvider signer, PdfSignatureOptions options, CancellationToken ct)
+    {
+        X509Certificate2 certificate = signer.Certificate ?? throw new ArgumentException("The signature provider has no certificate.", nameof(signer));
+        PdfSignatureAlgorithm algorithm = signer.SignatureAlgorithm;
+        SignatureValues.CheckKey(certificate, algorithm, nameof(signer), nameof(signer));
+        byte[][] chain = ChainOf(signer, options);
+        HashAlgorithmName hash = HashName(options.Digest);
+
+        UpdatedFile file = PrepareUpdate(pdf, certificate, chain, options, ct);
+        byte[] attributes = Cms.SignedAttributes(file.Digest!, hash, certificate);
+        ct.ThrowIfCancellationRequested();
+        byte[] returned = await signer.SignDigestAsync(Pkix.Hash(hash, attributes), options.Digest, ct).ConfigureAwait(false);
+        byte[] value = SignatureValues.Accept(returned, attributes, algorithm, hash, certificate);
+
+        byte[]? token = null;
+        if (options.Timestamp is PdfTimestampClient tsa)
+        {
+            ct.ThrowIfCancellationRequested();
+            token = await tsa.GetTokenForDigestAsync(Pkix.Hash(HashName(tsa.Digest), value), ct).ConfigureAwait(false);
+        }
+
+        file.Fill(Cms.Build(attributes, hash, certificate, chain, Cms.SignatureAlgorithm(algorithm, hash), value, token));
+        return file;
+    }
+
+    /// <summary>
+    /// Adds the signature field, its widget and the signature dictionary, with an empty Contents
+    /// string large enough for the CMS signature, and returns the update with the digest of the
+    /// file outside that string: the message digest the signed attributes carry.
+    /// </summary>
+    private static UpdatedFile PrepareUpdate(ReadOnlyMemory<byte> pdf, X509Certificate2 certificate, byte[][] chain, PdfSignatureOptions options, CancellationToken ct)
+    {
         var update = new IncrementalUpdate(pdf);
-        cancellationToken.ThrowIfCancellationRequested();
+        ct.ThrowIfCancellationRequested();
         PdfDocument doc = update.Doc;
         DateTimeOffset when = options.SigningTime ?? DateTimeOffset.UtcNow;
 
@@ -184,17 +234,9 @@ public static class PdfSigner
         if (options.Appearance is PdfSignatureAppearance look) Appear(doc, page, widget, look, certificate, options, when);
         update.AddField(page, doc.AddObject(widget));
 
-        byte[][] chain = [.. options.Chain.Select(c => c.RawData)];
         int reserve = 8192 + certificate.RawData.Length + chain.Sum(c => c.Length) + (options.Timestamp?.ReservedSize ?? 0);
-        HashAlgorithmName hash = HashName(options.Digest);
-        PdfTimestampClient? tsa = options.Timestamp;
-        Func<byte[], byte[]>? stamp = tsa is null ? null : value =>
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            return tsa.GetToken(value);
-        };
-        cancellationToken.ThrowIfCancellationRequested();
-        return update.Seal(
+        ct.ThrowIfCancellationRequested();
+        return update.Write(
             new IncrementalUpdate.Placeholder(signatureNumber, "/Type/Sig/Filter/Adobe.PPKLite/SubFilter/ETSI.CAdES.detached", reserve, sink =>
             {
                 sink.WriteAscii("/M");
@@ -204,8 +246,37 @@ public static class PdfSigner
                 WriteText(sink, "Location", options.Location);
                 WriteText(sink, "ContactInfo", options.ContactInfo);
             }),
-            hash,
-            digest => Cms.Sign(digest, hash, certificate, chain, stamp));
+            HashName(options.Digest));
+    }
+
+    /// <summary>
+    /// The certificates embedded after the signer's: the provider's chain, then those of the
+    /// options it does not already hold. With no provider chain, the options' list as it is.
+    /// </summary>
+    private static byte[][] ChainOf(IPdfSignatureProvider signer, PdfSignatureOptions options)
+    {
+        IReadOnlyList<X509Certificate2> own = signer.Chain ?? [];
+        if (own.Count == 0) return [.. options.Chain.Select(c => c.RawData)];
+        var chain = new List<byte[]>(own.Select(c => c.RawData));
+        foreach (X509Certificate2 extra in options.Chain)
+        {
+            if (!chain.Any(c => c.AsSpan().SequenceEqual(extra.RawData))) chain.Add(extra.RawData);
+        }
+
+        return [.. chain];
+    }
+
+    /// <summary>
+    /// The result of a task started by a synchronous overload. Those overloads hand the shared
+    /// asynchronous code only synchronous parts (the certificate's own key, a time stamp authority
+    /// made with a synchronous delegate, a synchronous revocation source), so every await finds its
+    /// task complete and the call has run to its end on this thread before the task is returned:
+    /// nothing waits here, and no synchronization context can deadlock.
+    /// </summary>
+    private static T Synchronously<T>(Task<T> task)
+    {
+        Debug.Assert(task.IsCompleted, "A synchronous signing call reached asynchronous work.");
+        return task.GetAwaiter().GetResult();
     }
 
     /// <summary>
@@ -219,19 +290,28 @@ public static class PdfSigner
     /// <param name="fieldName">The timestamp field's name; null picks Timestamp1, Timestamp2 and so on.</param>
     /// <exception cref="NotSupportedException">The document is encrypted.</exception>
     /// <exception cref="CryptographicException">The authority refused the request or replied with an invalid token.</exception>
+    /// <exception cref="InvalidOperationException">The client was made with an asynchronous delegate; use <see cref="AddDocumentTimestampAsync(byte[], PdfTimestampClient, string?, CancellationToken)"/>.</exception>
     public static byte[] AddDocumentTimestamp(byte[] pdf, PdfTimestampClient timestampAuthority, string? fieldName = null)
     {
         Compat.ThrowIfNull(pdf, nameof(pdf));
         Compat.ThrowIfNull(timestampAuthority, nameof(timestampAuthority));
+        if (timestampAuthority.IsAsynchronous) throw PdfTimestampClient.Asynchronous();
+        return Synchronously(DocumentTimestampCoreAsync(pdf, timestampAuthority, fieldName, CancellationToken.None)).ToArray();
+    }
+
+    private static async Task<UpdatedFile> DocumentTimestampCoreAsync(ReadOnlyMemory<byte> pdf, PdfTimestampClient timestampAuthority, string? fieldName, CancellationToken ct)
+    {
         var update = new IncrementalUpdate(pdf);
+        ct.ThrowIfCancellationRequested();
         PdfDocument doc = update.Doc;
         int number = doc.NextNumber++;
         PdfPage page = doc.Pages[0];
         update.AddField(page, doc.AddObject(Widget(fieldName ?? UniqueFieldName(doc, "Timestamp"), number, page)));
-        return update.Seal(
+        UpdatedFile file = update.Write(
             new IncrementalUpdate.Placeholder(number, "/Type/DocTimeStamp/Filter/Adobe.PPKLite/SubFilter/ETSI.RFC3161", timestampAuthority.ReservedSize, null),
-            HashName(timestampAuthority.Digest),
-            timestampAuthority.GetTokenForDigest);
+            HashName(timestampAuthority.Digest));
+        file.Fill(await timestampAuthority.GetTokenForDigestAsync(file.Digest!, ct).ConfigureAwait(false));
+        return file;
     }
 
     /// <summary>
@@ -274,7 +354,7 @@ public static class PdfSigner
         Compat.ThrowIfNull(revocation, nameof(revocation));
         try
         {
-            return CollectValidationData(pdf, revocation, certificates, new SignatureChecks(), cancellationToken);
+            return Synchronously(CollectValidationDataAsync(pdf, new SynchronousRevocationSource(revocation), certificates, new SignatureChecks(), cancellationToken)).ToArray();
         }
         catch (SignatureChecks.ExhaustedException e)
         {
@@ -282,7 +362,7 @@ public static class PdfSigner
         }
     }
 
-    private static byte[] CollectValidationData(byte[] pdf, IPdfRevocationSource revocation, IReadOnlyList<X509Certificate2>? certificates, SignatureChecks checks, CancellationToken ct)
+    private static async Task<UpdatedFile> CollectValidationDataAsync(ReadOnlyMemory<byte> pdf, IAsyncPdfRevocationSource revocation, IReadOnlyList<X509Certificate2>? certificates, SignatureChecks checks, CancellationToken ct)
     {
         var update = new IncrementalUpdate(pdf);
         PdfDocument doc = update.Doc;
@@ -343,7 +423,7 @@ public static class PdfSigner
                     if (!fetched.TryGetValue(id, out var found))
                     {
                         ct.ThrowIfCancellationRequested();
-                        found = Fetch(store, revocation, cert, chain[i + 1], pool, checks);
+                        found = await FetchAsync(store, revocation, cert, chain[i + 1], pool, checks, ct).ConfigureAwait(false);
                         fetched[id] = found;
                     }
 
@@ -359,7 +439,7 @@ public static class PdfSigner
         }
 
         store.WriteTo(update);
-        return update.Write();
+        return update.Append();
     }
 
     /// <summary>Checks every signature of a file: byte range, digest and cryptographic validity, and any timestamp.</summary>
@@ -480,13 +560,13 @@ public static class PdfSigner
     }
 
     /// <summary>The OCSP responses and CRLs for one certificate that match it and verify, added to the store.</summary>
-    private static (List<PdfObject> Ocsps, List<PdfObject> Crls, List<X509Certificate2> Responders) Fetch(
-        DssWriter store, IPdfRevocationSource source, X509Certificate2 cert, X509Certificate2 issuer, List<X509Certificate2> pool, SignatureChecks checks)
+    private static async Task<(List<PdfObject> Ocsps, List<PdfObject> Crls, List<X509Certificate2> Responders)> FetchAsync(
+        DssWriter store, IAsyncPdfRevocationSource source, X509Certificate2 cert, X509Certificate2 issuer, List<X509Certificate2> pool, SignatureChecks checks, CancellationToken ct)
     {
         var ocsps = new List<PdfObject>();
         var crls = new List<PdfObject>();
         var responders = new List<X509Certificate2>();
-        PdfRevocationValues values = source.GetRevocationValues(new PdfRevocationRequest(cert, issuer)) ?? PdfRevocationValues.None;
+        PdfRevocationValues values = await source.GetRevocationValuesAsync(new PdfRevocationRequest(cert, issuer), ct).ConfigureAwait(false) ?? PdfRevocationValues.None;
         foreach (byte[] data in values.OcspResponses)
         {
             if (data is null || Ocsp.TryParse(data) is not Ocsp response || response.Find(cert, issuer) is null) continue;
@@ -666,13 +746,14 @@ public static class PdfSigner
 internal sealed class IncrementalUpdate
 {
     private const int ByteRangeDigits = 10;
-    private readonly byte[] _original;
+    private readonly ReadOnlyMemory<byte> _original;
     private readonly PdfFile _file;
     private readonly int _firstNew;
     private readonly SortedSet<int> _changed = [];
 
+    /// <param name="pdf">The file; it is referenced, not copied, and must not change while the update is in use.</param>
     /// <exception cref="NotSupportedException">The document is encrypted.</exception>
-    public IncrementalUpdate(byte[] pdf)
+    public IncrementalUpdate(ReadOnlyMemory<byte> pdf)
     {
         _original = pdf;
         _file = PdfFile.Open(pdf, 256L << 20);
@@ -740,30 +821,40 @@ internal sealed class IncrementalUpdate
     }
 
     /// <summary>Writes the update with no signature.</summary>
-    public byte[] Write() => WriteUpdate(null).Output;
+    public byte[] Write() => Append().ToArray();
+
+    /// <summary>Writes the update with no signature, keeping the original bytes and the update apart.</summary>
+    public UpdatedFile Append() => new(_original, WriteUpdate(null).Tail, 0, 0, null);
 
     /// <summary>
-    /// Writes the update with a signature dictionary, fills its byte range, hashes the file
-    /// outside the contents, and writes what <paramref name="contents"/> makes of the digest.
+    /// Writes the update with a signature dictionary, fills its byte range and hashes the file
+    /// outside the Contents string. <see cref="UpdatedFile.Fill(byte[])"/> then writes the contents.
     /// </summary>
-    /// <exception cref="InvalidOperationException">The contents are larger than the space reserved.</exception>
-    public byte[] Seal(Placeholder placeholder, HashAlgorithmName hash, Func<byte[], byte[]> contents)
+    public UpdatedFile Write(Placeholder placeholder, HashAlgorithmName hash)
     {
-        (byte[] output, int byteRangeAt, int contentsStart, int contentsEnd) = WriteUpdate(placeholder);
+        (byte[] tail, int byteRangeAt, int contentsStart, int contentsEnd) = WriteUpdate(placeholder);
+        int origin = _original.Length;
 
         // The byte range covers everything but the Contents hex string, delimiters included.
-        long[] range = [0, contentsStart, contentsEnd, output.Length - contentsEnd];
+        long[] range = [0, origin + contentsStart, origin + contentsEnd, tail.Length - contentsEnd];
         byte[] digits = Encoding.ASCII.GetBytes(string.Join(" ", range.Select(r => r.ToString("D" + ByteRangeDigits, CultureInfo.InvariantCulture))));
-        digits.CopyTo(output, byteRangeAt);
+        digits.CopyTo(tail, byteRangeAt);
 
-        byte[] value = contents(PdfSigner.Hash(hash, output, contentsStart, contentsEnd));
-        if (2 * value.Length > contentsEnd - contentsStart - 2) throw new InvalidOperationException("The signature is larger than the space reserved for it.");
-        Encoding.ASCII.GetBytes(Compat.ToHex(value)).CopyTo(output, contentsStart + 1);
-        return output;
+        // The original bytes are hashed where they are, never copied: they precede the update.
+        using IncrementalHash digest = IncrementalHash.CreateHash(hash);
+        UpdatedFile.Append(digest, _original);
+        digest.AppendData(tail, 0, contentsStart);
+        digest.AppendData(tail, contentsEnd, tail.Length - contentsEnd);
+        return new UpdatedFile(_original, tail, origin + contentsStart, origin + contentsEnd, digest.GetHashAndReset());
     }
 
-    /// <summary>Appends the objects, the signature dictionary with placeholders, and a cross-reference section matching the file's style.</summary>
-    private (byte[] Output, int ByteRangeAt, int ContentsStart, int ContentsEnd) WriteUpdate(Placeholder? placeholder)
+    /// <summary>
+    /// The update to append to the original bytes: the objects, the signature dictionary with
+    /// placeholders, and a cross-reference section matching the file's style. Offsets in the
+    /// cross-reference data count from the start of the file; the positions returned count from
+    /// the start of the update.
+    /// </summary>
+    private (byte[] Tail, int ByteRangeAt, int ContentsStart, int ContentsEnd) WriteUpdate(Placeholder? placeholder)
     {
         Doc.FinishFonts();
 
@@ -775,16 +866,17 @@ internal sealed class IncrementalUpdate
             if (o.Key >= _firstNew) objects[o.Key] = o.Value;
         }
 
-        var sink = new ByteSink(_original.Length + (placeholder?.Reserve ?? 0) * 2 + 16384);
-        sink.Write(_original);
-        if (sink.LastByte is not ((byte)'\n' or (byte)'\r')) sink.Write((byte)'\n');
+        // Offsets in the file are the original's length plus the position in the update.
+        long origin = _original.Length;
+        var sink = new ByteSink((placeholder?.Reserve ?? 0) * 2 + 16384);
+        if (_original.Length == 0 || _original.Span[_original.Length - 1] is not ((byte)'\n' or (byte)'\r')) sink.Write((byte)'\n');
         var serializer = new PdfSerializer(r => r.Number) { KeepGenerations = true };
         var offsets = new SortedDictionary<int, (long Offset, int Generation)>();
 
         foreach ((int number, PdfObject obj) in objects)
         {
             int generation = _file.Exists(number) ? _file.GenerationOf(number) : 0;
-            offsets[number] = (sink.Length, generation);
+            offsets[number] = (origin + sink.Length, generation);
             sink.WriteAscii($"{number} {generation} obj\n");
             if (obj is PdfStream stream)
             {
@@ -806,7 +898,7 @@ internal sealed class IncrementalUpdate
         int byteRangeAt = 0, contentsStart = 0, contentsEnd = 0;
         if (placeholder is Placeholder p)
         {
-            offsets[p.Number] = (sink.Length, 0);
+            offsets[p.Number] = (origin + sink.Length, 0);
             sink.WriteAscii($"{p.Number} 0 obj\n<<{p.Head}/ByteRange[");
             byteRangeAt = sink.Length;
             sink.WriteAscii(string.Join(" ", Enumerable.Repeat(new string('0', ByteRangeDigits), 4)));
@@ -825,12 +917,12 @@ internal sealed class IncrementalUpdate
         {
             ["Size"] = PdfNumber.FromInteger(Math.Max(maxNumber + (_file.UsesXrefStreams ? 2 : 1), _file.Trailer["Size"] is PdfNumber { IsInteger: true } sz ? sz.IntegerValue : 0)),
             ["Root"] = _file.Trailer["Root"]!,
-            ["Prev"] = PdfNumber.FromInteger(LastStartXref(_original)),
+            ["Prev"] = PdfNumber.FromInteger(LastStartXref(_original.Span)),
         };
         if (_file.Trailer["Info"] is PdfObject info) trailer.Set("Info", info);
         if (_file.Resolve(_file.Trailer["ID"]) is PdfArray id) trailer.Set("ID", id);
 
-        long xref = sink.Length;
+        long xref = origin + sink.Length;
         if (_file.UsesXrefStreams)
         {
             int xrefNumber = maxNumber + 1;
@@ -901,9 +993,9 @@ internal sealed class IncrementalUpdate
         if (start >= 0) yield return (start, previous - start + 1);
     }
 
-    private static long LastStartXref(byte[] pdf)
+    private static long LastStartXref(ReadOnlySpan<byte> pdf)
     {
-        int at = pdf.AsSpan().LastIndexOf("startxref"u8);
+        int at = pdf.LastIndexOf("startxref"u8);
         if (at < 0) throw new PdfFormatException("startxref not found.");
         int i = at + 9;
         while (i < pdf.Length && pdf[i] is (byte)' ' or (byte)'\r' or (byte)'\n' or (byte)'\t') i++;
@@ -914,4 +1006,72 @@ internal sealed class IncrementalUpdate
 
     /// <summary>A signature or timestamp dictionary written by hand: its number, its entries before ByteRange, the bytes reserved for Contents, and entries after Contents.</summary>
     public readonly record struct Placeholder(int Number, string Head, int Reserve, Action<ByteSink>? Tail);
+}
+
+/// <summary>
+/// A file after an incremental update: the original bytes, untouched, then the update. The two
+/// parts stay apart so the original is never copied: it is hashed where it is and written out as
+/// it is, which keeps a signed copy of a large file from needing twice its size in memory.
+/// </summary>
+internal sealed class UpdatedFile
+{
+    public UpdatedFile(ReadOnlyMemory<byte> original, byte[] tail, int contentsStart, int contentsEnd, byte[]? digest)
+    {
+        Original = original;
+        Tail = tail;
+        ContentsStart = contentsStart;
+        ContentsEnd = contentsEnd;
+        Digest = digest;
+    }
+
+    public ReadOnlyMemory<byte> Original { get; }
+
+    /// <summary>The update appended to the original bytes.</summary>
+    public byte[] Tail { get; }
+
+    /// <summary>Where the Contents hex string starts in the file, at its '&lt;'; 0 without a signature dictionary.</summary>
+    public int ContentsStart { get; }
+
+    /// <summary>Where the Contents hex string ends in the file, just after its '&gt;'.</summary>
+    public int ContentsEnd { get; }
+
+    /// <summary>The hash of the file outside the Contents string, which a signature or timestamp covers; null without a signature dictionary.</summary>
+    public byte[]? Digest { get; }
+
+    public long Length => Original.Length + Tail.Length;
+
+    /// <summary>Writes the signature or token into the Contents string, as hex.</summary>
+    /// <exception cref="InvalidOperationException">The contents are larger than the space reserved.</exception>
+    public void Fill(byte[] contents)
+    {
+        if (2 * contents.Length > ContentsEnd - ContentsStart - 2) throw new InvalidOperationException("The signature is larger than the space reserved for it.");
+        Encoding.ASCII.GetBytes(Compat.ToHex(contents)).CopyTo(Tail, ContentsStart - Original.Length + 1);
+    }
+
+    public byte[] ToArray()
+    {
+        var all = new byte[Length];
+        Original.CopyTo(all);
+        Tail.CopyTo(all, Original.Length);
+        return all;
+    }
+
+    /// <summary>Writes the file to a stream from its position, asynchronously, and flushes it.</summary>
+    public async Task WriteToAsync(Stream stream, CancellationToken ct)
+    {
+        await OutputStreams.WriteAsync(stream, Original, ct).ConfigureAwait(false);
+        await OutputStreams.WriteAsync(stream, Tail, ct).ConfigureAwait(false);
+        await stream.FlushAsync(ct).ConfigureAwait(false);
+    }
+
+    /// <summary>Adds memory to a hash without copying it where the target allows.</summary>
+    public static void Append(IncrementalHash hash, ReadOnlyMemory<byte> data)
+    {
+#if NET8_0_OR_GREATER
+        hash.AppendData(data.Span);
+#else
+        if (System.Runtime.InteropServices.MemoryMarshal.TryGetArray(data, out ArraySegment<byte> segment)) hash.AppendData(segment.Array!, segment.Offset, segment.Count);
+        else hash.AppendData(data.ToArray());
+#endif
+    }
 }
