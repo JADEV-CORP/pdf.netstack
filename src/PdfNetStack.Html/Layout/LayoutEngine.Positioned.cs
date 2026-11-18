@@ -6,8 +6,12 @@ namespace PdfNetStack.Html.Layout;
 internal readonly record struct Exclusion(double Left, double Right, double Next);
 
 /// <summary>The floats of one block formatting context, as margin boxes on the canvas (CSS 2.1, 9.5).</summary>
-internal sealed class FloatContext
+internal sealed class FloatContext(WorkBudget budget)
 {
+    // Floats compared per unit of layout work: each check scans every float of the context, so
+    // thousands of floats checked by thousands of lines and floats grow with the square.
+    private const int FloatsPerUnit = 64;
+
     private readonly List<(double Left, double Top, double Right, double Bottom, bool IsLeft)> _floats = [];
 
     public bool IsEmpty => _floats.Count == 0;
@@ -18,6 +22,7 @@ internal sealed class FloatContext
     /// <summary>The free span inside [<paramref name="left"/>, <paramref name="right"/>] over a band, and where the first float beside it ends.</summary>
     public (double Left, double Right, double Next) Free(double top, double height, double left, double right)
     {
+        budget.Layout(1 + (_floats.Count / FloatsPerUnit));
         double l = left, r = right, next = double.PositiveInfinity;
         double bottom = top + Math.Max(height, 1e-6);
         foreach (var f in _floats)
@@ -77,7 +82,7 @@ internal sealed partial class LayoutEngine
 {
     private sealed record Pending(Box Box, double StaticX, double StaticY);
 
-    private FloatContext _floats = new();
+    private FloatContext _floats;
     private readonly Stack<List<Pending>> _positioned = new();
     private readonly List<Pending> _fixedPending = [];
 

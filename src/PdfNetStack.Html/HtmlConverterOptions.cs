@@ -21,6 +21,16 @@ public sealed class HtmlConverterOptions
     /// </summary>
     public Func<Uri, byte[]?>? ResourceLoader { get; init; }
 
+    /// <summary>
+    /// Fetches style sheets, images and fonts by absolute URL, asynchronously, with the
+    /// conversion's cancellation token; return null for anything that should not load. When set
+    /// it is used instead of <see cref="ResourceLoader"/>, with the same rules: check each address
+    /// before fetching it when the HTML is untrusted. Resources load one at a time, when layout
+    /// first needs them, on the conversion's own thread, which waits for each without blocking the
+    /// thread pool.
+    /// </summary>
+    public Func<Uri, CancellationToken, Task<byte[]?>>? ResourceLoaderAsync { get; init; }
+
     /// <summary>Fonts to use before installed ones, matched by family name, width, style and weight.</summary>
     public PdfFontCollection? Fonts { get; init; }
 
@@ -84,4 +94,54 @@ public sealed class HtmlConverterOptions
     }
 
     private readonly int _maxPages = 10_000;
+
+    /// <summary>
+    /// The most style work a conversion may do: one unit per rule considered for an element, per
+    /// selector part tested while walking ancestors or siblings, and per value a <c>var()</c>
+    /// copies. Ordinary documents use a few hundred units per element. Style sheets built to be
+    /// slow to match, such as thousands of descendant selectors over a deep tree, end with
+    /// <see cref="HtmlConversionException"/> within seconds instead of running for minutes.
+    /// Null, the default, scales with the input: 50 million plus 250 per character of the HTML
+    /// and of <see cref="StyleSheet"/>, a hundred times what ordinary documents use.
+    /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException">The value is less than 1.</exception>
+    public long? MaxStyleWork
+    {
+        get => _maxStyleWork;
+        init => _maxStyleWork = value is null or >= 1 ? value : throw new ArgumentOutOfRangeException(nameof(MaxStyleWork), value, "At least one unit, or null to scale with the input.");
+    }
+
+    /// <summary>
+    /// The most layout work a conversion may do: one unit per box laid out or measured, per line,
+    /// per box repeated on a page (a fixed box or a repeated table header), and per 64 floats a
+    /// line or box is checked against. A box sized from its content is measured and then laid
+    /// out, so ordinary documents use a few units per box. Markup built to be laid out again and
+    /// again ends with <see cref="HtmlConversionException"/>. Null, the default, scales with the
+    /// input: 1 million plus 20 per character of the HTML, fifty times what ordinary documents use.
+    /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException">The value is less than 1.</exception>
+    public long? MaxLayoutWork
+    {
+        get => _maxLayoutWork;
+        init => _maxLayoutWork = value is null or >= 1 ? value : throw new ArgumentOutOfRangeException(nameof(MaxLayoutWork), value, "At least one unit, or null to scale with the input.");
+    }
+
+    // The scaled budgets: what any document may spend, plus an amount per character of input.
+    // Honest documents cost a roughly fixed amount per element; the attacks these stop multiply
+    // work by the number of rules, ancestors or siblings, so a budget that grows with the input
+    // stops them without refusing large ordinary documents.
+    private const long StyleAllowance = 50_000_000;
+    private const long StylePerCharacter = 250;
+    private const long LayoutAllowance = 1_000_000;
+    private const long LayoutPerCharacter = 20;
+
+    private readonly long? _maxStyleWork;
+    private readonly long? _maxLayoutWork;
+
+    internal long StyleWorkFor(string html) => _maxStyleWork ?? Scaled(StyleAllowance, StylePerCharacter, (long)html.Length + (StyleSheet?.Length ?? 0));
+
+    internal long LayoutWorkFor(string html) => _maxLayoutWork ?? Scaled(LayoutAllowance, LayoutPerCharacter, html.Length);
+
+    private static long Scaled(long allowance, long perCharacter, long characters) =>
+        characters >= (long.MaxValue - allowance) / perCharacter ? long.MaxValue : allowance + (perCharacter * characters);
 }

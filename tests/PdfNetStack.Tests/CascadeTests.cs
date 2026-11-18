@@ -310,7 +310,8 @@ public sealed class CascadeTests
         Assert.AreEqual("outset", Value(t, "border-top-style"));
 
         ComputedStyle c = Of(styles, "c");
-        Assert.AreEqual("right", Value(c, "text-align"));
+        // The legacy value browsers compute for align: it aligns right, and a nested table drops it.
+        Assert.AreEqual("-webkit-right", Value(c, "text-align"));
         Assert.AreEqual("top", Value(c, "vertical-align"));
         Assert.AreEqual("120px", Value(c, "width"));
         Assert.AreEqual("nowrap", Value(c, "white-space"));

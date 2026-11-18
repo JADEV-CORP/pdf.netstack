@@ -107,7 +107,33 @@ internal sealed partial class LayoutEngine
         }
 
         grid.ColumnCount = Math.Max(grid.ColumnCount, index);
+        if (table.Style.Keyword("direction") == "rtl") Mirror(grid);
         return grid;
+    }
+
+    /// <summary>
+    /// Mirrors the columns of a right to left table, whose first column is the rightmost (CSS 2.1,
+    /// 17.5): column 0 is then the leftmost on the page, so widths, positions and the collapsing
+    /// border model, which reads border-left and border-right as the sides they name, need no
+    /// further care.
+    /// </summary>
+    private static void Mirror(TableGrid grid)
+    {
+        int n = grid.ColumnCount;
+        for (int i = 0; i < grid.Cells.Count; i++) grid.Cells[i] = grid.Cells[i] with { Column = n - grid.Cells[i].Column - grid.Cells[i].ColumnSpan };
+
+        grid.Slots.Clear();
+        foreach (CellSlot cell in grid.Cells)
+        {
+            for (int dr = 0; dr < cell.RowSpan; dr++)
+            {
+                for (int dc = 0; dc < cell.ColumnSpan; dc++) grid.Slots[Key(cell.Row + dr, cell.Column + dc)] = cell;
+            }
+        }
+
+        List<KeyValuePair<int, Box>> columns = [.. grid.ColumnBoxes];
+        grid.ColumnBoxes.Clear();
+        foreach (KeyValuePair<int, Box> column in columns) grid.ColumnBoxes[n - 1 - column.Key] = column.Value;
     }
 
     private static bool Collapsed(TableBox table) => table.Style.Keyword("border-collapse") == "collapse";
@@ -280,12 +306,17 @@ internal sealed partial class LayoutEngine
         int n = c.Min.Length;
         var widths = new double[n];
         bool[] percent = [.. c.Percent.Select(p => p is not null)];
-        double used = 0;
+
+        // Percentages past 100% in total are cut from the later columns (CSS Tables 3, 3.9.3).
+        double used = 0, percentMin = 0, total = 0;
         for (int k = 0; k < n; k++)
         {
             if (!percent[k]) continue;
-            widths[k] = Math.Max(c.Min[k], c.Percent[k]!.Value / 100 * tableWidth);
+            double share = Math.Min(c.Percent[k]!.Value, Math.Max(0, 100 - total));
+            total += share;
+            widths[k] = Math.Max(c.Min[k], share / 100 * tableWidth);
             used += widths[k];
+            percentMin += c.Min[k];
         }
 
         double remaining = target - used;
@@ -295,6 +326,16 @@ internal sealed partial class LayoutEngine
             if (percent[k]) continue;
             sumMin += c.Min[k];
             sumMax += c.Max[k];
+        }
+
+        if (remaining < sumMin && used > percentMin)
+        {
+            // Between the minimum guess and the percentage guess: percentage columns give way, in
+            // proportion to what they hold past their minimums, so no other column drops below its
+            // own and the table does not overflow (CSS Tables 3, 3.9.3).
+            double t = Math.Max(0, Math.Min(1, (target - sumMin - percentMin) / (used - percentMin)));
+            for (int k = 0; k < n; k++) widths[k] = percent[k] ? c.Min[k] + ((widths[k] - c.Min[k]) * t) : c.Min[k];
+            return widths;
         }
 
         if (remaining >= sumMax)
