@@ -19,6 +19,8 @@ internal sealed class CMap
     /// <summary>Mappings one CMap may hold, a range counting once however wide.</summary>
     public const int MaxEntries = 1 << 18;
 
+    private const int MaxDestinationBytes = 512;
+
     /// <summary>How deep usecmap may chain.</summary>
     public const int MaxDepth = 8;
 
@@ -519,10 +521,14 @@ internal sealed class CMap
         _ => null,
     };
 
-    /// <summary>UTF-16BE code units; a lone byte is one unit.</summary>
+    /// <summary>
+    /// UTF-16BE code units; a lone byte is one unit. A destination is at most 512 bytes (ISO
+    /// 32000-1, 9.10.3); a longer one is cut there, as every glyph it maps would repeat it.
+    /// </summary>
     private static char[] Units(byte[] bytes)
     {
         if (bytes.Length == 1) return [(char)bytes[0]];
+        if (bytes.Length > MaxDestinationBytes) bytes = bytes.AsSpan(0, MaxDestinationBytes).ToArray();
         var units = new char[bytes.Length / 2];
         for (int i = 0; i < units.Length; i++) units[i] = (char)((bytes[2 * i] << 8) | bytes[(2 * i) + 1]);
         return units;

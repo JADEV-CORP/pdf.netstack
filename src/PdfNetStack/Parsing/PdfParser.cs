@@ -56,6 +56,15 @@ internal sealed class PdfParser
 
     public ReadOnlySpan<byte> Span => _data.Span;
 
+    /// <summary>Tokens read so far, re-reads included: the work a caller's budget measures.</summary>
+    public long Tokens { get; private set; }
+
+    /// <summary>
+    /// Set when the last <see cref="ParseObject"/> failed because arrays and dictionaries nest
+    /// deeper than <see cref="MaxNesting"/>, rather than because the syntax was damaged.
+    /// </summary>
+    public bool NestingExceeded { get; private set; }
+
     public void SkipWhitespaceAndComments()
     {
         ReadOnlySpan<byte> s = _data.Span;
@@ -82,6 +91,7 @@ internal sealed class PdfParser
 
     public Token NextToken()
     {
+        Tokens++;
         SkipWhitespaceAndComments();
         ReadOnlySpan<byte> s = _data.Span;
         int start = Position;
@@ -202,7 +212,12 @@ internal sealed class PdfParser
     /// <summary>Parses one direct object. References "n g R" are recognised by lookahead.</summary>
     public PdfObject ParseObject(int depth = 0)
     {
-        if (depth > MaxNesting) throw new PdfFormatException("Object nesting exceeds the supported depth.");
+        if (depth == 0) NestingExceeded = false;
+        if (depth > MaxNesting)
+        {
+            NestingExceeded = true;
+            throw new PdfFormatException("Object nesting exceeds the supported depth.");
+        }
 
         Token t = NextToken();
         ReadOnlySpan<byte> s = Span;

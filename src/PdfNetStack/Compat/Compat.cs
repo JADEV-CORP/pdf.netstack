@@ -29,6 +29,13 @@ internal static class Compat
 
     public static int Clamp(int value, int min, int max) => value < min ? min : value > max ? max : value;
 
+    /// <summary>An array the caller overwrites before reading: modern .NET skips zeroing it.</summary>
+#if NET8_0_OR_GREATER
+    public static byte[] AllocateUninitialized(int length) => GC.AllocateUninitializedArray<byte>(length);
+#else
+    public static byte[] AllocateUninitialized(int length) => new byte[length];
+#endif
+
     public static void ThrowIfNull(object? value, string name)
     {
         if (value is null) throw new ArgumentNullException(name);

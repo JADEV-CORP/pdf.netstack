@@ -131,6 +131,8 @@ internal sealed class EquivalenceVerifier
         return failure;
     }
 
+    private const int MaxPathLength = 256;
+
     private string? Compare(PdfObject? a, PdfObject? b, string path, int depth)
     {
         if (depth > PdfParser.MaxNesting) return path + ": nesting too deep to verify";
@@ -158,7 +160,12 @@ internal sealed class EquivalenceVerifier
 
             _aToB[ra.Number] = rb.Number;
             _bToA.TryAdd(rb.Number, ra.Number);
-            if (_visited.Add((ra.Number, rb.Number))) _pending.Enqueue((ra.Number, rb.Number, path));
+
+            // A path names where a difference is; past a few hundred characters, as down a page
+            // tree nested thousands deep, the object's number names it as well, and copying ever
+            // longer paths would cost the square of the depth.
+            string next = path.Length <= MaxPathLength ? path : Compat.Format("object {0}", ra.Number);
+            if (_visited.Add((ra.Number, rb.Number))) _pending.Enqueue((ra.Number, rb.Number, next));
             return null;
         }
 
@@ -501,7 +508,7 @@ internal sealed class EquivalenceVerifier
         if (filters is null) return null;
         try
         {
-            return StreamCodec.Decode(s.Data, filters, DecodeDepth.Full, _decodeLimit, static o => o);
+            return StreamCodec.Decode(s.Data, filters, DecodeDepth.Full, _decodeLimit, static o => o, _a.Budget);
         }
         catch (StreamDecodeException)
         {

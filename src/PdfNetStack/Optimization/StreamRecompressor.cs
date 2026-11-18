@@ -142,7 +142,7 @@ internal static class StreamRecompressor
                 is { } plan ? plan with { Recompress = scope.Recompress, Compact = scope.Compact.Contains(numbers[i]) } : null;
         }
 
-        return new Work(streams, numbers, plans, new Flate(level, exhaustive, ct), imagePredictors, decodeLimit, scope.HashContent);
+        return new Work(streams, numbers, plans, new Flate(level, exhaustive, ct), imagePredictors, decodeLimit, scope.HashContent) { Budget = file.Budget };
     }
 
     /// <summary>
@@ -186,6 +186,9 @@ internal static class StreamRecompressor
 
         public int Count => Streams.Count;
 
+        /// <summary>The budget every decode is charged to: the source file's.</summary>
+        public ResourceBudget? Budget { get; init; }
+
         /// <summary>The streams in scope, as the file holds them.</summary>
         public List<PdfStream> Streams { get; }
 
@@ -212,7 +215,7 @@ internal static class StreamRecompressor
             bool rejected;
             try
             {
-                result = Recompress(Streams[i], plan, _flate, _imagePredictors, _decodeLimit,
+                result = Recompress(Streams[i], plan, _flate, _imagePredictors, _decodeLimit, Budget,
                     reportHash && _hashContent ? hash => _hashes[i] = hash : null, out rejected);
             }
             finally
@@ -301,7 +304,7 @@ internal static class StreamRecompressor
             DecodedStream decoded;
             try
             {
-                decoded = StreamCodec.Decode(Streams[i].Data, plan.Filters, DecodeDepth.CompressionOnly, _decodeLimit, static o => o);
+                decoded = StreamCodec.Decode(Streams[i].Data, plan.Filters, DecodeDepth.CompressionOnly, _decodeLimit, static o => o, Budget);
             }
             catch (StreamDecodeException)
             {
@@ -651,7 +654,7 @@ internal static class StreamRecompressor
     private static int IntOf(PdfFile file, PdfObject? o) =>
         file.Resolve(o) is PdfNumber { IsInteger: true } n && n.IntegerValue is > 0 and < int.MaxValue ? (int)n.IntegerValue : 0;
 
-    private static Result? Recompress(PdfStream stream, Plan plan, Flate level, bool imagePredictors, long decodeLimit, Action<byte[]>? reportHash, out bool rejected)
+    private static Result? Recompress(PdfStream stream, Plan plan, Flate level, bool imagePredictors, long decodeLimit, ResourceBudget? budget, Action<byte[]>? reportHash, out bool rejected)
     {
         rejected = false;
 
@@ -661,7 +664,7 @@ internal static class StreamRecompressor
         DecodedStream decoded;
         try
         {
-            decoded = StreamCodec.Decode(data, plan.Filters, DecodeDepth.CompressionOnly, decodeLimit, static o => o);
+            decoded = StreamCodec.Decode(data, plan.Filters, DecodeDepth.CompressionOnly, decodeLimit, static o => o, budget);
         }
         catch (StreamDecodeException)
         {
@@ -693,7 +696,7 @@ internal static class StreamRecompressor
 
         Result? Reencode(out bool gate)
         {
-            Result? best = Choose(decoded, plan, originalCost, level, imagePredictors, decodeLimit, out gate);
+            Result? best = Choose(decoded, plan, originalCost, level, imagePredictors, decodeLimit, budget?.Pool, out gate);
             if (plan.Image is null || plan.Images is null) return best;
 
             // Lossy candidates must beat the best lossless (or requantized) encoding by a clear margin.
@@ -822,7 +825,8 @@ internal static class StreamRecompressor
         return probe.Length;
     }
 
-    private static Result? Choose(DecodedStream decoded, Plan plan, int originalCost, Flate flate, bool imagePredictors, long decodeLimit, out bool rejected)
+    /// <param name="pool">The run's pool for large working arrays, or null.</param>
+    private static Result? Choose(DecodedStream decoded, Plan plan, int originalCost, Flate flate, bool imagePredictors, long decodeLimit, System.Buffers.ArrayPool<byte>? pool, out bool rejected)
     {
         rejected = false;
         if (decoded.LayersDecoded == 0 && plan.Filters.Count > 0 && plan.Jpeg is null && plan.Bilevel?.Ccitt is null) return null;
@@ -882,10 +886,10 @@ internal static class StreamRecompressor
             // Rank plain and predicted data with a cheap pass, then spend the expensive
             // compression level only on the winner.
             PredictorParams layout = plan.ImageLayout!.Value;
-            using BoundedBuffer predictedLease = Predictors.EncodePng(decoded.Data.Span, layout);
+            using BoundedBuffer predictedLease = Predictors.EncodePng(decoded.Data.Span, layout, pool);
             ReadOnlySpan<byte> predicted = predictedLease.Span;
             bool usePredictor = level == CompressionLevel.Fastest
-                || StreamCodec.Deflate(predicted, CompressionLevel.Fastest).Length < StreamCodec.Deflate(decoded.Data.Span, CompressionLevel.Fastest).Length;
+                || StreamCodec.DeflatedLength(predicted, CompressionLevel.Fastest) < StreamCodec.DeflatedLength(decoded.Data.Span, CompressionLevel.Fastest);
             if (usePredictor)
             {
                 Consider(flate.Encode(predicted), new PdfName("FlateDecode"), StreamCodec.PredictorDictionary(layout));
