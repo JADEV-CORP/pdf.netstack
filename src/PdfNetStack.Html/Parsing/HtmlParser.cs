@@ -14,6 +14,10 @@ internal sealed class HtmlParser
 {
     private const int MaxDepth = 512;
 
+    // Tags read between two looks at the cancellation token: parsing runs at tens of megabytes a
+    // second, so cancellation is seen within a fraction of a millisecond.
+    private const int CancellationInterval = 1024;
+
     private static readonly HashSet<string> Void = new(StringComparer.Ordinal)
     {
         "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr", "param", "keygen",
@@ -34,6 +38,7 @@ internal sealed class HtmlParser
     };
 
     private readonly string _s;
+    private readonly CancellationToken _cancellationToken;
     private readonly HtmlDocument _doc = new();
     private readonly List<HtmlElement> _stack = [];
     private readonly HtmlElement _html = new("html");
@@ -41,19 +46,24 @@ internal sealed class HtmlParser
     private readonly HtmlElement _body = new("body");
     private bool _inBody;
     private int _at;
+    private int _markup;
 
-    private HtmlParser(string html)
+    private HtmlParser(string html, CancellationToken cancellationToken)
     {
         _s = html.Replace("\r\n", "\n").Replace('\r', '\n');
+        _cancellationToken = cancellationToken;
         _doc.Append(_html);
         _html.Append(_head);
         _html.Append(_body);
     }
 
-    public static HtmlDocument Parse(string html)
+    public static HtmlDocument Parse(string html) => Parse(html, CancellationToken.None);
+
+    /// <exception cref="OperationCanceledException">The token fired while parsing.</exception>
+    public static HtmlDocument Parse(string html, CancellationToken cancellationToken)
     {
         Compat.ThrowIfNull(html, nameof(html));
-        var parser = new HtmlParser(html);
+        var parser = new HtmlParser(html, cancellationToken);
         parser.Run();
         return parser._doc;
     }
@@ -71,6 +81,7 @@ internal sealed class HtmlParser
                 char n = _s[_at + 1];
                 if (char.IsLetter(n) || n == '/' || n == '!' || n == '?')
                 {
+                    if (++_markup % CancellationInterval == 0) _cancellationToken.ThrowIfCancellationRequested();
                     Flush(text);
                     Markup();
                     continue;
@@ -386,7 +397,7 @@ internal sealed class HtmlParser
     private static string DecodeText(string text)
     {
         if (text.IndexOf('&') < 0) return text;
-        var parser = new HtmlParser(text);
+        var parser = new HtmlParser(text, CancellationToken.None);
         var sb = new StringBuilder();
         while (parser._at < parser._s.Length)
         {

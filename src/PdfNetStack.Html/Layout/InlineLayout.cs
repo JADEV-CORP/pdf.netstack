@@ -239,6 +239,7 @@ internal sealed class InlineLayout
     {
         foreach (Box b in boxes)
         {
+            _engine.Budget.Layout(1);
             switch (b)
             {
                 case TextBox t:
@@ -823,6 +824,7 @@ internal sealed class InlineLayout
 
     private LineFragment BuildLine(int a, int b, double x, double top, double available, double indent, bool lastOrForced)
     {
+        _engine.Budget.Layout(1);
         int visibleEnd = TrimEnd(a, b);
         int start = a;
         while (start < visibleEnd && _text[start] == ' ' && Collapsible(_style[start])) start++;
@@ -1108,9 +1110,10 @@ internal sealed class InlineLayout
 
         return align switch
         {
-            "start" or "match-parent" or "-webkit-left" => _rtl ? "right" : "left",
+            "start" or "match-parent" => _rtl ? "right" : "left",
             "end" => _rtl ? "left" : "right",
             "-webkit-center" => "center",
+            "-webkit-left" => "left",
             "-webkit-right" => "right",
             _ => align,
         };

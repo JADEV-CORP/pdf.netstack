@@ -87,9 +87,19 @@ internal sealed partial class LayoutEngine
     // measured for the column widths and then laid out in its column.
     private readonly Dictionary<Box, InlineLayout> _measured = [];
 
-    public LayoutEngine(FontResolver fonts) => Fonts = fonts;
+    /// <param name="fonts">Resolves fonts for the styles laid out.</param>
+    /// <param name="budget">Counts boxes and lines laid out; unlimited when null.</param>
+    public LayoutEngine(FontResolver fonts, WorkBudget? budget = null)
+    {
+        Fonts = fonts;
+        Budget = budget ?? WorkBudget.Unlimited();
+        _floats = new FloatContext(Budget);
+    }
 
     public FontResolver Fonts { get; }
+
+    /// <summary>The conversion's work budget: every box laid out or measured, and every line, counts against it.</summary>
+    public WorkBudget Budget { get; }
 
     public FontSet FontsFor(ComputedStyle style)
     {
@@ -103,7 +113,7 @@ internal sealed partial class LayoutEngine
     /// <param name="pageHeight">The page area height: the initial containing block for absolute and fixed positioning.</param>
     public BoxFragment Layout(BlockBox root, double width, double pageHeight = double.PositiveInfinity)
     {
-        _floats = new FloatContext();
+        _floats = new FloatContext(Budget);
         _positioned.Clear();
         _fixedPending.Clear();
         Fixed.Clear();
@@ -138,6 +148,9 @@ internal sealed partial class LayoutEngine
     /// <param name="borderOverride">Border widths decided by the parent, as for cells in the collapsing border model.</param>
     private Placed LayoutBlockLevel(Box box, double cbX, double cbWidth, double cursorY, MarginCollapse pending, double? cbHeight, double? forcedWidth = null, Edges? borderOverride = null)
     {
+        // Every layout of a box counts, including the second and later ones of the same box: those
+        // are what nested shrink-to-fit, flex and table sizing can multiply.
+        Budget.Layout(1);
         if (box is ReplacedBox replaced) return LayoutReplacedBlock(replaced, cbX, cbWidth, cursorY, pending, cbHeight);
         if (box is TableBox table) return LayoutTable(table, cbX, cbWidth, cursorY, pending, shrink: false);
         if (box is FlexBox flex) return LayoutFlex(flex, cbX, cbWidth, cursorY, pending, cbHeight, forcedWidth);
@@ -155,7 +168,7 @@ internal sealed partial class LayoutEngine
 
         // A formatting context keeps its floats to itself; a positioned box collects its absolute descendants.
         FloatContext outerFloats = _floats;
-        if (context) _floats = new FloatContext();
+        if (context) _floats = new FloatContext(Budget);
         if (positioned) _positioned.Push([]);
         MarginCollapse top = pending + margin.Top;
         bool collapseTop = border.Top == 0 && padding.Top == 0 && !context;
@@ -210,6 +223,12 @@ internal sealed partial class LayoutEngine
                     double clearY = _floats.Clear(clear);
                     if (clearY > cursor + (inner + childMargin).Value)
                     {
+                        // A child with clearance does not collapse its margin with its parent's
+                        // (CSS 2.1, 8.3.1): a parent whose top waited on its first child starts
+                        // here, around the floats before it, not below them with the child. A
+                        // clearfix after floats otherwise left its floats above the container,
+                        // and a page break before the container skipped them.
+                        y ??= cursor + inner.Value;
                         cursor = clearY - childMargin;
                         inner = MarginCollapse.None;
                     }
@@ -385,7 +404,12 @@ internal sealed partial class LayoutEngine
     }
 
     /// <summary>The used size of a replaced element (CSS 2.1, 10.3.2 and 10.6.2, with 10.4 for min and max), laid out at the origin.</summary>
-    private static BoxFragment LayoutReplaced(ReplacedBox box, double cbWidth, double? cbHeight)
+    /// <param name="measuring">
+    /// Sizing for an intrinsic width, when the containing block's width is not known yet:
+    /// percentage widths count as auto and percentage min and max widths as none (CSS Sizing 3,
+    /// 5.2.1), so <c>width: 100%; max-width: 300px</c> asks for 300px rather than nothing.
+    /// </param>
+    private static BoxFragment LayoutReplaced(ReplacedBox box, double cbWidth, double? cbHeight, bool measuring = false)
     {
         ComputedStyle s = box.Style;
         Edges margin = BoxMetrics.Margins(s, cbWidth);
@@ -396,7 +420,7 @@ internal sealed partial class LayoutEngine
         double iw = box.IntrinsicWidth, ih = box.IntrinsicHeight;
         double ratio = ih > 0 ? iw / ih : 1;
 
-        double? width = BoxMetrics.IsAuto(s, "width") ? null : s.Length("width", cbWidth);
+        double? width = BoxMetrics.IsAuto(s, "width") || (measuring && HasPercent(s, "width")) ? null : s.Length("width", cbWidth);
         double? height = BoxMetrics.IsAuto(s, "height") || (HasPercent(s, "height") && cbHeight is null) ? null : s.Length("height", cbHeight ?? 0);
         if (borderBox)
         {
@@ -411,8 +435,8 @@ internal sealed partial class LayoutEngine
         else (w, h) = (iw, ih);
 
         // max-width: 100% and friends keep the aspect ratio when the other side is auto.
-        double? maxW = s.Keyword("max-width") == "none" ? null : s.Length("max-width", cbWidth) - (borderBox ? frameW : 0);
-        double? minW = s.Length("min-width", cbWidth) - (borderBox ? frameW : 0);
+        double? maxW = s.Keyword("max-width") == "none" || (measuring && HasPercent(s, "max-width")) ? null : s.Length("max-width", cbWidth) - (borderBox ? frameW : 0);
+        double? minW = measuring && HasPercent(s, "min-width") ? null : s.Length("min-width", cbWidth) - (borderBox ? frameW : 0);
         double? maxH = s.Keyword("max-height") == "none" || (HasPercent(s, "max-height") && cbHeight is null) ? null : s.Length("max-height", cbHeight ?? 0) - (borderBox ? frameH : 0);
         double? minH = HasPercent(s, "min-height") && cbHeight is null ? null : s.Length("min-height", cbHeight ?? 0) - (borderBox ? frameH : 0);
         if (maxW is double mxw && w > mxw)
@@ -490,6 +514,7 @@ internal sealed partial class LayoutEngine
     public (double Min, double Max) Intrinsic(Box box)
     {
         if (_intrinsic.TryGetValue(box, out var cached)) return cached;
+        Budget.Layout(1);
         ComputedStyle s = box.Style;
         Edges margin = BoxMetrics.Margins(s, 0);
         Edges border = BoxMetrics.Borders(s);
@@ -498,7 +523,7 @@ internal sealed partial class LayoutEngine
         (double min, double max) result;
         if (box is ReplacedBox replaced)
         {
-            BoxFragment f = LayoutReplaced(replaced, 0, null);
+            BoxFragment f = LayoutReplaced(replaced, 0, null, measuring: true);
             double w = f.Width + f.Margin.Horizontal;
 
             // A percentage width or max-width lets the image shrink to nothing at min-content.
