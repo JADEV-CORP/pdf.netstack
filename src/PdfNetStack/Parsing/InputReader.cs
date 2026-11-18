@@ -12,14 +12,14 @@ internal static class InputReader
     private const int LargestPiece = 4 << 20;
 
     /// <exception cref="NotSupportedException">The stream holds more than one array can.</exception>
-    public static ReadOnlyMemory<byte> ReadToEnd(Stream stream)
+    public static ReadOnlyMemory<byte> ReadToEnd(Stream stream, long maxBytes = long.MaxValue)
     {
-        if (Exposed(stream) is { } exposed) return exposed;
+        if (Exposed(stream, maxBytes) is { } exposed) return exposed;
 
-        var pieces = new Pieces();
+        var pieces = new Pieces(maxBytes);
         if (stream.CanSeek)
         {
-            byte[] sized = new byte[Remaining(stream)];
+            byte[] sized = new byte[Remaining(stream, maxBytes)];
             int total = 0, read;
             while (total < sized.Length && (read = stream.Read(sized, total, sized.Length - total)) > 0) total += read;
             if (total < sized.Length) return sized.AsMemory(0, total);
@@ -38,14 +38,14 @@ internal static class InputReader
 
 #pragma warning disable CA1835 // Array overloads keep one code path for .NET Standard 2.0.
     /// <exception cref="NotSupportedException">The stream holds more than one array can.</exception>
-    public static async Task<ReadOnlyMemory<byte>> ReadToEndAsync(Stream stream, CancellationToken cancellationToken)
+    public static async Task<ReadOnlyMemory<byte>> ReadToEndAsync(Stream stream, CancellationToken cancellationToken, long maxBytes = long.MaxValue)
     {
-        if (Exposed(stream) is { } exposed) return exposed;
+        if (Exposed(stream, maxBytes) is { } exposed) return exposed;
 
-        var pieces = new Pieces();
+        var pieces = new Pieces(maxBytes);
         if (stream.CanSeek)
         {
-            byte[] sized = new byte[Remaining(stream)];
+            byte[] sized = new byte[Remaining(stream, maxBytes)];
             int total = 0, read;
             while (total < sized.Length && (read = await stream.ReadAsync(sized, total, sized.Length - total, cancellationToken).ConfigureAwait(false)) > 0) total += read;
             if (total < sized.Length) return sized.AsMemory(0, total);
@@ -64,22 +64,34 @@ internal static class InputReader
 #pragma warning restore CA1835
 
     /// <summary>The unread part of a memory stream's own buffer, which then reads as at its end.</summary>
-    private static ReadOnlyMemory<byte>? Exposed(Stream stream)
+    private static ReadOnlyMemory<byte>? Exposed(Stream stream, long maxBytes)
     {
         if (stream is not MemoryStream memory || !memory.TryGetBuffer(out ArraySegment<byte> buffer)) return null;
         int at = (int)Math.Min(memory.Position, buffer.Count);
+        if (buffer.Count - at > maxBytes) throw InputTooLarge(maxBytes);
         memory.Position = Math.Max(memory.Position, buffer.Count);
         return new ReadOnlyMemory<byte>(buffer.Array, buffer.Offset + at, buffer.Count - at);
     }
 
-    private static int Remaining(Stream stream)
+    private static int Remaining(Stream stream, long maxBytes)
     {
         long remaining = Math.Max(0, stream.Length - stream.Position);
+        if (remaining > maxBytes) throw InputTooLarge(maxBytes);
         if (remaining > Compat.MaxArrayLength) throw TooLarge();
         return (int)remaining;
     }
 
     private static NotSupportedException TooLarge() => new("A PDF of 2 GiB or more cannot be held in memory; open it on demand.");
+
+    /// <summary>The exception for an input longer than <see cref="PdfLimits.MaxInputBytes"/>.</summary>
+    public static PdfLimitExceededException InputTooLarge(long maxBytes) =>
+        new(PdfLimitKind.InputBytes, Compat.Format("The input is longer than its limit of {0} bytes (PdfLimits.MaxInputBytes).", maxBytes));
+
+    /// <exception cref="PdfLimitExceededException"><paramref name="length"/> is over the limit.</exception>
+    public static void CheckLength(long length, long maxBytes)
+    {
+        if (length > maxBytes) throw InputTooLarge(maxBytes);
+    }
 
     /// <summary>
     /// Full pieces and the one being filled. Each new piece is as large as the pieces made before
@@ -87,12 +99,15 @@ internal static class InputReader
     /// </summary>
     private sealed class Pieces
     {
+        private readonly long _maxBytes;
         private readonly List<byte[]> _full = [];
         private byte[] _current = [];
         private long _total;
         private long _made;
 
         /// <summary>Bytes read into the piece being filled.</summary>
+        public Pieces(long maxBytes) => _maxBytes = maxBytes;
+
         public int Used { get; private set; }
 
         /// <summary>Free bytes in the piece being filled.</summary>
@@ -122,6 +137,7 @@ internal static class InputReader
         public bool Fill(int read)
         {
             if (read <= 0) return false;
+            if (_total + Used + read > _maxBytes) throw InputTooLarge(_maxBytes);
             if (_total + Used + read > Compat.MaxArrayLength) throw TooLarge();
             Used += read;
             return true;

@@ -276,8 +276,55 @@ public sealed record PdfOptimizerOptions
     /// </summary>
     public bool RemovePieceInfo { get; init; }
 
-    /// <summary>Worker threads for compression and verification. Default: processor count.</summary>
+    /// <summary>
+    /// Worker threads for compression and verification, at most. Default: processor count. Fewer
+    /// run when memory is short: each worker can hold several streams of up to
+    /// <see cref="MaxDecodedStreamBytes"/>, so the count is also capped by half the memory the
+    /// runtime reports available (a container's limit included) divided by three such streams.
+    /// </summary>
     public int MaxDegreeOfParallelism { get; init; } = Environment.ProcessorCount;
+
+    /// <summary>
+    /// Ceilings on the work one optimization may cause, all passes together: input size, decoded
+    /// bytes, image pixels, content operators and time. A run that reaches one writes the input
+    /// unchanged with <see cref="OptimizationDisposition.LimitExceeded"/>; when time runs out
+    /// during lossy image work, the lossless rewrite is written instead (in memory; streaming mode
+    /// writes the input). <see cref="MaxInputBytes"/> applies as well. Default <see cref="PdfLimits.Default"/>.
+    /// </summary>
+    public PdfLimits Limits { get; init; } = PdfLimits.Default;
+
+    /// <summary>True when some option may change images lossily.</summary>
+    internal bool IsLossy => JpegQuality is not null || MaxImageDpi is not null || MaxBilevelImageDpi is not null || ConvertImagesToJpeg || QuantizeImages;
+
+    /// <summary>These options with every lossy image change turned off.</summary>
+    internal PdfOptimizerOptions Lossless => this with
+    {
+        JpegQuality = null,
+        MaxImageDpi = null,
+        MaxBilevelImageDpi = null,
+        ConvertImagesToJpeg = false,
+        QuantizeImages = false,
+        MinImageSsim = null,
+    };
+
+    /// <summary>
+    /// Workers that fit in memory: half of what the runtime reports available, three streams at
+    /// the decode ceiling each, and never more than asked.
+    /// </summary>
+    internal int Workers
+    {
+        get
+        {
+#if NET8_0_OR_GREATER
+            long available = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes;
+            if (available <= 0) return MaxDegreeOfParallelism;
+            long perWorker = Math.Max(1, 3 * MaxDecodedStreamBytes);
+            return (int)Math.Max(1, Math.Min(MaxDegreeOfParallelism, available / 2 / perWorker));
+#else
+            return MaxDegreeOfParallelism;
+#endif
+        }
+    }
 
     internal CompressionLevel ZlibLevel => Compression switch
     {
@@ -311,5 +358,8 @@ public sealed record PdfOptimizerOptions
         {
             throw new ArgumentException("ConvertImagesToJpeg needs JpegQuality set and RecompressStreams enabled.", nameof(ConvertImagesToJpeg));
         }
+
+        if (Limits is null) throw new ArgumentNullException(nameof(Limits));
+        Limits.Validate();
     }
 }

@@ -795,7 +795,7 @@ internal static class LossyImages
         if (file.Resolve(globals) is not PdfStream stream) return null;
         try
         {
-            using DecodedStream decoded = StreamCodec.Decode(stream.Data, StreamCodec.GetFilters(stream.Dictionary, file.Resolve), DecodeDepth.Full, decodeLimit, file.Resolve);
+            using DecodedStream decoded = StreamCodec.Decode(stream.Data, StreamCodec.GetFilters(stream.Dictionary, file.Resolve), DecodeDepth.Full, decodeLimit, file.Resolve, file.Budget);
             return decoded.Remaining.Count == 0 && decoded.PendingPredictor is null ? decoded.Data.ToArray() : null;
         }
         catch (StreamDecodeException)

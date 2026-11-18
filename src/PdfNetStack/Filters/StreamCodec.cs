@@ -24,6 +24,19 @@ internal sealed class DecodedStream : IDisposable
 
     public ReadOnlyMemory<byte> Data { get; private set; }
 
+    /// <summary>The data as an array the caller owns, without a copy when the buffer allows it.</summary>
+    public byte[] ToArray()
+    {
+        if (_lease is not null && _lease.Length == Data.Length && _lease.Memory.Equals(Data))
+        {
+            byte[] owned = _lease.DetachArray();
+            Data = default;
+            return owned;
+        }
+
+        return Data.ToArray();
+    }
+
     public void Dispose()
     {
         Data = default;
@@ -95,12 +108,15 @@ internal static class StreamCodec
     public static bool IsDecodable(string filter) => filter is
         "FlateDecode" or "LZWDecode" or "ASCIIHexDecode" or "ASCII85Decode" or "RunLengthDecode";
 
+    /// <param name="size">The decoded size when it is known (an image's samples, /DL), else 0: the output is then allocated once.</param>
     public static DecodedStream Decode(
         ReadOnlyMemory<byte> raw,
         List<FilterSpec> filters,
         DecodeDepth depth,
         long limit,
-        Func<PdfObject?, PdfObject?> resolve)
+        Func<PdfObject?, PdfObject?> resolve,
+        ResourceBudget? budget = null,
+        int size = 0)
     {
         ReadOnlyMemory<byte> current = raw;
         BoundedBuffer? lease = null;
@@ -113,14 +129,22 @@ internal static class StreamCodec
                 if (!IsDecodable(f.Name)) break;
 
                 var parms = resolve(f.Parms) as PdfDictionary;
+
+                // The known decoded size sizes the last layer's buffer, unless a predictor follows.
+                // A size the input cannot reach is a hostile hint, not a reason to allocate it:
+                // Deflate expands 1032 times at most (RFC 1951, a 258 byte match in 2 bits).
+                bool last = i + 1 == filters.Count || !IsDecodable(filters[i + 1].Name);
+                bool plausible = size > 0 && size <= (current.Length * 1032L) + 4096;
+                int layerSize = last && plausible && GetInt(parms, "Predictor", 1, resolve) <= 1 ? size : 0;
                 BoundedBuffer next = f.Name switch
                 {
-                    "FlateDecode" => Decoders.Flate(current, limit),
-                    "LZWDecode" => Decoders.Lzw(current.Span, GetInt(parms, "EarlyChange", 1, resolve), limit),
-                    "ASCIIHexDecode" => Decoders.AsciiHex(current.Span, limit),
-                    "ASCII85Decode" => Decoders.Ascii85(current.Span, limit),
-                    _ => Decoders.RunLength(current.Span, limit),
+                    "FlateDecode" => Decoders.Flate(current, limit, budget, layerSize),
+                    "LZWDecode" => Decoders.Lzw(current.Span, GetInt(parms, "EarlyChange", 1, resolve), limit, budget, layerSize),
+                    "ASCIIHexDecode" => Decoders.AsciiHex(current.Span, limit, budget),
+                    "ASCII85Decode" => Decoders.Ascii85(current.Span, limit, budget),
+                    _ => Decoders.RunLength(current.Span, limit, budget),
                 };
+                next.Settle();
                 lease?.Dispose();
                 lease = next;
                 current = next.Memory;
@@ -130,15 +154,16 @@ internal static class StreamCodec
                     PredictorParams p = ReadPredictor(parms, resolve);
                     if (p.Predictor > 1)
                     {
-                        if (depth == DecodeDepth.CompressionOnly || !Predictors.TryDecode(current.Span, p, limit, out BoundedBuffer? unpredicted))
+                        if (depth == DecodeDepth.CompressionOnly || !Predictors.TryDecode(current.Span, p, limit, out BoundedBuffer? unpredicted, budget))
                         {
                             var pending = new DecodedStream(lease, current, filters.GetRange(i + 1, filters.Count - i - 1), p, i + 1);
                             lease = null;
                             return pending;
                         }
 
+                        unpredicted!.Settle();
                         lease.Dispose();
-                        lease = unpredicted!;
+                        lease = unpredicted;
                         current = lease.Memory;
                     }
                 }
@@ -195,6 +220,48 @@ internal static class StreamCodec
 
         return output.ToArray();
     }
+
+    /// <summary>The length zlib at <paramref name="level"/> gives, for ranking candidates, without keeping the output.</summary>
+    public static long DeflatedLength(ReadOnlySpan<byte> data, CompressionLevel level)
+    {
+        using var counter = new CountingStream();
+        Compat.ZlibCompress(counter, data, level);
+        return counter.Length;
+    }
+}
+
+/// <summary>Write-only stream that keeps nothing but the count of bytes written.</summary>
+internal sealed class CountingStream : Stream
+{
+    private long _length;
+
+    public override bool CanRead => false;
+
+    public override bool CanSeek => false;
+
+    public override bool CanWrite => true;
+
+    public override long Length => _length;
+
+    public override long Position
+    {
+        get => _length;
+        set => throw new NotSupportedException();
+    }
+
+    public override void Write(byte[] buffer, int offset, int count) => _length += count;
+
+#if NET8_0_OR_GREATER
+    public override void Write(ReadOnlySpan<byte> buffer) => _length += buffer.Length;
+#endif
+
+    public override void Flush() { }
+
+    public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+    public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+
+    public override void SetLength(long value) => throw new NotSupportedException();
 }
 
 /// <summary>Write-only stream over pooled arrays; only the final exact-size copy is allocated.</summary>
@@ -203,7 +270,7 @@ internal sealed class PooledWriteStream : Stream
     private byte[] _buffer;
     private int _length;
 
-    public PooledWriteStream(int capacity) => _buffer = System.Buffers.ArrayPool<byte>.Shared.Rent(capacity);
+    public PooledWriteStream(int capacity) => _buffer = Buffers.Rent(capacity);
 
     public override bool CanRead => false;
 
@@ -232,9 +299,9 @@ internal sealed class PooledWriteStream : Stream
         if (_length + data.Length > _buffer.Length)
         {
             long next = Math.Max((long)_length + data.Length, (long)_buffer.Length * 2);
-            byte[] grown = System.Buffers.ArrayPool<byte>.Shared.Rent((int)Math.Min(next, Compat.MaxArrayLength));
+            byte[] grown = Buffers.Rent((int)Math.Min(next, Compat.MaxArrayLength));
             Buffer.BlockCopy(_buffer, 0, grown, 0, _length);
-            System.Buffers.ArrayPool<byte>.Shared.Return(_buffer);
+            Buffers.Return(_buffer);
             _buffer = grown;
         }
 
@@ -254,7 +321,7 @@ internal sealed class PooledWriteStream : Stream
     {
         if (disposing && _buffer.Length > 0)
         {
-            System.Buffers.ArrayPool<byte>.Shared.Return(_buffer);
+            Buffers.Return(_buffer);
             _buffer = [];
         }
 
