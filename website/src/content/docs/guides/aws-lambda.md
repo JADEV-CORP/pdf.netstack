@@ -63,10 +63,13 @@ The library itself writes nothing to disk unless you give it a path or a stream.
 
 - Lambda gives one vCPU at 1,769 MB of memory and more above. The optimizer recompresses streams
   on every core it gets (`MaxDegreeOfParallelism`), so more memory also means shorter runs.
-- With `Streaming`, the optimizer's memory stays flat whatever the file size (a generated 278 MB
-  file peaked at about 460 MB of working set), and `/tmp` holds about three times the file. Check
-  the size in the S3 event before downloading, and set `MaxInputBytes` and `EphemeralStorage` to
-  match. Without `Streaming`, plan for about ten times the file size in memory.
+- With `Streaming`, the file itself stays out of memory (a generated 278 MB file peaked at about
+  460 MB of working set), and `/tmp` holds about three times the file. Memory still follows the
+  objects and the streams being recompressed, so image heavy files need room in that mode too.
+  Check the size in the S3 event before downloading, and set `MaxInputBytes` and
+  `EphemeralStorage` to match. Without `Streaming`, size the function from the
+  [measured numbers](/concepts/memory-and-performance/#measured-memory-use): on 1.2.0 the
+  optimizer peaked at 24 to 60 times the input file.
 - HTML conversion of invoices and reports fits in 512 MB; 1,024 MB converts faster for the CPU.
   `MaxPages` bounds the output.
 - A synchronous response is at most 6 MB, base64 encoded for binary bodies. Write larger PDFs to

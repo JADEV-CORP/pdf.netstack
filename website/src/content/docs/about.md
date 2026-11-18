@@ -10,15 +10,17 @@ the MIT license.
 
 ## Why it exists
 
-PdfNetStack gives .NET developers a PDF toolkit that is permissively licensed all the way down,
-safe to run on files from strangers, and honest about what it changes. It optimizes, creates,
-edits, merges, splits and protects PDFs, extracts their text and images, and converts HTML and CSS
-to PDF.
+PdfNetStack gives .NET developers a PDF toolkit that is permissively licensed all the way down
+and honest about what it changes. Its first job is shrinking PDFs on servers without breaking
+them; its second is an MIT path for teams leaving PDFsharp, whose 6.5.0 was published under the
+AGPL (see the [migration guide](/guides/migrate-from-pdfsharp/)). It also creates, edits,
+merges, splits and protects PDFs, extracts their text and images, and converts HTML and CSS to
+PDF.
 
 It started with one narrow job: making PDFs smaller without shelling out to Ghostscript, without a
 copyleft or commercial dependency, and without silently losing forms, tags or metadata. That job
 set the rules the rest of the library follows: lossless by default, every rewrite verified,
-bounded on hostile input, and no native code in the core packages.
+limits on hostile input, and no native code in the core packages.
 
 ## Who builds it
 
