@@ -369,6 +369,7 @@ namespace PdfNetStack.Cli
                 rows.Count(r => r.Disposition == nameof(OptimizationDisposition.Optimized)),
                 rows.Count(r => r.Disposition == nameof(OptimizationDisposition.OriginalRetained)),
                 rows.Count(r => r.Disposition == nameof(OptimizationDisposition.UnsupportedRetained)),
+                rows.Count(r => r.Disposition == nameof(OptimizationDisposition.LimitExceeded)),
                 rows.Count(r => r.Disposition == "Error"),
                 before,
                 after,
@@ -393,6 +394,7 @@ namespace PdfNetStack.Cli
                 Console.WriteLine($"Optimized     {summary.Optimized}");
                 Console.WriteLine($"Retained      {summary.Retained} (saving below threshold or failed checks)");
                 Console.WriteLine($"Unsupported   {summary.Unsupported}");
+                Console.WriteLine($"Over a limit  {summary.LimitExceeded} (input kept: a resource limit was reached)");
                 foreach ((string reason, int count) in summary.UnsupportedReasons.OrderByDescending(p => p.Value))
                 {
                     Console.WriteLine($"  {count,5}  {reason}");
@@ -478,6 +480,7 @@ namespace PdfNetStack.Cli
         int Optimized,
         int Retained,
         int Unsupported,
+        int LimitExceeded,
         int Errors,
         long OriginalBytes,
         long OutputBytes,
