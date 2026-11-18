@@ -9,6 +9,8 @@ faq:
     a: No. Resources shared by several imported pages are copied once, and saving runs the optimizer, which merges byte identical fonts and images across the merged documents.
   - q: What happens to links and bookmarks when pages are removed?
     a: Links and bookmarks that point to a removed page become empty. Links between pages imported in the same call keep working.
+  - q: Does merging keep a tagged PDF accessible?
+    a: From version 1.3, yes. Merge, Split, ExtractPages and page import copy the structure elements of the pages they copy, with their marked content, role map, class map and IDs, and keep MarkInfo and the document language. Before 1.3 the result was untagged.
   - q: Can PdfNetStack edit a signed PDF?
     a: Yes. Saving in full writes a new single revision file and invalidates the signatures. From version 1.1, SaveIncremental appends the changes after the signed bytes instead, so every signature stays intact.
 ---
@@ -71,7 +73,8 @@ document opens, so a page stays correct when it moves within the document or to 
 ```
 
 To extract a page range, import the pages you want into a new document. Any order works, and the
-same page may appear twice:
+same page may appear twice. From 1.3, `ExtractPages(start, count)` copies a run of pages in one
+call, and on .NET 8 and later `ExtractPages(range)` takes a range such as `^2..`:
 
 ```csharp sample="edit-merge.cs" region="range"
 ```
@@ -81,6 +84,16 @@ in the same call are remapped to the copies; links to pages left behind become e
 form fields travel with their pages too, renamed with a `_2` suffix when the target form already
 has the name, see [Forms](/guides/forms/#fields-in-imported-pages). A document
 opened with only its user password gives up its pages only when its permissions allow copying.
+
+From 1.3, merging, splitting, extracting and importing keep tagged PDFs tagged. The structure
+elements of the copied pages come along with their marked content and object references, the
+role map, class map and ID tree are merged, and names and IDs that clash are renamed. `/MarkInfo`
+is kept, and `/Lang` goes on the document, or on the copied top elements when the sources differ.
+Before 1.3 the result was untagged.
+
+To merge files or uploads while holding one input at a time, to write each page of a split to a
+stream of your own, or to report progress and cancel, see
+[Cancellation and progress](/guides/cancellation-and-progress/).
 
 ## Metadata
 

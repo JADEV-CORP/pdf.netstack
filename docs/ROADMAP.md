@@ -66,10 +66,15 @@ every page, still gain about 2%, and their JPEG 2000 decoding takes 2 to 4 minut
 
 ## Next
 
-**Evidence**
-- Publish the comparison with qpdf, MuPDF and Ghostscript. `tools/compare_optimizers.py` runs it
-  in the corpus workflow and scores size, rendering (SSIM) and the structure each tool keeps; the
-  numbers go in the docs once a few weekly runs agree.
+**1.3** (in progress, not yet on NuGet): a hardening release.
+
+| Area | Scope |
+|---|---|
+| Resource limits | `PdfLimits` for a whole document (input size, decoded bytes and image pixels in total, content operators, text per page, time per call) with an `Untrusted` preset; `PdfDocument.Diagnostics` and `OnWarning`; `PdfException`, `PdfLimitExceededException`; `LimitExceeded` in the optimizer; the default worker count follows available memory |
+| Servers | Cancellation tokens and `IProgress<PdfProgress>` on long calls; `MergeAsync` one input at a time, `SplitTo`, `ExtractPages`; tagged PDFs kept tagged through merge, split and import; `PdfAcroForm.Fill` and `TryGetField` |
+| HTML | Style and layout work budgets, a cap on concurrent conversions, `ResourceLoaderAsync`, and fixes found on 20 public templates |
+| Optimizer | `RemoveUsageRights`; progressive JPEG on by default |
+| Evidence and supply chain | The comparison with qpdf, MuPDF and Ghostscript on library defaults, published in the docs; fuzzing of 13 entry points on pull requests and nightly; build provenance attestations, SBOMs, CodeQL and OpenSSF Scorecard |
 
 **Compression**
 - Better JPEG coding. A rounding deadzone gave 0.4% to 3% at equal rendered quality in a test, not

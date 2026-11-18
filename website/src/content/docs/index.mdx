@@ -79,9 +79,9 @@ No Ghostscript, no browser, no native binaries. It runs anywhere .NET runs, Nati
 serverless included. [Architecture](/concepts/architecture/)
 </Card>
 <Card title="Fails safe" icon="seti:lock">
-Signed, encrypted and damaged files come back as they are. Limits apply per object today;
-limits for whole documents from untrusted sources are being added in 1.3.
-[Safety model](/concepts/safety-model/)
+Signed, encrypted and damaged files come back as they are. From 1.3, `PdfLimits.Untrusted` bounds
+what a whole file from a user may cost, and long calls take a cancellation token.
+[Resource limits](/concepts/resource-limits/)
 </Card>
 </CardGrid>
 

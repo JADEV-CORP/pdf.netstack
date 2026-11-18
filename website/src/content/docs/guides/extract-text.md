@@ -120,8 +120,14 @@ and y goes up, before the page's `/Rotate` is applied. Drawing uses the top left
 
 ## Damaged and hostile files
 
-Damaged content and fonts are read as far as they go. CMaps, fonts and content streams are
-bounded and never throw, and at most 500,000 letters are read per page.
+Damaged content and fonts are read as far as they go: a content stream that cannot be decoded is
+skipped, reported in `PdfDocument.Diagnostics` with its object, and the rest of the page reads.
+At most 500,000 letters are read per page. From 1.3, `PdfLimits` also bounds the characters a page
+returns (4 million by default, 250,000 with `PdfLimits.Untrusted`), the content operators and
+decoded bytes of the whole document, and the time of one call. A page that reaches a total ends
+early and says so in `Diagnostics`; the time limit raises `PdfLimitExceededException`, and a
+cancelled token `OperationCanceledException`. See
+[Resource limits and diagnostics](/concepts/resource-limits/).
 
 ## Limits
 

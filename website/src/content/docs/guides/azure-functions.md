@@ -53,8 +53,10 @@ the input size. The library itself writes nothing to disk unless you give it a p
   on one instance. Size memory for the concurrent work. With `Streaming`, each document being
   optimized keeps the file itself out of memory and takes a few hundred MB, more for image heavy
   files, and about three times its size in the temporary directory. Without it, size instances
-  from the [measured numbers](/concepts/memory-and-performance/#measured-memory-use): on 1.2.0 the
-  optimizer peaked at 24 to 60 times the input file.
+  for each document plus about three times the largest decoded stream per worker, see
+  [Memory and performance](/concepts/memory-and-performance/#workers-and-the-decoded-size). From
+  1.3 the optimizer runs fewer workers when memory is short, and `PdfLimits.Untrusted` bounds what
+  a file from a user may cost.
 - The Consumption plan caps an instance at 1.5 GB for all its concurrent invocations.
 - `maxDegreeOfParallelism` under `extensions.blobs` in `host.json` bounds concurrent blobs per
   instance; `MaxDegreeOfParallelism` in `PdfOptimizerOptions` bounds the threads of one
