@@ -186,12 +186,25 @@ public sealed record PdfOptimizerOptions
 
     /// <summary>
     /// Re-encode bilevel (1 bit) images stored as raw samples, under Flate, LZW or RunLength, or as
-    /// CCITT Group 3, as CCITT Group 4 when that is smaller. The encoder follows ITU-T T.6, and
-    /// the proof decodes both versions and requires every pixel to match, so the image stays
-    /// exactly the same. Group 3 data is only re-encoded when it decodes without a flaw and its
-    /// parameters leave nothing to a reader's defaults. Part of stream recompression. Default true.
+    /// CCITT Group 3, as CCITT Group 4, or JBIG2 with <see cref="UseJbig2"/>, when that is smaller.
+    /// The encoders follow ITU-T T.6 and T.88, and the proof decodes both versions and requires
+    /// every pixel to match, so the image stays exactly the same. Group 3 data is only re-encoded
+    /// when it decodes without a flaw and its parameters leave nothing to a reader's defaults. Part
+    /// of stream recompression. Default true.
     /// </summary>
     public bool OptimizeBilevelImages { get; init; } = true;
+
+    /// <summary>
+    /// Also code bilevel images as JBIG2 (ITU-T T.88) wherever they are coded again: by
+    /// <see cref="OptimizeBilevelImages"/>, and when <see cref="MaxImageDpi"/> or
+    /// <see cref="MaxBilevelImageDpi"/> reduces them. Each image keeps whichever of CCITT Group 4
+    /// and JBIG2 is smaller; on scanned text JBIG2 is usually 15 to 30% smaller. Only generic
+    /// region coding is written, which is lossless, with no shared JBIG2Globals: symbol coding,
+    /// which matches glyphs by likeness, could show one character in place of another. Every
+    /// JBIG2 image is decoded again before it is kept, and the proof checks every pixel. Needs PDF
+    /// 1.4; output that stays at an earlier version gets Group 4 only. Default true.
+    /// </summary>
+    public bool UseJbig2 { get; init; } = true;
 
     /// <summary>
     /// Requantize JPEG images to this quality, 1 to 100, on the scale libjpeg and most image tools
@@ -215,8 +228,9 @@ public sealed record PdfOptimizerOptions
     /// <see cref="JpegQuality"/>, or without it lossless samples. Bilevel images (raw, CCITT or
     /// JBIG2) stay bilevel: each new pixel takes the color that covers at least half of it, and
     /// strokes thinner than a new pixel are kept, so text stays legible; the result is CCITT Group
-    /// 4 or Flate, whichever is smaller. JPEG sources need <see cref="OptimizeJpegImages"/>. Not
-    /// lossless. Null, the default, keeps every image's size. Requires <see cref="RecompressStreams"/>.
+    /// 4, JBIG2 (see <see cref="UseJbig2"/>) or Flate, whichever is smaller. JPEG sources need
+    /// <see cref="OptimizeJpegImages"/>. Not lossless. Null, the default, keeps every image's
+    /// size. Requires <see cref="RecompressStreams"/>.
     /// </summary>
     public int? MaxImageDpi { get; init; }
 
@@ -234,8 +248,9 @@ public sealed record PdfOptimizerOptions
     /// Re-encode raw 8 bit gray and RGB images, and gray and RGB JPEG 2000 images, as JPEG at
     /// <see cref="JpegQuality"/> when they look photographic. Bilevel, indexed, line art and screenshot-like images are recognized from
     /// their pixels and left lossless, and a JPEG is kept only when it is at least 10% smaller
-    /// than the best lossless encoding. Not lossless. Default false. Requires
-    /// <see cref="JpegQuality"/> and <see cref="RecompressStreams"/>.
+    /// than the best lossless encoding. An image already stored in fewer bytes than the smallest
+    /// JPEG of its size could take, at about two bits per 8 by 8 block, is not even decoded. Not
+    /// lossless. Default false. Requires <see cref="JpegQuality"/> and <see cref="RecompressStreams"/>.
     /// </summary>
     public bool ConvertImagesToJpeg { get; init; }
 

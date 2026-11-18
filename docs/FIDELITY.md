@@ -22,7 +22,7 @@ The source bytes and the candidate bytes are parsed independently. Starting at t
   bytes must match exactly; filters that stay encoded (DCT, JPX, JBIG2, CCITT) must be identical,
   including their parameters and any objects they reference such as `/JBIG2Globals`,
 - JPEG data whose bytes changed is decoded to DCT coefficients on both sides (see below),
-- a bilevel image whose output is CCITT data is decoded to pixels on both sides (see below),
+- a bilevel image whose output is CCITT or JBIG2 data is decoded to pixels on both sides (see below),
 - streams that cannot be decoded must be byte identical with an identical filter chain.
 
 Apart from the structural changes below, bilevel images coded again, and the opt-in image
@@ -209,6 +209,27 @@ different ways, so only data every reader takes alike counts, on both sides:
 Anything else must match as it was, encoded bytes and parameters included. Group 3 data with a
 flaw, or with parameters a reader could take differently, is never coded again.
 
+With `UseJbig2` (on by default) each such image is also coded as JBIG2 (ITU-T T.88) and keeps
+whichever of Group 4 and JBIG2 is smaller; output that stays below PDF 1.4, which has no
+JBIG2Decode, gets Group 4 only. Only generic region coding is written, which is lossless, never
+symbol coding, which matches glyphs by likeness and can show one character in place of another.
+The stream is the embedded organisation PDF uses (ISO 32000-1, 7.4.7), with no file header and
+no JBIG2Globals: one page information segment and one immediate generic region over the whole
+page, arithmetic coded with template 0, its adaptive pixels at their nominal places, typical
+prediction on, and the coded data ended by the 0xFFAC marker. JBIG2Decode gives a reader the
+inverse of the T.88 bitmap, so the bitmap coded is the samples inverted, whatever the samples
+mean. The optimizer decodes every JBIG2 image it would keep before keeping it. jbig2dec reads the
+same pixels (a test checks this where it is installed), and the coded data matches what jbig2enc
+writes in generic mode to a few bytes.
+
+The proof accepts JBIG2 data in place of samples or CCITT data, again only by its pixels, and
+only in the form every reader decodes alike, the form written here: the page information segment
+of exactly the image's size, white by default and not striped; one immediate generic region over
+the whole page at its origin, drawn by OR or REPLACE, arithmetic coded with a standard template
+and its adaptive pixels at their nominal places, its data ended by the 0xFFAC marker so that no
+reader reads past it; nothing after but an end of page or end of file; and no JBIG2Globals.
+JBIG2 data in any other form must match as it was.
+
 ### JPEG images
 
 The JPEG pass re-encodes DCTDecode data without ever producing pixels, so the proof works at the
@@ -254,6 +275,36 @@ is a ridge across or along the image (covered more than the neighbour before it 
 much as the one after it): the middle of a stroke thinner than the new pixels, which plain
 thresholding would erase. The arithmetic is exact and in a fixed order, so the proof reproduces
 the reduction bit for bit and the optimizer's own output reaches SSIM 1 against it.
+
+### Lossy changes proven when written
+
+The bounds above take decoding both images, resampling the source and comparing them, which on
+a scanned book is as much work as making the change. When the optimizer proves its own output,
+it does not do that work twice. As it writes a changed image it checks that image against the
+same bounds, on the same images, with the same functions, and records a key for the check: a
+SHA-256 over both images after their general filters (samples only up to the size the
+dictionary gives them, which is all a decoder reads; coded data whole), how each is coded and
+sized (width, height, components, bits, coding, JPEG color transform, CCITT parameters, palette),
+the JBIG2Globals of each, and the gate. A requantized JPEG gets a key over both images and its
+color transform and the gate, once its SSIM met the gate. The proof then reads both images as
+always, undoes their general filters, makes every check that needs no pixels (same components
+and bit depth, no larger, the same aspect, coded as the dictionary says, and for JPEG the exact
+requantization of every coefficient), computes the key from what it read and looks it up. A
+changed image whose key was not recorded is refused, whatever its pixels: the output holds
+something other than what was checked. A key only skips work: anything that differs in any
+input gives another key. Outputs whose pixels are by construction the reference itself (samples
+under Flate, a palette under Flate, bilevel samples, Group 4 or JBIG2 data of the reduced
+bitmap) count as checked once their data is known to decode to it: under Flate the key's hash
+is of the samples the proof inflates, and Group 4 and JBIG2 data is decoded before it is kept.
+`PdfEquivalence` and `pdfnetstack verify` have no keys and check every changed image in full.
+
+Images that cannot gain are not decoded in the first place. A lossy candidate must cost less
+than 90% of the best lossless encoding, which is never more than the stored one; the JPEG
+encoder writes at least two bits for every 8 by 8 block (a DC code and an end of block, or in
+progressive coding a DC code and its refinement bit), so an image stored in fewer bytes than
+that for its size can never become a smaller JPEG. Such images, and images under 256 bytes,
+are left out before their data is read, unless they are downsampled and could still win as
+samples.
 
 The coefficient reader is itself checked against libjpeg: test fixtures written by libjpeg-turbo
 in baseline, optimized, progressive and restart marker layouts of the same image must decode to
@@ -342,6 +393,18 @@ PSNR says little. Read side by side, the reduced pages keep every stroke, rule a
   sizes) in baseline, optimized, progressive and restart marker layouts; lossless and requantized
   round trips; soft masks, Flate wrapped JPEG, color space mismatches, palettes, damaged and
   truncated data, unsupported coding processes, and mutated inputs that must never throw.
+- JBIG2: the generic region encoder round tripped at every width from 1 to 40 pixels and up to
+  2551, blank and full pages, the inversion of PDF samples, jbig2dec reading the same pixels,
+  scanned text at least 10% under Group 4, the encoder giving up past its limit, the decoder's
+  fast path for nominal template 0 against its general case, and every departure from the plain
+  form (another size, black by default, stripes, XOR, MMR, moved adaptive pixels, referred-to
+  segments, no end marker, a second region, a file header, symbol coding) refused by the proof.
+- Lossy proof keys: a resampled image and a requantized JPEG each pass with the key recorded
+  when they were written, and are refused with one sample off, another quality, another gate or
+  no key, though the full check would let the first two through. The JPEG size floor holds for
+  flat and photographic images in gray, RGB and CMYK at qualities 5 to 95; images under it are
+  never planned for decoding. JPEG 2000 decoded straight to samples, and with one workspace
+  serving image after image in either order, gives the same samples as a fresh decode to planes.
 - Bilevel images: the Group 4 encoder byte for byte against libtiff, round trips of random rows
   at widths from 1 to 9000 pixels with runs past 2560 in both polarities, the libtiff Group 3
   fixtures coded again as Group 4, stencil masks, palettes, /Decode and predictors; Group 3 with

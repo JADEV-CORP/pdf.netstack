@@ -235,6 +235,27 @@ internal static class StreamCodec
         return output.ToArray();
     }
 
+    /// <summary>
+    /// zlib at <paramref name="level"/>, or null as soon as the output passes
+    /// <paramref name="maxLength"/> bytes: compression stops there, so data that cannot fit costs
+    /// only the part it took to find out.
+    /// </summary>
+    /// <param name="capacity">The expected output length, when a ranking pass measured it; otherwise half the input is reserved.</param>
+    public static byte[]? DeflateWithin(ReadOnlySpan<byte> data, CompressionLevel level, long maxLength, long capacity = -1)
+    {
+        using var output = new PooledWriteStream((int)Math.Min(Capacity(capacity, data.Length), Math.Max(256, maxLength))) { MaxLength = maxLength };
+        try
+        {
+            Compat.ZlibCompress(output, data, level);
+        }
+        catch (OutputLimitException)
+        {
+            return null;
+        }
+
+        return output.ToArray();
+    }
+
     /// <summary>The length zlib at <paramref name="level"/> gives, for ranking candidates, without keeping the output.</summary>
     public static long DeflatedLength(ReadOnlySpan<byte> data, CompressionLevel level)
     {
@@ -255,6 +276,15 @@ internal static class StreamCodec
     // without one, half the input, as before.
     private static int Capacity(long measured, long inputLength) =>
         (int)Math.Min(Compat.MaxArrayLength, Math.Max(256, measured >= 0 ? measured + (measured / 16) + 64 : inputLength / 2));
+}
+
+/// <summary>Output grew past the limit its writer was given; nothing written so far is kept.</summary>
+internal sealed class OutputLimitException : Exception
+{
+    public OutputLimitException()
+        : base("The output grew past its limit.")
+    {
+    }
 }
 
 /// <summary>Write-only stream that keeps nothing but the count of bytes written.</summary>
@@ -299,6 +329,9 @@ internal sealed class PooledWriteStream : Stream
 
     public PooledWriteStream(int capacity) => _buffer = Buffers.Rent(capacity);
 
+    /// <summary>Writes past this many bytes throw <see cref="OutputLimitException"/>.</summary>
+    public long MaxLength { get; init; } = long.MaxValue;
+
     public override bool CanRead => false;
 
     public override bool CanSeek => false;
@@ -326,6 +359,7 @@ internal sealed class PooledWriteStream : Stream
     public void Write(ReadOnlySpan<byte> data)
 #endif
     {
+        if (_length + data.Length > MaxLength) throw new OutputLimitException();
         if (_length + data.Length > _buffer.Length)
         {
             long next = Math.Max((long)_length + data.Length, (long)_buffer.Length * 2);

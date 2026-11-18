@@ -127,6 +127,36 @@ internal static class BilevelImages
         return (data, parms);
     }
 
+    /// <summary>
+    /// JBIG2 generic region data for packed rows (<see cref="Jbig2Encoder"/>), with no
+    /// /DecodeParms, or null when it would not fit in <paramref name="maxBytes"/>. JBIG2Decode
+    /// gives a reader 0 where T.88 codes black, so the bitmap coded is the samples inverted and
+    /// the samples stay as they were, whatever their colors mean.
+    /// </summary>
+    public static byte[]? Jbig2(ReadOnlySpan<byte> rows, int width, int height, int maxBytes) =>
+        Jbig2Encoder.EncodeGeneric(rows, width, height, maxBytes, invert: true);
+
+    /// <summary>
+    /// The samples JBIG2 data decodes to, as packed rows with 0 where T.88 codes black; null unless
+    /// the data has the form every reader decodes alike (<see cref="Jbig2Encoder.IsPlainGeneric"/>)
+    /// and decodes within <paramref name="decodeLimit"/>.
+    /// </summary>
+    public static byte[]? Jbig2Pixels(ReadOnlySpan<byte> data, int width, int height, long decodeLimit)
+    {
+        long size = (long)((width + 7) / 8) * height;
+        if (size > Math.Min(decodeLimit, Compat.MaxArrayLength) || !Jbig2Encoder.IsPlainGeneric(data, width, height)) return null;
+        try
+        {
+            byte[] page = Jbig2Decoder.Decode(data.ToArray(), null, width, height);
+            for (int i = 0; i < page.Length; i++) page[i] = (byte)~page[i];
+            return page;
+        }
+        catch (Jbig2FormatException)
+        {
+            return null;
+        }
+    }
+
     private static int Int(PdfFile file, PdfObject? o) =>
         file.Resolve(o) is PdfNumber { IsInteger: true } n && n.IntegerValue is > 0 and < int.MaxValue ? (int)n.IntegerValue : 0;
 }

@@ -307,6 +307,7 @@ public static partial class PdfOptimizer
             bool objectStreams = options.UseObjectStreams && !pdfA1;
             string version = OutputVersion(file.HeaderVersion, objectStreams);
             bool progressive = options.ProgressiveJpeg && AllowsProgressiveJpeg(version) && (!options.Linearize || AllowsProgressiveJpeg(LinearizedVersion(file.HeaderVersion)));
+            bool jbig2 = options.UseJbig2 && AllowsJbig2(version) && (!options.Linearize || AllowsJbig2(LinearizedVersion(file.HeaderVersion)));
             int stripped = graph.StrippedEntries + (usageRightsRemoved ? 1 : 0);
             timings = timings with { Analyze = phase.Elapsed };
             phase.Restart();
@@ -342,11 +343,15 @@ public static partial class PdfOptimizer
             {
                 JpegSettings? jpeg = options.OptimizeJpegImages ? new JpegSettings(options.JpegQuality, progressive, options.MinImageSsim) : null;
                 ImageSettings? images = options.MaxImageDpi is not null || options.MaxBilevelImageDpi is not null || options.ConvertImagesToJpeg || options.QuantizeImages
-                    ? new ImageSettings(options.MaxImageDpi, options.ConvertImagesToJpeg, options.JpegQuality, options.MinImageSsim, progressive) { Quantize = options.QuantizeImages, MaxBilevelDpi = options.MaxBilevelImageDpi }
+                    ? new ImageSettings(options.MaxImageDpi, options.ConvertImagesToJpeg, options.JpegQuality, options.MinImageSsim, progressive) { Quantize = options.QuantizeImages, MaxBilevelDpi = options.MaxBilevelImageDpi, Jbig2 = jbig2 }
                     : null;
-                var scope = new RecompressionScope(options.RecompressStreams, compact, encoded, options.DeduplicateObjects) { KeepMetadataUnfiltered = pdfA1 || options.KeepMetadataUnfiltered };
+                var scope = new RecompressionScope(options.RecompressStreams, compact, encoded, options.DeduplicateObjects)
+                {
+                    KeepMetadataUnfiltered = pdfA1 || options.KeepMetadataUnfiltered,
+                    Prove = options.Verify,
+                };
                 recompressed = StreamRecompressor.Run(file, graph, scope, options.ZlibLevel, options.Compression == CompressionEffort.Exhaustive, options.UseImagePredictors,
-                    options.OptimizeBilevelImages, jpeg, images, options.MaxDecodedStreamBytes, options.Workers, ct);
+                    options.OptimizeBilevelImages, jbig2, jpeg, images, options.MaxDecodedStreamBytes, options.Workers, ct);
 
                 // A JBIG2 image coded anew no longer needs its JBIG2Globals, which may now be unused.
                 if (recompressed.ResampledObjects.Count > 0) graph = ObjectGraph.Collect(file, options.RemovePageThumbnails, options.RemovePieceInfo, ct);
@@ -430,6 +435,7 @@ public static partial class PdfOptimizer
                 ImagesQuantized = recompressed.Quantized,
                 ImagesKeptByQualityGate = recompressed.KeptByGate,
                 ImagesRecodedAsGroup4 = recompressed.Group4,
+                ImagesRecodedAsJbig2 = recompressed.Jbig2,
                 ResourcesPruned = pruned,
                 ContentStreamsCompacted = recompressed.Compacted,
                 FontProgramsMerged = fontsMerged,
@@ -465,14 +471,14 @@ public static partial class PdfOptimizer
                 var rules = new VerificationRules
                 {
                     IgnoredSourceKeys = ignored,
-                    Images = new ImageAllowance(recompressed.RequantizedObjects.Contains, recompressed.ResampledObjects.Contains, options.MinImageSsim),
+                    Images = new ImageAllowance(recompressed.RequantizedObjects.Contains, recompressed.ResampledObjects.Contains, options.MinImageSsim) { Proofs = recompressed.ImageProofs },
                     AllowResourcePruning = pruned > 0,
                     AllowContentCompaction = recompressed.Compacted > 0,
                     AllowFontMerging = fontsMerged > 0,
                     AllowFontSubsetting = fonts.Subset > 0,
                     AllowFontConversion = fonts.Converted > 0,
                     AllowInheritedAttributes = pushedDown,
-                    AllowBilevelRecoding = recompressed.Group4 > 0,
+                    AllowBilevelRecoding = recompressed.Group4 + recompressed.Jbig2 > 0,
                     AllowXObjectNameRemoval = namesRemoved > 0,
                 };
                 string? difference = EquivalenceVerifier.Verify(reference, written, rules, options.MaxDecodedStreamBytes,
@@ -709,6 +715,10 @@ public static partial class PdfOptimizer
     /// <summary>Progressive JPEG (DCTDecode) arrived with PDF 1.3; output at an earlier version keeps sequential coding.</summary>
     private static bool AllowsProgressiveJpeg(string version) =>
         decimal.TryParse(version, NumberStyles.AllowDecimalPoint, CultureInfo.InvariantCulture, out decimal v) && v >= 1.3m;
+
+    /// <summary>JBIG2Decode arrived with PDF 1.4; output at an earlier version keeps CCITT and Flate.</summary>
+    private static bool AllowsJbig2(string version) =>
+        decimal.TryParse(version, NumberStyles.AllowDecimalPoint, CultureInfo.InvariantCulture, out decimal v) && v >= 1.4m;
 
     /// <summary>Linearization arrived with PDF 1.2.</summary>
     private static string LinearizedVersion(string header) =>

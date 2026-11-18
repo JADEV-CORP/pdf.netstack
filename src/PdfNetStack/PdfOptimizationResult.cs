@@ -74,6 +74,13 @@ public sealed record OptimizationStatistics(
     /// </summary>
     public int ImagesRecodedAsGroup4 { get; init; }
 
+    /// <summary>
+    /// Bilevel images re-encoded as JBIG2 with exactly the same pixels by
+    /// <see cref="PdfOptimizerOptions.OptimizeBilevelImages"/> and <see cref="PdfOptimizerOptions.UseJbig2"/>,
+    /// counted in <see cref="StreamsRecompressed"/> as well.
+    /// </summary>
+    public int ImagesRecodedAsJbig2 { get; init; }
+
     /// <summary>Resource entries removed because no content stream could name them.</summary>
     public int ResourcesPruned { get; init; }
 

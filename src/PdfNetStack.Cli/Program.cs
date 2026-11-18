@@ -58,6 +58,9 @@ namespace PdfNetStack.Cli
                                         inputs of any size are accepted
               --no-recompress           Do not re-encode streams
               --no-group4               Do not re-encode bilevel images as CCITT Group 4
+                                        or JBIG2
+              --no-jbig2                Code bilevel images as CCITT Group 4 only, never
+                                        as JBIG2
               --no-image-predictors     Do not try PNG prediction on raw images
               --no-jpeg                 Do not re-encode JPEG images
               --jpeg-quality <1-100>    Requantize JPEG images to this quality (lossy);
@@ -180,7 +183,7 @@ namespace PdfNetStack.Cli
                 {
                     Console.WriteLine($"pages {result.PageCount}, objects {s.ObjectsInFile} -> {s.ObjectsWritten} " +
                                       $"(unreachable {s.UnreachableRemoved}, merged {s.ObjectsDeduplicated}), " +
-                                      $"streams re-encoded {s.StreamsRecompressed} (JPEG {s.JpegImagesRecompressed}, requantized {s.JpegImagesRequantized}, Group 4 {s.ImagesRecodedAsGroup4}), " +
+                                      $"streams re-encoded {s.StreamsRecompressed} (JPEG {s.JpegImagesRecompressed}, requantized {s.JpegImagesRequantized}, Group 4 {s.ImagesRecodedAsGroup4}, JBIG2 {s.ImagesRecodedAsJbig2}), " +
                                       $"objects verified {s.ObjectsVerified}");
                     if (s.ImagesDownsampled + s.ImagesConvertedToJpeg + s.ImagesQuantized + s.ImagesKeptByQualityGate > 0)
                     {
@@ -570,6 +573,7 @@ namespace PdfNetStack.Cli
                     case "--streaming": o = o with { Streaming = true, MaxInputBytes = long.MaxValue }; break;
                     case "--no-recompress": o = o with { RecompressStreams = false }; break;
                     case "--no-group4": o = o with { OptimizeBilevelImages = false }; break;
+                    case "--no-jbig2": o = o with { UseJbig2 = false }; break;
                     case "--no-image-predictors": o = o with { UseImagePredictors = false }; break;
                     case "--no-jpeg": o = o with { OptimizeJpegImages = false }; break;
                     case "--jpeg-quality": o = o with { JpegQuality = int.Parse(Value(args, ref i), CultureInfo.InvariantCulture) }; break;
