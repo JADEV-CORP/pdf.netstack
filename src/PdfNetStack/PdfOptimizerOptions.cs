@@ -329,6 +329,26 @@ public sealed record PdfOptimizerOptions
     public bool RemoveUsageRights { get; init; }
 
     /// <summary>
+    /// Rewrite encrypted files that open with the empty user password, or with <see cref="Password"/>.
+    /// The file is decrypted in memory, optimized and proven like any other, and written encrypted
+    /// again exactly as it was: the same encryption dictionary (security handler revision, cipher,
+    /// key length, permissions, crypt filters, /EncryptMetadata), the same file key and the same
+    /// first /ID entry, so every password opens it as before and grants the same rights. The proof
+    /// compares both files decrypted and checks that protection too. Files that need a password
+    /// not given, use another security handler than the standard one (public key, custom), choose
+    /// crypt filters per stream, are signed, or claim PDF/A conformance (which forbids encryption)
+    /// are left as they are. False leaves every encrypted file as it is. Default true.
+    /// </summary>
+    public bool OptimizeEncryptedFiles { get; init; } = true;
+
+    /// <summary>
+    /// User or owner password for encrypted files, for <see cref="OptimizeEncryptedFiles"/>. When it
+    /// does not open a file, or is null, the empty user password is tried. The output is protected
+    /// with the source's own passwords whichever one opened it. Kept out of <see cref="ToString"/>.
+    /// </summary>
+    public string? Password { get; init; }
+
+    /// <summary>
     /// Worker threads for compression and verification, at most. Default: processor count. Fewer
     /// run when memory is short: each worker can hold several streams of up to
     /// <see cref="MaxDecodedStreamBytes"/>, so the count is also capped by half the memory the
@@ -419,5 +439,48 @@ public sealed record PdfOptimizerOptions
 
         if (Limits is null) throw new ArgumentNullException(nameof(Limits));
         Limits.Validate();
+    }
+
+    // The password stays out of logs that print the options. Every other public property is
+    // listed, as the compiler would; a test checks none is missing.
+    private bool PrintMembers(System.Text.StringBuilder builder)
+    {
+        var p = System.Globalization.CultureInfo.InvariantCulture;
+        builder.Append("MinSavingPercent = ").Append(MinSavingPercent.ToString(p));
+        builder.Append(", MaxInputBytes = ").Append(MaxInputBytes);
+        builder.Append(", Streaming = ").Append(Streaming);
+        builder.Append(", MaxDecodedStreamBytes = ").Append(MaxDecodedStreamBytes);
+        builder.Append(", Compression = ").Append(Compression);
+        builder.Append(", UseObjectStreams = ").Append(UseObjectStreams);
+        builder.Append(", ObjectsPerStream = ").Append(ObjectsPerStream);
+        builder.Append(", DeduplicateObjects = ").Append(DeduplicateObjects);
+        builder.Append(", PruneUnusedResources = ").Append(PruneUnusedResources);
+        builder.Append(", CompactContentStreams = ").Append(CompactContentStreams);
+        builder.Append(", MergeFontSubsets = ").Append(MergeFontSubsets);
+        builder.Append(", SubsetFonts = ").Append(SubsetFonts);
+        builder.Append(", ConvertType1Fonts = ").Append(ConvertType1Fonts);
+        builder.Append(", Linearize = ").Append(Linearize);
+        builder.Append(", RecompressStreams = ").Append(RecompressStreams);
+        builder.Append(", UseImagePredictors = ").Append(UseImagePredictors);
+        builder.Append(", OptimizeJpegImages = ").Append(OptimizeJpegImages);
+        builder.Append(", OptimizeBilevelImages = ").Append(OptimizeBilevelImages);
+        builder.Append(", JpegQuality = ").Append(JpegQuality?.ToString(p) ?? "null");
+        builder.Append(", MaxImageDpi = ").Append(MaxImageDpi?.ToString(p) ?? "null");
+        builder.Append(", MaxBilevelImageDpi = ").Append(MaxBilevelImageDpi?.ToString(p) ?? "null");
+        builder.Append(", ConvertImagesToJpeg = ").Append(ConvertImagesToJpeg);
+        builder.Append(", QuantizeImages = ").Append(QuantizeImages);
+        builder.Append(", MinImageSsim = ").Append(MinImageSsim?.ToString(p) ?? "null");
+        builder.Append(", ProgressiveJpeg = ").Append(ProgressiveJpeg);
+        builder.Append(", Verify = ").Append(Verify);
+        builder.Append(", AllowIncrementalUpdates = ").Append(AllowIncrementalUpdates);
+        builder.Append(", AllowRepairedFiles = ").Append(AllowRepairedFiles);
+        builder.Append(", RemovePageThumbnails = ").Append(RemovePageThumbnails);
+        builder.Append(", RemovePieceInfo = ").Append(RemovePieceInfo);
+        builder.Append(", RemoveUsageRights = ").Append(RemoveUsageRights);
+        builder.Append(", OptimizeEncryptedFiles = ").Append(OptimizeEncryptedFiles);
+        builder.Append(", Password = ").Append(Password is null ? "null" : "(set)");
+        builder.Append(", MaxDegreeOfParallelism = ").Append(MaxDegreeOfParallelism);
+        builder.Append(", Limits = ").Append(Limits);
+        return true;
     }
 }

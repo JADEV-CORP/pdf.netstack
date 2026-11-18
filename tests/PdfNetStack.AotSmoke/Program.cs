@@ -95,6 +95,18 @@ internal static class Smoke
             Check(output.Length < source.Length, "the lossy output is smaller");
         });
 
+        Run("optimize encrypted", () =>
+        {
+            // An uncompressed stream gives the rewrite something to save, so the proof runs.
+            PdfDocument doc = PdfDocument.Open(source);
+            doc.Catalog.Set("Notes", doc.AddObject(PdfStream.FromData(Encoding.ASCII.GetBytes(new string('x', 20000)), compress: false)));
+            doc.Security.Encrypt("", "owner");
+            byte[] encrypted = doc.ToArray(new PdfSaveOptions { Optimize = false });
+            (byte[] output, PdfOptimizationResult result) = Optimize(encrypted, PdfOptimizerOptions.Default);
+            Check(result.Disposition == OptimizationDisposition.Optimized && result.Statistics.Reencrypted, result.Reason);
+            Check(PdfDocument.Open(output, "owner").Security.HasOwnerAccess, "the owner password still opens the output");
+        });
+
         Run("extract text", () =>
         {
             string text = ExtractText(source);

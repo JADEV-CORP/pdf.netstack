@@ -201,6 +201,13 @@ internal sealed class PdfFile
     public StandardSecurity? Security { get; private set; }
 
     private int _encryptNumber = -1;
+    private int _cryptFilterStreams;
+
+    /// <summary>
+    /// Streams read so far that chose their own crypt filter (a leading /Crypt filter), which
+    /// decryption removes. A rewrite would encrypt them with the default filter instead.
+    /// </summary>
+    public int CryptFilterStreams => Volatile.Read(ref _cryptFilterStreams);
 
     /// <summary>
     /// Authenticates against the /Encrypt dictionary. Every object read afterwards is decrypted.
@@ -980,6 +987,7 @@ internal sealed class PdfFile
         PdfObject? parms = Resolve(dict["DecodeParms"]);
         bool isCrypt = filter is PdfName { Value: "Crypt" } || (filter is PdfArray { Count: > 0 } fa && Resolve(fa[0]) is PdfName { Value: "Crypt" });
         if (!isCrypt) return true;
+        Interlocked.Increment(ref _cryptFilterStreams);
 
         PdfDictionary? cryptParms = parms switch
         {

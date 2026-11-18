@@ -289,7 +289,12 @@ public static partial class PdfOptimizer
         var timings = new PhaseTimings();
         try
         {
+            // Unlocked before any object is read: objects read while locked come out encrypted,
+            // and an object stream that cannot be decoded counts as unreadable.
+            string? locked = UnlockSource(file, options, out string? password);
             pageCount = CountPages(file, guard.Budget.Diagnostics);
+            if (locked is not null) return Retained(OptimizationDisposition.UnsupportedRetained, locked);
+            Security.StandardSecurity? encryption = file.Security;
             int byteRanges = UsageRights.CountByteRanges(input.Span);
             bool usageRightsRemoved = options.RemoveUsageRights && UsageRights.Remove(file, byteRanges);
             if (Unsupported(file, byteRanges > 0 && !usageRightsRemoved, options) is { } unsupported)
@@ -298,7 +303,7 @@ public static partial class PdfOptimizer
             }
 
             ObjectGraph graph = ObjectGraph.Collect(file, options.RemovePageThumbnails, options.RemovePieceInfo, ct);
-            if (Unsupported(graph, file, options) is { } unsupportedGraph)
+            if ((Unsupported(graph, file, options) ?? UnsupportedEncryptedContent(file)) is { } unsupportedGraph)
             {
                 return Retained(OptimizationDisposition.UnsupportedRetained, unsupportedGraph);
             }
@@ -332,7 +337,9 @@ public static partial class PdfOptimizer
             }
 
             // A linearized file describes each page by what the page itself refers to.
-            string? notLinearized = options.Linearize ? InheritedAttributes.PushToPages(file) : null;
+            string? notLinearized = !options.Linearize ? null
+                : encryption is not null ? EncryptedNotLinearized
+                : InheritedAttributes.PushToPages(file);
             bool pushedDown = options.Linearize && notLinearized is null;
 
             timings = timings with { Content = phase.Elapsed };
@@ -401,9 +408,11 @@ public static partial class PdfOptimizer
                 Exhaustive = options.Compression == CompressionEffort.Exhaustive,
                 Parallelism = options.Workers,
             };
+            Func<PdfReference, int> map = Map;
+            if (encryption is not null) map = EncryptLikeSource(encryption, objects, trailer, map, ref settings);
             ReadOnlyMemory<byte> candidate;
             bool linearized = false;
-            if (pushedDown && LinearizedWriter.Write(objects, trailer, Map, settings with { UseObjectStreams = false, Version = LinearizedVersion(file.HeaderVersion) }) is { } lin)
+            if (pushedDown && LinearizedWriter.Write(objects, trailer, map, settings with { UseObjectStreams = false, Version = LinearizedVersion(file.HeaderVersion) }) is { } lin)
             {
                 candidate = lin;
                 linearized = true;
@@ -411,11 +420,17 @@ public static partial class PdfOptimizer
             else
             {
                 if (pushedDown) notLinearized = "the page tree cannot be laid out page by page";
-                candidate = PdfDocumentWriter.Write(objects, trailer, Map, settings);
+                candidate = PdfDocumentWriter.Write(objects, trailer, map, settings);
             }
 
             timings = timings with { Write = phase.Elapsed };
             phase.Restart();
+
+            // Writing decrypted every stream, so any damaged AES data has been seen by now.
+            if (encryption is not null && DamagedCiphertext(encryption, options) is { } damaged)
+            {
+                return Retained(OptimizationDisposition.UnsupportedRetained, damaged);
+            }
 
             var stats = new OptimizationStatistics(
                 file.Xref.Count(e => e.Value.Type != XrefEntryType.Free),
@@ -443,6 +458,7 @@ public static partial class PdfOptimizer
                 Type1FontsConverted = fonts.Converted,
                 FontsLeftWhole = fonts.Kept,
                 Linearized = linearized,
+                Reencrypted = encryption is not null,
             };
 
             // Linearizing a file that is not linearized yet is worth keeping even when it costs bytes.
@@ -462,6 +478,11 @@ public static partial class PdfOptimizer
                 if (written.WasReconstructed || written.LengthsRepaired > 0)
                 {
                     return new Outcome(OptimizationDisposition.OriginalRetained, null, "Verification failed: output is not well formed.", pageCount, stats);
+                }
+
+                if (encryption is not null && UnlockForProof(reference, written, password) is { } unopened)
+                {
+                    return new Outcome(OptimizationDisposition.OriginalRetained, null, "Verification failed: " + unopened + ".", pageCount, stats);
                 }
 
                 var ignored = new List<string>();
@@ -490,9 +511,14 @@ public static partial class PdfOptimizer
 
                 stats = stats with { ObjectsVerified = compared, Phases = timings with { Verify = phase.Elapsed } };
             }
+            else if (encryption is not null && ProveProtection(file, PdfFile.Open(candidate, options.MaxDecodedStreamBytes, guard.Budget), password) is { } unprotected)
+            {
+                return new Outcome(OptimizationDisposition.OriginalRetained, null, "Verification failed: " + unprotected + ".", pageCount, stats);
+            }
 
             string reason = Reason(options, recompressed) + fonts.Note();
             if (usageRightsRemoved) reason += " Usage rights removed.";
+            if (encryption is not null) reason += Reencrypted(encryption);
             if (linearized) reason += " The output is linearized.";
             else if (notLinearized is not null) reason += " Not linearized: " + notLinearized + ".";
             return new Outcome(OptimizationDisposition.Optimized, candidate, reason, pageCount, stats);
@@ -586,7 +612,7 @@ public static partial class PdfOptimizer
     /// <param name="signed">The file's bytes hold a signature's /ByteRange.</param>
     private static string? Unsupported(PdfFile file, bool signed, PdfOptimizerOptions options)
     {
-        if (file.Trailer["Encrypt"] is not null and not PdfNull) return "Encrypted PDF.";
+        if (IsEncrypted(file) && file.Security is null) return "Encrypted PDF.";
         if (signed) return "Digitally signed PDF.";
         if (file.RevisionCount > 1 && !options.AllowIncrementalUpdates)
         {

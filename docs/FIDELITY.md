@@ -174,6 +174,51 @@ checked again after the walk has read every stream. A merged object is allowed e
 image change its representative got, which is what the output holds for it. Only a proven
 rewrite reaches the destination; otherwise the input is copied there unchanged.
 
+### Encrypted files
+
+With `OptimizeEncryptedFiles`, on by default, a file encrypted with the standard security handler
+that opens with the empty user password, or with `Password`, is rewritten. The passes and the
+proof work on decrypted objects, in memory; nothing decrypted is ever written. The output is
+encrypted as it is written, with the source's own security handler:
+
+- the encryption dictionary is copied unchanged: `/Filter`, `/V`, `/R`, `/Length`, `/P`, `/O`,
+  `/U`, `/OE`, `/UE`, `/Perms`, `/CF`, `/StmF`, `/StrF` and `/EncryptMetadata`,
+- the file key is the source's, and the trailer keeps the source's `/ID`, whose first entry
+  revisions 2 to 4 derive the key from,
+- every string and stream is encrypted with that key under its new object number; a metadata
+  stream stays in the clear when `/EncryptMetadata` is false, as it was.
+
+The proof adds one rule. A standard security handler decides which passwords open a file, in
+which role (user or owner), with which permissions and under which file key, from the encryption
+dictionary and the first `/ID` entry alone (ISO 32000-2, 7.6.4.3 and 7.6.4.4). The verifier
+unlocks the output with the password that opened the source and requires:
+
+- an encryption dictionary equal to the source's, entry by entry,
+- the same first `/ID` entry,
+- the same file key, compared in constant time, and the same role and permissions for that password.
+
+Every password then opens the output exactly as it opens the source, with the same rights; the
+cipher, the key length and the permissions cannot change. The object walk compares both files
+decrypted, as for any file. With `Verify` off this check still runs, since a mistake there would
+lock every reader out of the file. `PdfEquivalence` and `pdfnetstack verify` unlock two encrypted
+files with the empty user password and apply the same rule.
+
+Left as they are, with the reason in the result:
+
+- files that need a password that was not given,
+- other security handlers (public key, custom), and versions and revisions outside the
+  standard pairs (`/V` 1 or 2 with `/R` 2 or 3, `/V` 4 with `/R` 4, `/V` 5 with `/R` 5 or 6),
+- crypt filter settings the reader would decrypt one way and the writer encrypt another: an
+  `/EFF` of its own for embedded files, a filter named but not defined, a method the version does
+  not define, a `/Crypt` filter chosen by a stream, `/EncryptMetadata` false before version 4,
+- AES data of a wrong length or padding, which viewers recover in different ways, unless
+  `AllowRepairedFiles` is set,
+- signed files, and files with usage rights unless `RemoveUsageRights` applies,
+- files that claim PDF/A conformance, which forbids encryption.
+
+An encrypted file is not linearized: the linearized writer does not encrypt. Streaming mode
+encrypts each object as it is written and proves the result the same way.
+
 ### Linearized output
 
 A linearized file holds the same objects as any other rewrite, so the proof above covers its
@@ -413,6 +458,14 @@ PSNR says little. Read side by side, the reduced pages keep every stroke, rule a
   JBIG2 and raw scans with thin strokes kept, and bad reductions (another page, too dark, plain
   subsampling, gray output) rejected; JPEG 2000 converted and reduced, and the JPEG 2000 images
   the dictionary cannot describe left alone; mutated fax and JBIG2 data that must never throw.
+- Encryption: files written in code with every revision the library writes (RC4 40 bit at
+  revisions 2 and 3, RC4 128 bit, AES-128, AES-256), with and without `/EncryptMetadata` false
+  and object streams, holding strings in arrays, name trees, annotations and XMP; each output
+  opens with the same user and owner passwords in the same roles, under the same key and
+  dictionary, keeps decrypted content equal, and stores in the clear only what the source did;
+  qpdf `--check` and `--show-encryption` agree on source and output. Passwords given or
+  needed, streaming mode, every refusal rule, and protection the proof must catch (decrypted,
+  new key, fewer rights, another user password, another role).
 - Fuzzing: mutated inputs (byte flips, deletions, truncation, injected tokens, duplicated
   regions) must never throw and must produce either the exact input or a verified rewrite.
   CI runs 600 cases; set `PDFNETSTACK_FUZZ_ITERATIONS` for a long soak. 20,000 cases pass locally.

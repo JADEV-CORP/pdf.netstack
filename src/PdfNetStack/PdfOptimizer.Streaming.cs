@@ -262,7 +262,12 @@ public static partial class PdfOptimizer
         var timings = new PhaseTimings();
         try
         {
+            // Unlocked before any object is read: objects read while locked come out encrypted,
+            // and an object stream that cannot be decoded counts as unreadable.
+            string? locked = UnlockSource(file, options, out string? password);
             pageCount = CountPages(file, guard.Budget.Diagnostics);
+            if (locked is not null) return Retained(OptimizationDisposition.UnsupportedRetained, locked);
+            Security.StandardSecurity? encryption = file.Security;
             bool usageRightsRemoved = options.RemoveUsageRights && UsageRights.Remove(file, byteRanges);
             if (Unsupported(file, byteRanges > 0 && !usageRightsRemoved, options) is { } unsupported)
             {
@@ -270,7 +275,7 @@ public static partial class PdfOptimizer
             }
 
             ObjectGraph graph = ObjectGraph.Collect(file, options.RemovePageThumbnails, options.RemovePieceInfo, ct);
-            if (Unsupported(graph, file, options) is { } unsupportedGraph)
+            if ((Unsupported(graph, file, options) ?? UnsupportedEncryptedContent(file)) is { } unsupportedGraph)
             {
                 return Retained(OptimizationDisposition.UnsupportedRetained, unsupportedGraph);
             }
@@ -377,11 +382,15 @@ public static partial class PdfOptimizer
             Func<int, PdfStream, PdfStream>? rewrite = work is null
                 ? null
                 : new BatchedRewrite(work, objects, sourceNumbers, options.Workers, ct).Rewrite;
+
+            // Each object is encrypted as it is written; the encryption dictionary comes last.
+            Func<PdfReference, int> map = Map;
+            if (encryption is not null) map = EncryptLikeSource(encryption, objects, trailer, map, ref settings);
             string candidateHash;
             long candidateLength;
             using (var hashing = new HashingStream(candidate))
             {
-                foreach (ReadOnlyMemory<byte> chunk in PdfDocumentWriter.WriteChunks(objects, trailer, Map, settings, rewrite, ct))
+                foreach (ReadOnlyMemory<byte> chunk in PdfDocumentWriter.WriteChunks(objects, trailer, map, settings, rewrite, ct))
                 {
                     hashing.Write(chunk.Span);
                 }
@@ -393,6 +402,12 @@ public static partial class PdfOptimizer
 
             timings = timings with { Write = phase.Elapsed };
             phase.Restart();
+
+            // Writing decrypted every stream, so any damaged AES data has been seen by now.
+            if (encryption is not null && DamagedCiphertext(encryption, options) is { } damaged)
+            {
+                return Retained(OptimizationDisposition.UnsupportedRetained, damaged);
+            }
 
             RecompressionCounts recompressed = work?.Counts(representative) ?? new RecompressionCounts(0, 0, []);
             var stats = new OptimizationStatistics(
@@ -421,6 +436,7 @@ public static partial class PdfOptimizer
                 Type1FontsConverted = fonts.Converted,
                 FontsLeftWhole = fonts.Kept,
                 Streamed = true,
+                Reencrypted = encryption is not null,
             };
 
             double saving = 100.0 * (source.Length - candidateLength) / Math.Max(1, source.Length);
@@ -442,6 +458,12 @@ public static partial class PdfOptimizer
                 if (written.WasReconstructed || written.LengthsRepaired > 0)
                 {
                     return new StreamedOutcome(OptimizationDisposition.OriginalRetained, false, "Verification failed: output is not well formed.", pageCount, stats);
+                }
+
+                // The fork shares the source's unlocked security handler; the output must open with its password.
+                if (encryption is not null && UnlockForProof(reference, written, password) is { } unopened)
+                {
+                    return new StreamedOutcome(OptimizationDisposition.OriginalRetained, false, "Verification failed: " + unopened + ".", pageCount, stats);
                 }
 
                 var ignored = new List<string>();
@@ -474,9 +496,14 @@ public static partial class PdfOptimizer
 
                 stats = stats with { ObjectsVerified = compared, Phases = timings with { Verify = phase.Elapsed } };
             }
+            else if (encryption is not null && ProveProtection(file, PdfFile.Open(candidate, options.MaxDecodedStreamBytes, guard.Budget), password) is { } unprotected)
+            {
+                return new StreamedOutcome(OptimizationDisposition.OriginalRetained, false, "Verification failed: " + unprotected + ".", pageCount, stats);
+            }
 
             string reason = Reason(options, recompressed) + fonts.Note();
             if (usageRightsRemoved) reason += " Usage rights removed.";
+            if (encryption is not null) reason += Reencrypted(encryption);
             return new StreamedOutcome(OptimizationDisposition.Optimized, true, reason, pageCount, stats, candidateHash, candidateLength);
         }
         catch (Exception ex) when (guard.Failure(ex) is { } failure)

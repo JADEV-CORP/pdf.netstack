@@ -86,6 +86,10 @@ namespace PdfNetStack.Cli
               --strip-pieceinfo         Remove application private data (not lossless)
               --remove-usage-rights     Rewrite files whose only signature is Adobe Reader
                                         usage rights (/UR3), removing them
+              --password <password>     Open encrypted inputs with this user or owner
+                                        password (the empty user password is tried too)
+              --no-encrypted            Leave encrypted files as they are (default: rewrite
+                                        those that open, encrypted again as they were)
               --min-saving <percent>    Minimum saving to keep a rewrite (default 1)
               --threads <n>             Threads per document (default: all cores)
               --jobs <n>                Documents processed in parallel by batch (default: all cores)
@@ -192,7 +196,7 @@ namespace PdfNetStack.Cli
                     }
 
                     Console.WriteLine($"resources pruned {s.ResourcesPruned}, content streams compacted {s.ContentStreamsCompacted}, " +
-                                      $"font programs merged {s.FontProgramsMerged}{(s.Linearized ? ", linearized" : "")}{(s.Streamed ? ", streamed" : "")}");
+                                      $"font programs merged {s.FontProgramsMerged}{(s.Linearized ? ", linearized" : "")}{(s.Streamed ? ", streamed" : "")}{(s.Reencrypted ? ", encrypted again" : "")}");
                     PhaseTimings p = s.Phases;
                     Console.WriteLine($"analyze {p.Analyze.TotalMilliseconds:F0} ms, content {p.Content.TotalMilliseconds:F0} ms, recompress {p.Recompress.TotalMilliseconds:F0} ms, " +
                                       $"dedup {p.Deduplicate.TotalMilliseconds:F0} ms, write {p.Write.TotalMilliseconds:F0} ms, verify {p.Verify.TotalMilliseconds:F0} ms");
@@ -591,6 +595,7 @@ namespace PdfNetStack.Cli
                     case "--strip-thumbnails": o = o with { RemovePageThumbnails = true }; break;
                     case "--strip-pieceinfo": o = o with { RemovePieceInfo = true }; break;
                     case "--remove-usage-rights": o = o with { RemoveUsageRights = true }; break;
+                    case "--no-encrypted": o = o with { OptimizeEncryptedFiles = false }; break;
                     case "--min-saving": o = o with { MinSavingPercent = double.Parse(Value(args, ref i), CultureInfo.InvariantCulture) }; break;
                     case "--threads":
                         o = o with { MaxDegreeOfParallelism = int.Parse(Value(args, ref i), CultureInfo.InvariantCulture) };
@@ -615,7 +620,8 @@ namespace PdfNetStack.Cli
                 }
             }
 
-            a.Options = o;
+            // --password opens encrypted inputs for the optimizer as for the editing commands.
+            a.Options = o with { Password = a.Password };
             return a;
         }
 
