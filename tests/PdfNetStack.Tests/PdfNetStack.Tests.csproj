@@ -48,6 +48,11 @@
     <ProjectReference Include="..\..\src\PdfNetStack.Ocr.Tool\PdfNetStack.Ocr.Tool.csproj" />
   </ItemGroup>
 
+  <!-- The fuzzing harness, whose seeds the tests replay through every target. .NET only. -->
+  <ItemGroup Condition="'$(TargetFramework)' != 'net48'">
+    <ProjectReference Include="..\PdfNetStack.Fuzz\PdfNetStack.Fuzz.csproj" />
+  </ItemGroup>
+
   <ItemGroup>
     <Using Include="Microsoft.VisualStudio.TestTools.UnitTesting" />
   </ItemGroup>
