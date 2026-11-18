@@ -46,9 +46,21 @@ Out of scope: high memory use that stays within the documented limits and scales
 
 ## Running on untrusted input
 
-- Keep `MaxInputBytes` and `MaxDecodedStreamBytes` at values your workers can afford.
-- Run batch workers with an OS level memory limit (container limits or job objects).
-- Use a `CancellationToken` with a timeout per document.
+- Open and optimize files from users with `PdfLimits.Untrusted`, through `PdfLoadOptions.Limits`
+  and `PdfOptimizerOptions.Limits`, or start from it with a `with` expression. It bounds the input
+  size, the bytes and image pixels decoded in total, the content operators, the characters read
+  from a page and the time of each call.
+- Pass a `CancellationToken` tied to the request, with a timeout, to every call that takes one:
+  opening, text and image extraction, merge, split, save, the optimizer, signing and HTML
+  conversion. Parsing after `OpenAsync` has read the input, `PdfInspector.Inspect` and
+  `PdfEquivalence.FindDifference` take no token yet; `PdfLimits.Timeout` bounds the first two.
+- Read `PdfDocument.Diagnostics` (or `PdfLoadOptions.OnWarning`) to learn what a limit or a damaged
+  part left out, and treat `PdfLimitExceededException` and `OptimizationDisposition.LimitExceeded`
+  as a refused file.
+- For HTML from users, keep the default `MaxStyleWork` and `MaxLayoutWork`, give no resource
+  loader or one that checks every address, and bound `HtmlConverter.MaxConcurrentConversions`.
+- Run workers with an operating system memory limit as well (container limits or job objects):
+  the limits bound one document, not the process.
 
 ## Verifying a release
 

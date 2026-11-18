@@ -123,6 +123,8 @@ export function expandSamplesInMarkdown(markdown) {
     const parsed = parseSampleMeta(meta);
     if (!parsed) return whole;
     const { code, title } = renderFence(parsed);
-    return `${indent}\`\`\`${lang}${title ? ` title="${title}"` : ''}\n${code}${indent}\`\`\``;
+    // Keep the fence's own attributes, such as a title given to one region, as the page does.
+    const attributes = [title && `title="${title}"`, parsed.rest].filter(Boolean).join(' ');
+    return `${indent}\`\`\`${lang}${attributes ? ` ${attributes}` : ''}\n${code}${indent}\`\`\``;
   });
 }

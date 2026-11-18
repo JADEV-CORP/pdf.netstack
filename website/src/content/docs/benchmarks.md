@@ -1,6 +1,6 @@
 ---
 title: PDF compression benchmarks
-description: PdfNetStack compression against qpdf and Ghostscript on a public corpus with default options, on a private corpus of 1,296 PDFs, with the method and how to reproduce it.
+description: PdfNetStack compression next to qpdf and Ghostscript on a public corpus with defaults, and on a private corpus of 1,296 PDFs, with how to reproduce it.
 sidebar:
   label: Benchmarks
 ---
