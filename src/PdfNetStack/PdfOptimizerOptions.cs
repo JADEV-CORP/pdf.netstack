@@ -464,6 +464,7 @@ public sealed record PdfOptimizerOptions
         builder.Append(", UseImagePredictors = ").Append(UseImagePredictors);
         builder.Append(", OptimizeJpegImages = ").Append(OptimizeJpegImages);
         builder.Append(", OptimizeBilevelImages = ").Append(OptimizeBilevelImages);
+        builder.Append(", UseJbig2 = ").Append(UseJbig2);
         builder.Append(", JpegQuality = ").Append(JpegQuality?.ToString(p) ?? "null");
         builder.Append(", MaxImageDpi = ").Append(MaxImageDpi?.ToString(p) ?? "null");
         builder.Append(", MaxBilevelImageDpi = ").Append(MaxBilevelImageDpi?.ToString(p) ?? "null");
