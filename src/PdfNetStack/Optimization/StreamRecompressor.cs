@@ -17,7 +17,21 @@ internal readonly record struct JpegSettings(int? Quality, bool Progressive = fa
 /// <summary>zlib at a level, optionally followed by the exhaustive encoder on data that is final.</summary>
 internal readonly record struct Flate(CompressionLevel Level, bool Exhaustive, CancellationToken Cancellation = default)
 {
-    public byte[] Encode(ReadOnlySpan<byte> data) => StreamCodec.Deflate(data, Level, Exhaustive, Cancellation);
+    /// <param name="capacity">The output length a ranking pass measured, or -1.</param>
+    public byte[] Encode(ReadOnlySpan<byte> data, long capacity = -1) => StreamCodec.Deflate(data, Level, Exhaustive, capacity, Cancellation);
+
+    /// <summary>
+    /// What <paramref name="write"/> writes, <paramref name="length"/> bytes, deflated as it is
+    /// written; the exhaustive encoder needs it whole, so only then is it held.
+    /// </summary>
+    /// <param name="capacity">The output length a ranking pass measured, or -1.</param>
+    public byte[] Encode(Action<Stream> write, long length, long capacity)
+    {
+        if (!Exhaustive) return StreamCodec.Deflate(write, length, Level, capacity);
+        using var whole = new PooledWriteStream((int)Math.Min(Compat.MaxArrayLength, Math.Max(256, length)));
+        write(whole);
+        return StreamCodec.Deflate(whole.WrittenSpan, Level, Exhaustive, capacity, Cancellation);
+    }
 }
 
 /// <summary>Streams whose encoding changed, and what the image passes did.</summary>
@@ -62,6 +76,13 @@ internal sealed record RecompressionScope(bool Recompress, HashSet<int> Compact,
 {
     /// <summary>Everything, as the optimizer did before the structural passes.</summary>
     public static RecompressionScope All { get; } = new(true, [], [], false);
+
+    /// <summary>
+    /// Leave unfiltered metadata streams unfiltered. PDF/A-1 forbids a filter on every metadata
+    /// stream (ISO 19005-1, 6.7.2); later PDF/A parts and plain PDF allow one, and an XMP packet
+    /// compresses like any other text.
+    /// </summary>
+    public bool KeepMetadataUnfiltered { get; init; }
 }
 
 /// <summary>
@@ -138,7 +159,7 @@ internal static class StreamRecompressor
         {
             bool mask = masks.Contains(numbers[i]);
             JpegSettings? settings = jpeg is { } j && mask ? j with { Quality = null } : jpeg;
-            plans[i] = Prepare(file, streams[i], settings, mask ? null : images, placed.TryGetValue(numbers[i], out PlacedSize size) ? size : null, group4, Globals)
+            plans[i] = Prepare(file, streams[i], settings, mask ? null : images, placed.TryGetValue(numbers[i], out PlacedSize size) ? size : null, group4, scope.KeepMetadataUnfiltered, decodeLimit, Globals)
                 is { } plan ? plan with { Recompress = scope.Recompress, Compact = scope.Compact.Contains(numbers[i]) } : null;
         }
 
@@ -162,9 +183,10 @@ internal static class StreamRecompressor
         private readonly LossyKind[] _lossyKinds;
         private int _changed, _jpegImages, _keptByGate, _compacted, _group4;
 
-        // Decoding images for the lossy pass takes several times their samples in memory; workers
-        // share a budget of twice the decode limit, so a document of large scans cannot multiply
-        // that by the number of threads.
+        // Recompressing a stream takes a few times its decoded size in memory, and the lossy pass
+        // several times an image's samples; workers share a budget of twice the decode limit, so a
+        // document of large images cannot multiply that by the number of threads. The process's
+        // own budget bounds concurrent optimizations together (MemoryGate.ProcessBudget).
         private readonly MemoryGate _gate;
 
         internal Work(List<PdfStream> streams, List<int> numbers, Plan?[] plans, Flate flate, bool imagePredictors, long decodeLimit, bool hashContent)
@@ -210,7 +232,7 @@ internal static class StreamRecompressor
         {
             Plan? plan = _plans[i];
             if (plan is null) return null;
-            long weight = _gate.Enter(plan.Image is { } image ? LossyImages.Footprint(image) : 0, ct);
+            long weight = _gate.Enter(plan.Image is { } image ? LossyImages.Footprint(image) : plan.Footprint, ct);
             Result? result;
             bool rejected;
             try
@@ -363,28 +385,40 @@ internal static class StreamRecompressor
     }
 
     /// <summary>
-    /// A budget of bytes shared by workers. A worker waits until its share fits beside the others;
-    /// a share larger than the whole budget is cut to it, so it runs, alone.
+    /// A budget of bytes shared by the workers of one run, inside a budget shared by every run in
+    /// the process. A worker waits until its share fits beside the others in both; a share larger
+    /// than a whole budget is cut to it, so it runs, alone. Both are taken and given back under one
+    /// lock, so a worker never holds one while it waits for the other.
     /// </summary>
-    private sealed class MemoryGate(long budget)
+    internal sealed class MemoryGate(long budget)
     {
-        private readonly object _lock = new();
+        private static readonly object Lock = new();
+        private static long s_processInUse;
         private long _inUse;
+
+        /// <summary>
+        /// Working memory all concurrent optimizations may hold at once: half of what the runtime
+        /// reports available, a container's limit included, as for the default worker count.
+        /// Without that figure (.NET Standard 2.0) only each run's own budget applies.
+        /// </summary>
+        internal static long ProcessBudget { get; } = AvailableHalf();
 
         /// <returns>The share taken, to give back to <see cref="Exit"/>.</returns>
         public long Enter(long bytes, CancellationToken ct)
         {
             long share = Math.Min(Math.Max(0, bytes), budget);
             if (share == 0) return 0;
-            lock (_lock)
+            long processShare = Math.Min(share, ProcessBudget);
+            lock (Lock)
             {
-                while (_inUse > 0 && _inUse + share > budget)
+                while ((_inUse > 0 && _inUse + share > budget) || (s_processInUse > 0 && s_processInUse + processShare > ProcessBudget))
                 {
                     ct.ThrowIfCancellationRequested();
-                    Monitor.Wait(_lock, 100);
+                    Monitor.Wait(Lock, 100);
                 }
 
                 _inUse += share;
+                s_processInUse += processShare;
             }
 
             return share;
@@ -393,11 +427,22 @@ internal static class StreamRecompressor
         public void Exit(long share)
         {
             if (share == 0) return;
-            lock (_lock)
+            lock (Lock)
             {
                 _inUse -= share;
-                Monitor.PulseAll(_lock);
+                s_processInUse -= Math.Min(share, ProcessBudget);
+                Monitor.PulseAll(Lock);
             }
+        }
+
+        private static long AvailableHalf()
+        {
+#if NET8_0_OR_GREATER
+            long available = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes;
+            return available > 0 ? available / 2 : long.MaxValue;
+#else
+            return long.MaxValue;
+#endif
         }
     }
 
@@ -405,10 +450,13 @@ internal static class StreamRecompressor
     /// <param name="Image">Set for an image the lossy image pass may change, with <paramref name="Images"/>.</param>
     /// <param name="Recompress">Re-encoding is allowed; without it only a compacted content stream may replace the data.</param>
     /// <param name="Compact">The stream is a content stream to compact.</param>
-    internal sealed record Plan(List<FilterSpec> Filters, int OriginalOverhead, PredictorParams? ImageLayout, bool KeepUnfiltered, JpegPlan? Jpeg, ImagePlan? Image, ImageSettings? Images, bool Recompress = true, bool Compact = false)
+    internal sealed record Plan(List<FilterSpec> Filters, int OriginalOverhead, PredictorParams? ImageLayout, JpegPlan? Jpeg, ImagePlan? Image, ImageSettings? Images, bool Recompress = true, bool Compact = false)
     {
         /// <summary>Set for a bilevel image that may become Group 4.</summary>
         public BilevelPlan? Bilevel { get; init; }
+
+        /// <summary>Bytes the lossless work on the stream holds at once, about: its decoded data and two working copies.</summary>
+        public long Footprint { get; init; }
     }
 
     /// <summary>A bilevel image the Group 4 pass may re-encode.</summary>
@@ -460,7 +508,8 @@ internal static class StreamRecompressor
         return targets;
     }
 
-    private static Plan? Prepare(PdfFile file, PdfStream stream, JpegSettings? jpeg, ImageSettings? images, PlacedSize? placed, bool group4, Func<PdfObject?, byte[]?> globals)
+    /// <param name="keepMetadataUnfiltered">See <see cref="RecompressionScope.KeepMetadataUnfiltered"/>.</param>
+    private static Plan? Prepare(PdfFile file, PdfStream stream, JpegSettings? jpeg, ImageSettings? images, PlacedSize? placed, bool group4, bool keepMetadataUnfiltered, long decodeLimit, Func<PdfObject?, byte[]?> globals)
     {
         PdfDictionary d = stream.Dictionary;
 
@@ -493,9 +542,7 @@ internal static class StreamRecompressor
             resolved.Add(f with { Parms = p });
         }
 
-        // An unfiltered XMP packet stays readable by tools that scan for it, as PDF/A expects.
-        bool keepUnfiltered = filters.Count == 0 && d.GetName("Type") == "Metadata";
-        if (keepUnfiltered) return null;
+        if (keepMetadataUnfiltered && filters.Count == 0 && d.GetName("Type") == "Metadata") return null;
 
         var probe = new ByteSink(64);
         var serializer = new PdfSerializer(r => r.Number);
@@ -511,7 +558,12 @@ internal static class StreamRecompressor
             serializer.Write(probe, dp);
         }
 
-        return new Plan(resolved, probe.Length, ImageLayout(file, d), keepUnfiltered, jpegPlan, imagePlan, images) { Bilevel = bilevel };
+        PredictorParams? layout = ImageLayout(file, d);
+        return new Plan(resolved, probe.Length, layout, jpegPlan, imagePlan, images)
+        {
+            Bilevel = bilevel,
+            Footprint = 3 * DecodedSize(file, d, layout, stream.EncodedLength, decodeLimit),
+        };
     }
 
     /// <summary>
@@ -596,6 +648,19 @@ internal static class StreamRecompressor
         }
 
         return copy;
+    }
+
+    /// <summary>
+    /// What a stream decodes to, as far as its dictionary tells before decoding: an image's
+    /// samples, or the length /DL states; otherwise four times its encoded length, about what
+    /// Flate achieves on content and fonts. Never more than the decode limit.
+    /// </summary>
+    private static long DecodedSize(PdfFile file, PdfDictionary d, PredictorParams? layout, int encodedLength, long decodeLimit)
+    {
+        long size = layout is { RowBytes: > 0 } rows && IntOf(file, d["Height"]) is > 0 and var height
+            ? (long)rows.RowBytes * height
+            : IntOf(file, d["DL"]) is > 0 and var stated ? stated : 4L * encodedLength;
+        return Math.Min(size, decodeLimit);
     }
 
     /// <summary>Row layout of a raw image, used to try PNG prediction. Null when not applicable.</summary>
@@ -696,7 +761,7 @@ internal static class StreamRecompressor
 
         Result? Reencode(out bool gate)
         {
-            Result? best = Choose(decoded, plan, originalCost, level, imagePredictors, decodeLimit, budget?.Pool, out gate);
+            Result? best = Choose(decoded, plan, originalCost, level, imagePredictors, decodeLimit, out gate);
             if (plan.Image is null || plan.Images is null) return best;
 
             // Lossy candidates must beat the best lossless (or requantized) encoding by a clear margin.
@@ -825,8 +890,7 @@ internal static class StreamRecompressor
         return probe.Length;
     }
 
-    /// <param name="pool">The run's pool for large working arrays, or null.</param>
-    private static Result? Choose(DecodedStream decoded, Plan plan, int originalCost, Flate flate, bool imagePredictors, long decodeLimit, System.Buffers.ArrayPool<byte>? pool, out bool rejected)
+    private static Result? Choose(DecodedStream decoded, Plan plan, int originalCost, Flate flate, bool imagePredictors, long decodeLimit, out bool rejected)
     {
         rejected = false;
         if (decoded.LayersDecoded == 0 && plan.Filters.Count > 0 && plan.Jpeg is null && plan.Bilevel?.Ccitt is null) return null;
@@ -856,14 +920,32 @@ internal static class StreamRecompressor
         List<FilterSpec> remaining = decoded.Remaining;
         if (decoded.PendingPredictor is { } pending)
         {
-            // Keep the existing predictor, recompress underneath it.
-            byte[] deflated = flate.Encode(decoded.Data.Span);
-            (PdfObject filter, PdfObject? parms) = BuildChain(remaining, StreamCodec.PredictorDictionary(pending));
-            Consider(deflated, filter, parms);
-            if (plan.Bilevel is { Ccitt: null } bilevel && remaining.Count == 0 && Predictors.TryDecode(decoded.Data.Span, pending, decodeLimit, out BoundedBuffer? samples))
+            BoundedBuffer? samples = null;
+            try
             {
-                using BoundedBuffer unpredicted = samples!;
-                ConsiderGroup4(BilevelImages.Pixels(unpredicted.Span, null, bilevel.Width, bilevel.Height, decodeLimit));
+                // Undone exactly, to whole rows, the samples may be predicted afresh or not at all:
+                // the producer's predictor is one choice among three. Otherwise it stays, with the
+                // data recompressed underneath it.
+                if (remaining.Count == 0 && Predictors.TryDecode(decoded.Data.Span, pending, decodeLimit, out samples)
+                    && Predictors.IsWholeRows(decoded.Data.Length, samples!.Length, pending))
+                {
+                    (byte[] data, PdfDictionary? parms) = ReChoosePredictor(decoded.Data, samples.Memory, pending, flate, imagePredictors);
+                    Consider(data, new PdfName("FlateDecode"), parms);
+                }
+                else
+                {
+                    (PdfObject filter, PdfObject? parms) = BuildChain(remaining, StreamCodec.PredictorDictionary(pending));
+                    Consider(flate.Encode(decoded.Data.Span), filter, parms);
+                }
+
+                if (plan.Bilevel is { Ccitt: null } bilevel && samples is not null)
+                {
+                    ConsiderGroup4(BilevelImages.Pixels(samples.Span, null, bilevel.Width, bilevel.Height, decodeLimit));
+                }
+            }
+            finally
+            {
+                samples?.Dispose();
             }
 
             return best;
@@ -884,22 +966,23 @@ internal static class StreamRecompressor
             }
 
             // Rank plain and predicted data with a cheap pass, then spend the expensive
-            // compression level only on the winner.
+            // compression level only on the winner. The predicted rows are made as they are
+            // deflated, once per pass, rather than held: predicting costs less than the memory.
             PredictorParams layout = plan.ImageLayout!.Value;
-            using BoundedBuffer predictedLease = Predictors.EncodePng(decoded.Data.Span, layout, pool);
-            ReadOnlySpan<byte> predicted = predictedLease.Span;
-            bool usePredictor = level == CompressionLevel.Fastest
-                || StreamCodec.DeflatedLength(predicted, CompressionLevel.Fastest) < StreamCodec.DeflatedLength(decoded.Data.Span, CompressionLevel.Fastest);
-            if (usePredictor)
+            ReadOnlyMemory<byte> raw = decoded.Data;
+            void Predicted(Stream output) => Predictors.WritePng(raw.Span, layout, output);
+            long predictedLength = (long)raw.Length / layout.RowBytes * (layout.RowBytes + 1);
+            if (level == CompressionLevel.Fastest)
             {
-                Consider(flate.Encode(predicted), new PdfName("FlateDecode"), StreamCodec.PredictorDictionary(layout));
-                if (level == CompressionLevel.Fastest) Consider(StreamCodec.Deflate(decoded.Data.Span, level), new PdfName("FlateDecode"), null);
-            }
-            else
-            {
-                Consider(flate.Encode(decoded.Data.Span), new PdfName("FlateDecode"), null);
+                Consider(flate.Encode(Predicted, predictedLength, -1), new PdfName("FlateDecode"), StreamCodec.PredictorDictionary(layout));
+                Consider(StreamCodec.Deflate(raw.Span, level), new PdfName("FlateDecode"), null);
+                return best;
             }
 
+            long fastPredicted = StreamCodec.DeflatedLength(Predicted, CompressionLevel.Fastest);
+            long fastPlain = StreamCodec.DeflatedLength(raw.Span, CompressionLevel.Fastest);
+            if (fastPredicted < fastPlain) Consider(flate.Encode(Predicted, predictedLength, fastPredicted), new PdfName("FlateDecode"), StreamCodec.PredictorDictionary(layout));
+            else Consider(flate.Encode(raw.Span, fastPlain), new PdfName("FlateDecode"), null);
             return best;
         }
 
@@ -923,6 +1006,8 @@ internal static class StreamRecompressor
                 transcoded = JpegTranscoder.TryTranscode(decoded.Data.Span, null, jpeg.ColorTransform, jpeg.Components, decodeLimit, out requantized, jpeg.Progressive);
             }
 
+            // DCTDecode is the only filter left, so progressive data never shares a chain with another
+            // filter, which some readers do not decode.
             if (transcoded is not null) Consider(transcoded, innerFilter, innerParms, jpeg: true, requantized: requantized);
 
             // A bare JPEG has no layers to drop, and entropy coded data does not deflate.
@@ -936,6 +1021,30 @@ internal static class StreamRecompressor
         (PdfObject wf, PdfObject? wp) = BuildChain(withFlate, null);
         Consider(wrapped, wf, wp);
         return best;
+    }
+
+    /// <summary>
+    /// The best Flate encoding of samples that came with a predictor, among three that decode to
+    /// the same samples: under that predictor as they were, without any, and, when image
+    /// predictors are allowed, under PNG prediction chosen afresh row by row. They are ranked by
+    /// zlib's default level, and only the winner is compressed at the configured effort. The
+    /// fastest level ranks them badly: on large images it favored rows predicted afresh that level
+    /// 9 then made larger than the others, and up to eight times slower to compress.
+    /// </summary>
+    /// <param name="predicted">The samples as the producer predicted them.</param>
+    /// <returns>The deflated data and its predictor parameters, null for none.</returns>
+    private static (byte[] Data, PdfDictionary? Parms) ReChoosePredictor(ReadOnlyMemory<byte> predicted, ReadOnlyMemory<byte> samples, PredictorParams pending, Flate flate, bool imagePredictors)
+    {
+        var png = new PredictorParams(15, pending.Colors, pending.BitsPerComponent, pending.Columns);
+        void Repredicted(Stream output) => Predictors.WritePng(samples.Span, png, output);
+        CompressionLevel rank = flate.Level == CompressionLevel.Fastest ? CompressionLevel.Fastest : CompressionLevel.Optimal;
+        long keep = StreamCodec.DeflatedLength(predicted.Span, rank);
+        long none = StreamCodec.DeflatedLength(samples.Span, rank);
+        long again = imagePredictors && samples.Length / png.RowBytes > 1 ? StreamCodec.DeflatedLength(Repredicted, rank) : long.MaxValue;
+        if (keep <= none && keep <= again) return (flate.Encode(predicted.Span, keep), StreamCodec.PredictorDictionary(pending));
+        return none <= again
+            ? (flate.Encode(samples.Span, none), null)
+            : (flate.Encode(Repredicted, predicted.Length, again), StreamCodec.PredictorDictionary(png));
     }
 
     /// <summary>Builds /Filter and /DecodeParms for a chain whose first element may get new parameters.</summary>

@@ -205,19 +205,33 @@ internal static class StreamCodec
     /// zlib at <paramref name="level"/>; with <paramref name="exhaustive"/>, also the exhaustive
     /// encoder, keeping whichever output is smaller. <paramref name="ct"/> stops the exhaustive search.
     /// </summary>
-    public static byte[] Deflate(ReadOnlySpan<byte> data, CompressionLevel level, bool exhaustive, CancellationToken ct = default)
+    public static byte[] Deflate(ReadOnlySpan<byte> data, CompressionLevel level, bool exhaustive, CancellationToken ct = default) =>
+        Deflate(data, level, exhaustive, -1, ct);
+
+    /// <param name="capacity">The expected output length, or -1.</param>
+    public static byte[] Deflate(ReadOnlySpan<byte> data, CompressionLevel level, bool exhaustive, long capacity, CancellationToken ct)
     {
-        byte[] zlib = Deflate(data, level);
+        byte[] zlib = Deflate(data, level, capacity);
         if (!exhaustive) return zlib;
         byte[]? smaller = ExhaustiveDeflate.TryCompress(data, ct: ct);
         return smaller is not null && smaller.Length < zlib.Length ? smaller : zlib;
     }
 
-    public static byte[] Deflate(ReadOnlySpan<byte> data, CompressionLevel level)
+    /// <param name="capacity">The expected output length, when a ranking pass measured it; otherwise half the input is reserved.</param>
+    public static byte[] Deflate(ReadOnlySpan<byte> data, CompressionLevel level, long capacity = -1)
     {
-        using var output = new PooledWriteStream(Math.Max(256, data.Length / 2));
+        using var output = new PooledWriteStream(Capacity(capacity, data.Length));
         Compat.ZlibCompress(output, data, level);
 
+        return output.ToArray();
+    }
+
+    /// <summary>zlib at <paramref name="level"/> of what <paramref name="write"/> writes, which is never held whole.</summary>
+    /// <param name="length">How much <paramref name="write"/> writes, to size the output when <paramref name="capacity"/> is unknown.</param>
+    public static byte[] Deflate(Action<Stream> write, long length, CompressionLevel level, long capacity = -1)
+    {
+        using var output = new PooledWriteStream(Capacity(capacity, length));
+        Compat.ZlibCompress(output, write, level);
         return output.ToArray();
     }
 
@@ -228,6 +242,19 @@ internal static class StreamCodec
         Compat.ZlibCompress(counter, data, level);
         return counter.Length;
     }
+
+    /// <summary>The length zlib at <paramref name="level"/> gives for what <paramref name="write"/> writes, keeping neither.</summary>
+    public static long DeflatedLength(Action<Stream> write, CompressionLevel level)
+    {
+        using var counter = new CountingStream();
+        Compat.ZlibCompress(counter, write, level);
+        return counter.Length;
+    }
+
+    // A measured length plus room for the zlib framing and a level that does a little worse;
+    // without one, half the input, as before.
+    private static int Capacity(long measured, long inputLength) =>
+        (int)Math.Min(Compat.MaxArrayLength, Math.Max(256, measured >= 0 ? measured + (measured / 16) + 64 : inputLength / 2));
 }
 
 /// <summary>Write-only stream that keeps nothing but the count of bytes written.</summary>
@@ -287,6 +314,9 @@ internal sealed class PooledWriteStream : Stream
     }
 
     public byte[] ToArray() => _buffer.AsSpan(0, _length).ToArray();
+
+    /// <summary>The bytes written so far, valid until the next write or disposal.</summary>
+    public ReadOnlySpan<byte> WrittenSpan => _buffer.AsSpan(0, _length);
 
     public override void Write(byte[] buffer, int offset, int count) => Write(buffer.AsSpan(offset, count));
 
