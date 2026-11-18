@@ -19,7 +19,9 @@ $projects = @(
     'src/PdfNetStack.Ocr/PdfNetStack.Ocr.csproj',
     'src/PdfNetStack.Ocr.Tesseract/PdfNetStack.Ocr.Tesseract.csproj',
     'src/PdfNetStack.Ocr.Models/PdfNetStack.Ocr.Models.csproj',
-    'src/PdfNetStack.Ocr.Tool/PdfNetStack.Ocr.Tool.csproj'
+    'src/PdfNetStack.Ocr.Tool/PdfNetStack.Ocr.Tool.csproj',
+    'src/PdfNetStack.DataIngestion/PdfNetStack.DataIngestion.csproj',
+    'src/PdfNetStack.Extensions.Hosting/PdfNetStack.Extensions.Hosting.csproj'
 )
 $buildOnly = @('Microsoft.NET.ILLink.Tasks')
 $failed = $false

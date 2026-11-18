@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Development tool: measures document text extraction for retrieval (word accuracy, reading
+    order, hidden text caught, time) of PdfNetStack against PdfPig. Not packed, never shipped, and
+    the only project that references PdfPig.
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>PdfNetStack.TextBench</RootNamespace>
+    <!-- Words are compared after NFKC normalization, which needs ICU: ligatures such as U+FB01 become "fi". -->
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\PdfNetStack\PdfNetStack.csproj" />
+    <ProjectReference Include="..\..\src\PdfNetStack.Html\PdfNetStack.Html.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Apache-2.0. The baseline: the reader Microsoft's AI chat template ships for PDFs. -->
+    <PackageReference Include="PdfPig" Version="0.1.16" />
+  </ItemGroup>
+
+</Project>

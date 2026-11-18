@@ -65,7 +65,7 @@ public sealed record PdfSaveOptions
 /// A document read on demand (<see cref="PdfLoadMode.OnDemand"/>) holds its file until it is
 /// disposed; disposing any other document does nothing.
 /// </remarks>
-public sealed class PdfDocument : IDisposable
+public sealed partial class PdfDocument : IDisposable
 {
     /// <summary>
     /// Levels of /Pages nodes read. Real trees are a handful of levels deep; the bound keeps a
