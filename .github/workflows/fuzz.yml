@@ -1,0 +1,116 @@
+name: Fuzz
+
+# Runs the SharpFuzz harness (tests/PdfNetStack.Fuzz) under libFuzzer, one job per entry point:
+# about 5 minutes per target on pull requests that touch the libraries, 1 hour per target every
+# night. Beyond crashes, the oracle reports exceptions the entry point does not document,
+# allocation above 64 times the input plus 64 MiB, and inputs that take more than 2 seconds.
+# libFuzzer stops at the first finding and saves its input, which the job uploads; reproduce it
+# with `dotnet run --project tests/PdfNetStack.Fuzz -c Release -- replay <target> <file>`.
+#
+# Main still has known resource bugs that the core limits work is fixing, so on pull requests a
+# finding does not fail the check yet: drop continue-on-error once those fixes are merged.
+on:
+  pull_request:
+    paths:
+      - 'src/PdfNetStack/**'
+      - 'src/PdfNetStack.Html/**'
+      - 'tests/PdfNetStack.Fuzz/**'
+      - '.github/workflows/fuzz.yml'
+  schedule:
+    - cron: '30 1 * * *'
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds per target
+        default: '300'
+
+# Each job asks for what it needs.
+permissions: {}
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fuzz:
+    name: Fuzz ${{ matrix.target }}
+    # Forks keep the nightly run off.
+    if: github.event_name != 'schedule' || github.repository == 'jams4code/pdf.netstack'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    continue-on-error: ${{ github.event_name == 'pull_request' }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [open, open-on-demand, optimize, verify-signatures, trusted-list, image, opentype, html, jbig2, jpx, ccitt, cmap, content]
+    env:
+      DOTNET_NOLOGO: true
+      DOTNET_CLI_TELEMETRY_OPTOUT: true
+      SHARPFUZZ_VERSION: 2.3.0
+      # The libFuzzer driver for .NET, pinned to a release and checked against its hash.
+      LIBFUZZER_DOTNET_URL: https://github.com/Metalnem/libfuzzer-dotnet/releases/download/v2025.05.02.0904/libfuzzer-dotnet-ubuntu
+      LIBFUZZER_DOTNET_SHA256: c2c2a90d94c409a4af339a0d4f244e0442c5a5d249be0f1252ba07871f285958
+      SECONDS_PER_TARGET: ${{ github.event_name == 'schedule' && '3600' || inputs.seconds || '300' }}
+      PDFNETSTACK_FUZZ_TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Publish the harness
+        run: dotnet publish tests/PdfNetStack.Fuzz -c Release -f net10.0 -o fuzz
+
+      # SharpFuzz rewrites the libraries under test so that libFuzzer sees the branches they take.
+      - name: Instrument the libraries
+        run: |
+          dotnet tool install SharpFuzz.CommandLine --version "$SHARPFUZZ_VERSION" --tool-path .tools
+          for library in PdfNetStack.dll PdfNetStack.Html.dll; do .tools/sharpfuzz "fuzz/$library"; done
+
+      - name: libFuzzer driver
+        run: |
+          curl -fsSL -o libfuzzer-dotnet "$LIBFUZZER_DOTNET_URL"
+          echo "$LIBFUZZER_DOTNET_SHA256  libfuzzer-dotnet" | sha256sum --check
+          chmod +x libfuzzer-dotnet
+
+      - name: Seeds from the test fixtures
+        run: dotnet fuzz/PdfNetStack.Fuzz.dll seeds "$PDFNETSTACK_FUZZ_TARGET" tests/PdfNetStack.Tests/Fixtures corpus
+
+      - name: Fuzz
+        env:
+          # An allocation the oracle has not seen end yet fails as OutOfMemoryException, which is a
+          # finding, instead of taking the runner down.
+          DOTNET_GCHeapHardLimit: '0xC0000000'
+        run: |
+          set -o pipefail
+          mkdir -p findings
+          ./libfuzzer-dotnet --target_path=dotnet --target_arg=fuzz/PdfNetStack.Fuzz.dll \
+            -max_total_time="$SECONDS_PER_TARGET" -timeout=30 -rss_limit_mb=4096 -max_len=262144 \
+            -artifact_prefix=findings/ -print_final_stats=1 corpus 2>&1 | tee fuzz.log
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "### $PDFNETSTACK_FUZZ_TARGET"
+            echo
+            echo '```'
+            grep -E 'FuzzFinding|Unhandled exception|ERROR: libFuzzer|stat::number_of_executed_units|Done [0-9]+ runs' fuzz.log | head -n 20 || true
+            echo '```'
+            if [ -n "$(ls -A findings 2>/dev/null)" ]; then echo "Saved inputs: $(ls findings | tr '\n' ' ')"; fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: fuzz-${{ matrix.target }}
+          path: |
+            findings/
+            fuzz.log
+          if-no-files-found: ignore
+          retention-days: 30
