@@ -140,12 +140,27 @@ public sealed class SecurityTests
     }
 
     [TestMethod]
-    public void OptimizerStillRefusesEncryptedInput()
+    public void OptimizerKeepsTheEncryptionOrLeavesTheFileAlone()
     {
-        PdfDocument doc = Sample();
+        // Content written long hand, so the rewrite saves something.
+        PdfBuilder b = PdfBuilder.Simple("Top secret");
+        b.SetStream(4, "", Encoding.ASCII.GetBytes(string.Concat(Enumerable.Repeat("BT /F1 24 Tf 72 700 Td (Top secret) Tj ET\n", 100))));
+        PdfDocument doc = PdfDocument.Open(b.Build());
+        doc.Info.Title = "Quarterly figures";
         doc.Security.Encrypt("", "owner");
-        byte[] bytes = doc.ToArray();
+        byte[] bytes = doc.ToArray(Plain);
+
         (byte[] output, PdfOptimizationResult result) = PdfOptimizer.Optimize(bytes);
+        Assert.AreEqual(OptimizationDisposition.Optimized, result.Disposition, result.Reason);
+        Assert.IsTrue(result.Statistics.Reencrypted);
+        string raw = Compat.Latin1.GetString(output);
+        Assert.AreEqual(-1, raw.IndexOf("Quarterly", StringComparison.Ordinal));
+        PdfDocument opened = PdfDocument.Open(output);
+        Assert.IsFalse(opened.Security.HasOwnerAccess);
+        Assert.AreEqual("Quarterly figures", opened.Info.Title);
+        Assert.IsTrue(PdfDocument.Open(output, "owner").Security.HasOwnerAccess);
+
+        (output, result) = PdfOptimizer.Optimize(bytes, new PdfOptimizerOptions { OptimizeEncryptedFiles = false });
         Assert.AreEqual(OptimizationDisposition.UnsupportedRetained, result.Disposition, result.Reason);
         CollectionAssert.AreEqual(bytes, output);
     }

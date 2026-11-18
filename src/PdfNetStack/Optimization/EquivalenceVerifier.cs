@@ -141,6 +141,10 @@ internal sealed class EquivalenceVerifier
     /// <returns>Null when equivalent, otherwise a description of the first difference found.</returns>
     public static string? Verify(PdfFile source, PdfFile output, VerificationRules rules, long decodeLimit, int parallelism, CancellationToken ct, out int objectsCompared)
     {
+        // Encrypted files are walked decrypted; their protection must be the same as well.
+        objectsCompared = 0;
+        if (Security.EncryptionEquivalence.Find(source, output) is { } encryption) return encryption;
+
         var v = new EquivalenceVerifier(source, output, rules, decodeLimit, ct);
         try
         {

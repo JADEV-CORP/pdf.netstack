@@ -109,6 +109,13 @@ public sealed record OptimizationStatistics(
     /// <summary>True when the file was optimized in streaming mode (<see cref="PdfOptimizerOptions.Streaming"/>).</summary>
     public bool Streamed { get; init; }
 
+    /// <summary>
+    /// True when the source was encrypted and the output was encrypted again exactly as it was
+    /// (<see cref="PdfOptimizerOptions.OptimizeEncryptedFiles"/>): same encryption dictionary,
+    /// file key and first /ID entry, so the same passwords open it with the same permissions.
+    /// </summary>
+    public bool Reencrypted { get; init; }
+
     internal static OptimizationStatistics Empty(TimeSpan elapsed) => new(0, 0, 0, 0, 0, 0, 0, elapsed, new PhaseTimings());
 }
 
