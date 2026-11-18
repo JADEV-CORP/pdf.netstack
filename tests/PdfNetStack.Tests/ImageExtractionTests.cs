@@ -360,6 +360,10 @@ public sealed class ImageExtractionTests
         PdfDocument reopened = Reopen(heavy);
         var clock = System.Diagnostics.Stopwatch.StartNew();
         Assert.IsEmpty(reopened.Pages[0].GetImages());
-        Assert.IsLessThan(15_000, clock.ElapsedMilliseconds);
+
+        // The page budget is what stops it, which a clock cannot tell apart from a fast machine:
+        // the diagnostic proves the walk stopped at the budget. The time bound only catches a hang.
+        Assert.IsTrue(reopened.Diagnostics.Any(d => d.Limit == PdfLimitKind.PageContent && d.PageIndex == 0));
+        Assert.IsLessThan(60_000, clock.ElapsedMilliseconds);
     }
 }
