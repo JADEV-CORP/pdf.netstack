@@ -60,6 +60,12 @@ public sealed record PdfSaveOptions
 /// </remarks>
 public sealed class PdfDocument : IDisposable
 {
+    /// <summary>
+    /// Levels of /Pages nodes read. Real trees are a handful of levels deep; the bound keeps a
+    /// tree of thousands of nested nodes from costing a walk per level everywhere pages are found.
+    /// </summary>
+    internal const int MaxPageTreeDepth = 64;
+
     private readonly HashSet<int> _pageTreeNodes = new();
     private readonly HashSet<int> _everPages = new();
     private readonly Dictionary<PdfDocument, PageImporter> _importers = new();
@@ -122,6 +128,30 @@ public sealed class PdfDocument : IDisposable
 
     /// <summary>Most pixels an image of this document may decode to.</summary>
     internal long MaxImagePixels { get; private set; } = PdfLoadOptions.DefaultMaxImagePixels;
+
+    /// <summary>
+    /// What is left of the document's <see cref="PdfLimits"/>, spent by every decode, image and
+    /// content operator over the document's life, and where its warnings are collected.
+    /// </summary>
+    internal ResourceBudget Budget { get; private set; } = new(Built, long.MaxValue, new PdfDiagnostics());
+
+    /// <summary>
+    /// The limits of a document built in code: it has no file to scale a budget from, and holds
+    /// what the application put in, merged pages among them, so only the per page bounds apply.
+    /// </summary>
+    private static readonly PdfLimits Built = PdfLimits.Default with { MaxOperationsPerDocument = long.MaxValue };
+
+    /// <summary>The limits the document was opened with.</summary>
+    internal PdfLimits Limits => Budget.Limits;
+
+    /// <summary>
+    /// Warnings about the document, oldest first: limits that cut work short, damaged parts that
+    /// were skipped, repairs made to read the file. The document stays usable; a warning says
+    /// what a reader of it may be missing. Added as they are found, during opening and later
+    /// calls such as <see cref="PdfPage.ExtractText"/>; <see cref="PdfLoadOptions.OnWarning"/>
+    /// hears each one as it comes. At most 1000 are kept.
+    /// </summary>
+    public IReadOnlyList<PdfDiagnostic> Diagnostics => Budget.Diagnostics.Snapshot();
 
     internal int CatalogNumber { get; private set; }
 
@@ -206,6 +236,7 @@ public sealed class PdfDocument : IDisposable
         Compat.ThrowIfNull(path, nameof(path));
         Compat.ThrowIfNull(options, nameof(options));
         options.Validate();
+        InputReader.CheckLength(new FileInfo(path).Length, options.Limits.MaxInputBytes);
         if (options.Mode == PdfLoadMode.InMemory) return Load(File.ReadAllBytes(path), options);
 
         var file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 4096, FileOptions.RandomAccess);
@@ -250,9 +281,15 @@ public sealed class PdfDocument : IDisposable
         Compat.ThrowIfNull(options, nameof(options));
         options.Validate();
         if (!stream.CanRead) throw new ArgumentException("The stream must be readable.", nameof(stream));
-        if (options.Mode == PdfLoadMode.InMemory) return Load(InputReader.ReadToEnd(stream), options);
-        if (stream.CanSeek) return OnStream(stream, options, owned: null, appendable: true);
-        return OnSpool(Spool.Copy(stream, options.SpoolThreshold, options.TempDirectory), options);
+        long maxBytes = options.Limits.MaxInputBytes;
+        if (options.Mode == PdfLoadMode.InMemory) return Load(InputReader.ReadToEnd(stream, maxBytes), options);
+        if (stream.CanSeek)
+        {
+            InputReader.CheckLength(stream.Length - stream.Position, maxBytes);
+            return OnStream(stream, options, owned: null, appendable: true);
+        }
+
+        return OnSpool(Spool.Copy(stream, options.SpoolThreshold, options.TempDirectory, maxBytes), options);
     }
 
     /// <summary>
@@ -284,7 +321,8 @@ public sealed class PdfDocument : IDisposable
         Compat.ThrowIfNull(options, nameof(options));
         options.Validate();
         if (options.Mode == PdfLoadMode.InMemory) return Load(data, options);
-        return OnDemand(PdfFile.Open(data, options.MaxDecodedStreamBytes), options, source: null, owned: null, closeOnDispose: false);
+        InputReader.CheckLength(data.Length, options.Limits.MaxInputBytes);
+        return OnDemand(PdfFile.Open(data, options.MaxDecodedStreamBytes, NewBudget(options, data.Length)), options, source: null, owned: null, closeOnDispose: false);
     }
 
     /// <summary>
@@ -320,12 +358,12 @@ public sealed class PdfDocument : IDisposable
         if (!stream.CanRead) throw new ArgumentException("The stream must be readable.", nameof(stream));
         if (options.Mode == PdfLoadMode.InMemory)
         {
-            ReadOnlyMemory<byte> data = await InputReader.ReadToEndAsync(stream, cancellationToken).ConfigureAwait(false);
+            ReadOnlyMemory<byte> data = await InputReader.ReadToEndAsync(stream, cancellationToken, options.Limits.MaxInputBytes).ConfigureAwait(false);
             cancellationToken.ThrowIfCancellationRequested();
             return Load(data, options);
         }
 
-        Spool spool = await Spool.CopyAsync(stream, options.SpoolThreshold, options.TempDirectory, cancellationToken).ConfigureAwait(false);
+        Spool spool = await Spool.CopyAsync(stream, options.SpoolThreshold, options.TempDirectory, cancellationToken, options.Limits.MaxInputBytes).ConfigureAwait(false);
         if (cancellationToken.IsCancellationRequested)
         {
             spool.Dispose();
@@ -362,12 +400,27 @@ public sealed class PdfDocument : IDisposable
     /// <summary>Parses a file held in memory: every object reachable from the trailer.</summary>
     private static PdfDocument Load(ReadOnlyMemory<byte> data, PdfLoadOptions options)
     {
+        InputReader.CheckLength(data.Length, options.Limits.MaxInputBytes);
+        var deadline = Deadline.Start(options.Limits);
         long limit = options.MaxDecodedStreamBytes;
-        PdfFile file = PdfFile.Open(data, limit);
+        ResourceBudget budget = NewBudget(options, data.Length);
+        PdfFile file = PdfFile.Open(data, limit, budget);
         if (file.Trailer["Encrypt"] is not null and not PdfNull) file.Unlock(options.Password);
 
-        var doc = new PdfDocument(file.HeaderVersion, file.Security) { DecodeLimit = limit, MaxImagePixels = options.MaxImagePixels, _file = file };
-        ObjectGraph graph = ObjectGraph.Collect(file, stripThumbnails: false, stripPieceInfo: false, CancellationToken.None);
+        var doc = new PdfDocument(file.HeaderVersion, file.Security) { DecodeLimit = limit, MaxImagePixels = options.MaxImagePixels, _file = file, Budget = budget };
+        ObjectGraph graph;
+        using (CancellationTokenSource? timer = deadline.NewTimer())
+        {
+            try
+            {
+                graph = ObjectGraph.Collect(file, stripThumbnails: false, stripPieceInfo: false, timer?.Token ?? CancellationToken.None);
+            }
+            catch (OperationCanceledException) when (timer is { IsCancellationRequested: true })
+            {
+                throw budget.Exceeded(PdfLimitKind.Timeout, "Opening the document ran past its time limit (PdfLimits.Timeout).");
+            }
+        }
+
         foreach (int number in graph.Order) doc.Objects[number] = file.GetObject(number);
         doc.NextNumber = (doc.Objects.Count == 0 ? 0 : doc.Objects.Keys.Max()) + 1;
         doc.NextNumber = Math.Max(doc.NextNumber, FirstFreeNumber(file));
@@ -384,7 +437,8 @@ public sealed class PdfDocument : IDisposable
     {
         try
         {
-            return OnDemand(PdfFile.Open(stream, options.MaxDecodedStreamBytes), options, appendable ? stream : null, owned, closeOnDispose: true);
+            ResourceBudget budget = NewBudget(options, stream.Length - stream.Position);
+            return OnDemand(PdfFile.Open(stream, options.MaxDecodedStreamBytes, budget), options, appendable ? stream : null, owned, closeOnDispose: true);
         }
         catch
         {
@@ -397,7 +451,7 @@ public sealed class PdfDocument : IDisposable
     private static PdfDocument OnSpool(Spool spool, PdfLoadOptions options)
     {
         if (spool.File is { } file) return OnStream(file, options, owned: spool, appendable: false);
-        return OnDemand(PdfFile.Open(spool.Memory, options.MaxDecodedStreamBytes), options, source: null, owned: null, closeOnDispose: true);
+        return OnDemand(PdfFile.Open(spool.Memory, options.MaxDecodedStreamBytes, NewBudget(options, spool.Memory.Length)), options, source: null, owned: null, closeOnDispose: true);
     }
 
     private static PdfDocument OnDemand(PdfFile file, PdfLoadOptions options, Stream? source, IDisposable? owned, bool closeOnDispose)
@@ -408,6 +462,7 @@ public sealed class PdfDocument : IDisposable
         {
             DecodeLimit = options.MaxDecodedStreamBytes,
             MaxImagePixels = options.MaxImagePixels,
+            Budget = file.Budget ?? NewBudget(options, file.Length),
             _file = file,
             _sourceStream = source,
             _owned = owned,
@@ -440,6 +495,9 @@ public sealed class PdfDocument : IDisposable
 
     private void ThrowIfDisposed() => Compat.ThrowIfDisposed(_disposed, this);
 
+    private static ResourceBudget NewBudget(PdfLoadOptions options, long inputBytes) =>
+        new(options.Limits, inputBytes, new PdfDiagnostics(options.OnWarning));
+
     /// <summary>
     /// The first number no object of the file uses, so objects added later never take the number
     /// of one the file still lists, such as an object stream an incremental update must not hide.
@@ -465,6 +523,16 @@ public sealed class PdfDocument : IDisposable
         if (file.Resolve(file.Trailer["ID"]) is PdfArray id) Id = id;
         LoadPageTree();
         _openedPages = Pages.Select(p => p.Number).ToList();
+        ReportRepairs(file);
+    }
+
+    /// <summary>Tells the diagnostics what opening had to repair or could not read.</summary>
+    private void ReportRepairs(PdfFile file)
+    {
+        PdfDiagnostics diagnostics = Budget.Diagnostics;
+        if (file.WasReconstructed) diagnostics.Repaired("The cross-reference data was damaged; objects were found by scanning the file.");
+        if (file.LengthsRepaired > 0) diagnostics.Repaired(Compat.Format("{0} stream length(s) were wrong and were corrected from the data.", file.LengthsRepaired));
+        if (file.UnreadableObjects > 0) diagnostics.Skipped(Compat.Format("{0} object(s) could not be parsed and read as null.", file.UnreadableObjects));
     }
 
     /// <summary>Creates a document holding all pages of the given documents, in order.</summary>
@@ -1214,15 +1282,33 @@ public sealed class PdfDocument : IDisposable
     /// left in place, so an image comes back as its JPEG or JPEG 2000 file.
     /// </summary>
     /// <exception cref="PdfFormatException">The data is damaged or exceeds the decode limit.</exception>
-    public byte[] GetStreamData(PdfStream stream)
+    /// <exception cref="PdfLimitExceededException">The document has decoded as much as its <see cref="PdfLoadOptions.Limits"/> allow.</exception>
+    public byte[] GetStreamData(PdfStream stream) => GetStreamData(stream, DecodeLimit);
+
+    /// <summary>
+    /// The decoded data, at most <paramref name="limit"/> bytes, charged to the document's budget.
+    /// A limit below the document's ceiling is what is left of a page's budget.
+    /// </summary>
+    /// <exception cref="PdfFormatException">The data is damaged or exceeds the document's ceiling.</exception>
+    /// <exception cref="PdfLimitExceededException">The data exceeds a page's <paramref name="limit"/>, or the document's budget.</exception>
+    internal byte[] GetStreamData(PdfStream stream, long limit)
     {
         Compat.ThrowIfNull(stream, nameof(stream));
         ThrowIfDisposed();
         try
         {
             List<Filters.FilterSpec> filters = Filters.StreamCodec.GetFilters(stream.Dictionary, Resolve);
-            using Filters.DecodedStream decoded = Filters.StreamCodec.Decode(stream.Data, filters, Filters.DecodeDepth.Full, DecodeLimit, Resolve);
-            return decoded.Data.ToArray();
+
+            // /DL, the decoded length (ISO 32000-1, Table 5), is a hint: it only sizes the buffer.
+            int size = Resolve(stream.Dictionary["DL"]) is PdfNumber { IsInteger: true } dl && dl.IntegerValue > 0 && dl.IntegerValue <= limit
+                ? (int)Math.Min(dl.IntegerValue, Compat.MaxArrayLength)
+                : 0;
+            using Filters.DecodedStream decoded = Filters.StreamCodec.Decode(stream.Data, filters, Filters.DecodeDepth.Full, limit, Resolve, Budget, size);
+            return decoded.ToArray();
+        }
+        catch (Filters.StreamDecodeException e) when (e.IsLimit && limit < DecodeLimit)
+        {
+            throw new PdfLimitExceededException(PdfLimitKind.PageContent, "The page's content decodes past its limit (PdfLoadOptions.MaxDecodedStreamBytes, all its streams and forms together); the rest is not read.");
         }
         catch (Filters.StreamDecodeException e)
         {
@@ -1324,6 +1410,7 @@ public sealed class PdfDocument : IDisposable
         var stack = new Stack<(int Number, Dictionary<string, PdfObject> Inherited, int Depth)>();
         stack.Push((rootRef.Number, new Dictionary<string, PdfObject>(), 0));
         var ordered = new List<(int Number, Dictionary<string, PdfObject> Inherited)>();
+        int looped = 0, tooDeep = 0;
 
         // Depth first, children in order: push in reverse.
         while (stack.Count > 0)
@@ -1337,7 +1424,18 @@ public sealed class PdfDocument : IDisposable
                 continue;
             }
 
-            if (!seenNodes.Add(number) || depth > 64) continue;
+            if (!seenNodes.Add(number))
+            {
+                looped++;
+                continue;
+            }
+
+            if (depth > MaxPageTreeDepth)
+            {
+                tooDeep++;
+                continue;
+            }
+
             _pageTreeNodes.Add(number);
             var next = new Dictionary<string, PdfObject>(inherited);
             foreach (string key in InheritableKeys)
@@ -1381,6 +1479,24 @@ public sealed class PdfDocument : IDisposable
             }
 
             Pages.Attach(new PdfPage(this, pageNumber, dict));
+        }
+
+        ReportPageTree(rootRef, looped, tooDeep);
+    }
+
+    /// <summary>Tells the diagnostics about branches of the page tree that were not read, and a /Count that disagrees.</summary>
+    private void ReportPageTree(PdfReference root, int looped, int tooDeep)
+    {
+        PdfDiagnostics diagnostics = Budget.Diagnostics;
+        if (looped > 0) diagnostics.Skipped(Compat.Format("The page tree lists {0} of its nodes more than once (a loop or a shared branch); they were read once.", looped));
+        if (tooDeep > 0)
+        {
+            diagnostics.Skipped(Compat.Format("The page tree nests deeper than {0} levels; {1} branch(es) below that were not read, with their pages.", MaxPageTreeDepth, tooDeep));
+        }
+
+        if (Resolve(Resolve(root) is PdfDictionary node ? node["Count"] : null) is PdfNumber { IsInteger: true } count && count.IntegerValue != Pages.Count)
+        {
+            diagnostics.Repaired(Compat.Format("The page tree says it has {0} page(s) but {1} were found; the pages found are used.", count.IntegerValue, Pages.Count));
         }
     }
 

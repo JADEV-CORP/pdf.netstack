@@ -20,15 +20,15 @@ internal static class Predictors
     /// Reverses a PNG (10-15) or TIFF (2) predictor into a pooled buffer owned by the caller.
     /// Returns false when the parameters are unsupported.
     /// </summary>
-    public static bool TryDecode(ReadOnlySpan<byte> data, PredictorParams p, long limit, out BoundedBuffer? result)
+    public static bool TryDecode(ReadOnlySpan<byte> data, PredictorParams p, long limit, out BoundedBuffer? result, ResourceBudget? budget = null)
     {
         result = null;
         if (!p.IsValid || p.Predictor == 1) return false;
-        if (p.Predictor == 2) return TryDecodeTiff(data, p, limit, out result);
-        return TryDecodePng(data, p, limit, out result);
+        if (p.Predictor == 2) return TryDecodeTiff(data, p, limit, out result, budget);
+        return TryDecodePng(data, p, limit, out result, budget);
     }
 
-    private static bool TryDecodePng(ReadOnlySpan<byte> data, PredictorParams p, long limit, out BoundedBuffer? result)
+    private static bool TryDecodePng(ReadOnlySpan<byte> data, PredictorParams p, long limit, out BoundedBuffer? result, ResourceBudget? budget)
     {
         result = null;
 
@@ -39,9 +39,9 @@ internal static class Predictors
         int rows = data.Length / (rowBytes + 1);
         int tail = data.Length - rows * (rowBytes + 1);
         long outLength = (long)rows * rowBytes + Math.Max(0, tail - 1);
-        if (outLength > limit) throw new StreamDecodeException("Decoded stream exceeds the configured size limit.");
+        if (outLength > limit) throw StreamDecodeException.OverLimit();
 
-        var output = new BoundedBuffer((int)outLength, limit);
+        var output = new BoundedBuffer((int)outLength, limit, budget, exact: true);
         var previous = new byte[rowBytes];
         var current = new byte[rowBytes];
         int src = 0;
@@ -94,11 +94,11 @@ internal static class Predictors
         return true;
     }
 
-    private static bool TryDecodeTiff(ReadOnlySpan<byte> data, PredictorParams p, long limit, out BoundedBuffer? result)
+    private static bool TryDecodeTiff(ReadOnlySpan<byte> data, PredictorParams p, long limit, out BoundedBuffer? result, ResourceBudget? budget)
     {
         result = null;
         if (p.BitsPerComponent != 8 && p.BitsPerComponent != 16) return false;
-        var output = new BoundedBuffer(data.Length, limit);
+        var output = new BoundedBuffer(data.Length, limit, budget);
         output.Write(data);
         Span<byte> r = output.WritableSpan;
         int rowBytes = p.RowBytes;
@@ -131,12 +131,13 @@ internal static class Predictors
     /// Applies PNG prediction choosing the filter per row with the minimum sum of absolute
     /// differences heuristic. Input length must be an exact multiple of the row size.
     /// </summary>
-    public static BoundedBuffer EncodePng(ReadOnlySpan<byte> data, PredictorParams p)
+    /// <param name="pool">Where a large output array comes from, or null to allocate it.</param>
+    public static BoundedBuffer EncodePng(ReadOnlySpan<byte> data, PredictorParams p, System.Buffers.ArrayPool<byte>? pool = null)
     {
         int rowBytes = p.RowBytes;
         int bpp = p.BytesPerPixel;
         int rows = data.Length / rowBytes;
-        var lease = new BoundedBuffer(rows * (rowBytes + 1), long.MaxValue);
+        var lease = new BoundedBuffer(rows * (rowBytes + 1), long.MaxValue, exact: true, pool: pool);
         Span<byte> output = lease.Extend(rows * (rowBytes + 1));
         var candidate = new byte[5][];
         for (int f = 0; f < 5; f++) candidate[f] = new byte[rowBytes];

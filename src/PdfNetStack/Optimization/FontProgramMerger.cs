@@ -270,7 +270,7 @@ internal sealed class TrueTypeGlyphs
         try
         {
             List<FilterSpec> filters = StreamCodec.GetFilters(stream.Dictionary, file.Resolve);
-            using DecodedStream decoded = StreamCodec.Decode(stream.Data, filters, DecodeDepth.Full, decodeLimit, file.Resolve);
+            using DecodedStream decoded = StreamCodec.Decode(stream.Data, filters, DecodeDepth.Full, decodeLimit, file.Resolve, file.Budget);
             if (decoded.Remaining.Count > 0 || decoded.PendingPredictor is not null) return null;
             return Parse(decoded.Data.ToArray());
         }

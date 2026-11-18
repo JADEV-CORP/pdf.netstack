@@ -48,7 +48,7 @@ public enum PdfPermissions
 }
 
 /// <summary>The supplied password matches neither the user nor the owner password.</summary>
-public sealed class PdfPasswordException : Exception
+public sealed class PdfPasswordException : PdfException
 {
     /// <summary>Creates the exception.</summary>
     public PdfPasswordException() : base("The password does not open this document.") { }

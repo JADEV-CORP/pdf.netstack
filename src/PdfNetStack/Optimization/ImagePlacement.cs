@@ -35,6 +35,9 @@ internal sealed class ImagePlacement
     private const long MaxOperations = 50_000_000;
     private const long MaxBytes = 1L << 30;
 
+    // Tokens the whole walk may read, damaged operands read again included: a few per operator.
+    private const long MaxTokens = 250_000_000;
+
     private readonly PdfFile _file;
     private readonly long _decodeLimit;
     private readonly CancellationToken _ct;
@@ -44,6 +47,7 @@ internal sealed class ImagePlacement
     private readonly HashSet<PdfDictionary> _taintedResources = [];
     private readonly HashSet<(int Number, long A, long B, long C, long D)> _walked = [];
     private readonly HashSet<int> _active = [];
+    private readonly ContentBudget _tokens = new(MaxTokens);
     private long _operations;
     private long _bytes;
     private bool _overBudget;
@@ -214,12 +218,13 @@ internal sealed class ImagePlacement
         if (_overBudget) return;
 
         Interpret(resources, ctm, depth);
-        var reader = new ContentReader(content);
+        var reader = new ContentReader(content, _tokens);
         var op = new ContentOperation();
         var saved = new Stack<PdfMatrix>();
         while (reader.Next(op))
         {
-            if (++_operations > MaxOperations)
+            // The run's operators also count against the document's budget, in batches.
+            if (++_operations > MaxOperations || (_operations % 1024 == 0 && _file.Budget?.TryChargeOperations(1024) == false))
             {
                 _overBudget = true;
                 return;
@@ -246,6 +251,8 @@ internal sealed class ImagePlacement
                     break;
             }
         }
+
+        if (reader.BudgetExhausted) _overBudget = true;
     }
 
     /// <summary>
@@ -399,7 +406,7 @@ internal sealed class ImagePlacement
         try
         {
             List<FilterSpec> filters = StreamCodec.GetFilters(stream.Dictionary, _file.Resolve);
-            using DecodedStream decoded = StreamCodec.Decode(stream.Data, filters, DecodeDepth.Full, _decodeLimit, _file.Resolve);
+            using DecodedStream decoded = StreamCodec.Decode(stream.Data, filters, DecodeDepth.Full, _decodeLimit, _file.Resolve, _file.Budget);
             if (decoded.Remaining.Count > 0 || decoded.PendingPredictor is not null) return null;
             return decoded.Data.ToArray();
         }
