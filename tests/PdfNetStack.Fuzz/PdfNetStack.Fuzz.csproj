@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <!-- Both frameworks the tests run on, which replay the seeds through every target. -->
+    <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
+    <IsPackable>false</IsPackable>
+    <AnalysisLevel>latest-minimum</AnalysisLevel>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Fuzzing only, MIT licensed, as is its dnlib dependency; nothing here ships in a package. -->
+    <PackageReference Include="SharpFuzz" Version="2.3.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="PdfNetStack.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\PdfNetStack\PdfNetStack.csproj" />
+    <ProjectReference Include="..\..\src\PdfNetStack.Html\PdfNetStack.Html.csproj" />
+  </ItemGroup>
+
+</Project>
