@@ -39,7 +39,7 @@ jobs:
 
       - name: Cache veraPDF
         id: cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/verapdf
           key: verapdf-greenfield-${{ env.VERAPDF_VERSION }}-${{ runner.os }}
