@@ -9,13 +9,16 @@ name: Release
 #   production environment, and the NUGET_USER secret holding the nuget.org user name (the
 #   profile name, not the email). No stored API key.
 # - Otherwise the NUGET_API_KEY repository secret.
+#
+# Every package and command line binary gets a build provenance attestation (verify one with
+# `gh attestation verify <file> --repo jams4code/pdf.netstack`), and every package a CycloneDX
+# SBOM attached to the GitHub release.
 on:
   push:
     tags: ['v*.*.*']
 
-permissions:
-  contents: write
-  id-token: write
+# Each job asks for what it needs.
+permissions: {}
 
 jobs:
   cli:
@@ -40,9 +43,11 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-dotnet@v6
+      - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
         with:
           dotnet-version: 10.0.x
 
@@ -71,7 +76,7 @@ jobs:
           "./${BINARY}" --help
           "./${BINARY}" inspect tests/PdfNetStack.Tests/Fixtures/Forms/form.pdf
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cli-${{ matrix.rid }}
           path: dist/*
@@ -82,14 +87,21 @@ jobs:
     runs-on: ubuntu-latest
     # Must match the environment in the nuget.org trusted publishing policy.
     environment: production
+    permissions:
+      contents: write # the GitHub release
+      id-token: write # NuGet trusted publishing and the attestations
+      attestations: write
     env:
       DOTNET_NOLOGO: true
       DOTNET_CLI_TELEMETRY_OPTOUT: true
       NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+      CYCLONEDX_VERSION: 6.3.1
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-dotnet@v6
+      - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
         with:
           dotnet-version: |
             8.0.x
@@ -126,6 +138,48 @@ jobs:
       - name: Pack
         run: dotnet pack PdfNetStack.sln -c Release --no-build -o artifacts -p:Version=${VERSION}
 
+      # One CycloneDX SBOM per package: its NuGet dependencies, per target framework, and the
+      # projects it is built from, from the restore this job just did. The trimming tasks run at
+      # build time only and ship in no package.
+      - name: SBOM
+        run: |
+          dotnet tool install CycloneDX --version "$CYCLONEDX_VERSION" --tool-path .tools
+          mkdir sbom
+          for project in src/*/*.csproj; do
+            properties=$(dotnet msbuild "$project" -getProperty:PackageId -getProperty:PackageVersion -p:Version="$VERSION")
+            id=$(jq -r .Properties.PackageId <<< "$properties")
+            version=$(jq -r .Properties.PackageVersion <<< "$properties")
+            type=Library
+            [[ "$id" == *.Tool ]] && type=Application
+            .tools/dotnet-CycloneDX "$project" --output sbom --filename "$id.$version.cdx.json" --output-format Json \
+              --set-name "$id" --set-version "$version" --set-type "$type" --include-project-references --set-nuget-purl \
+              --disable-package-restore --exclude-filter Microsoft.NET.ILLink.Tasks
+          done
+          ls -l sbom
+
+      - name: Command line binaries
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: cli-*
+          path: cli
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: cli
+        run: |
+          sha256sum pdfnetstack-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      # Signed statements, in GitHub's attestation store, that this workflow built these files
+      # from this commit. Made before anything is published, so a release never ships without them.
+      - name: Build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            artifacts/*.nupkg
+            artifacts/*.snupkg
+            cli/pdfnetstack-*
+
       - name: NuGet login (trusted publishing)
         if: env.NUGET_API_KEY == ''
         id: login
@@ -139,23 +193,10 @@ jobs:
           KEY: ${{ steps.login.outputs.NUGET_API_KEY || env.NUGET_API_KEY }}
         run: dotnet nuget push "artifacts/*.nupkg" --api-key "$KEY" --source https://api.nuget.org/v3/index.json --skip-duplicate
 
-      - name: Command line binaries
-        uses: actions/download-artifact@v8
-        with:
-          pattern: cli-*
-          path: cli
-          merge-multiple: true
-
-      - name: Checksums
-        working-directory: cli
-        run: |
-          sha256sum pdfnetstack-* > SHA256SUMS.txt
-          cat SHA256SUMS.txt
-
       - name: GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           flags=()
           [[ "$VERSION" == *-* ]] && flags+=(--prerelease)
-          gh release create "$GITHUB_REF_NAME" artifacts/* cli/* --title "PdfNetStack $VERSION" --notes-file release-notes.md "${flags[@]}"
+          gh release create "$GITHUB_REF_NAME" artifacts/* cli/* sbom/* --title "PdfNetStack $VERSION" --notes-file release-notes.md "${flags[@]}"

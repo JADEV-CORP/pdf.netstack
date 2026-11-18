@@ -36,6 +36,8 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="PdfNetStack.Tests" />
+    <!-- The fuzzing harness drives the decoders and parsers below the public API (tests/PdfNetStack.Fuzz). -->
+    <InternalsVisibleTo Include="PdfNetStack.Fuzz" />
     <InternalsVisibleTo Include="PdfNetStack.Cli" />
     <InternalsVisibleTo Include="PdfNetStack.Html" />
     <InternalsVisibleTo Include="PdfNetStack.Ocr" />
