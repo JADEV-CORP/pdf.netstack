@@ -197,11 +197,25 @@ internal sealed class EquivalenceVerifier
         if (CheckNewTags() is { } tagDifference) return tagDifference;
 
         // Filter parameters were resolved during the walk; stream content is compared in parallel.
+        // Each comparison holds both sides decoded at once, so it takes a share of the same memory
+        // budgets as the rewrite: per run and per process. Without that the proof, not the rewrite,
+        // set the peak on image heavy files.
         var jobs = _streams;
         string? failure = null;
+        var gate = new StreamRecompressor.MemoryGate(2 * _decodeLimit);
         Parallel.ForEach(jobs, new ParallelOptions { MaxDegreeOfParallelism = parallelism, CancellationToken = ct }, (job, state) =>
         {
-            string? d = CompareStreamData(job);
+            long share = gate.Enter(StreamRecompressor.ExpectedDecodedSize(_a, job.A, _decodeLimit) + StreamRecompressor.ExpectedDecodedSize(_b, job.B, _decodeLimit), ct);
+            string? d;
+            try
+            {
+                d = CompareStreamData(job);
+            }
+            finally
+            {
+                gate.Exit(share);
+            }
+
             if (d is not null)
             {
                 Interlocked.CompareExchange(ref failure, d, null);

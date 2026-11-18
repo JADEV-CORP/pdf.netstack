@@ -663,6 +663,13 @@ internal static class StreamRecompressor
         return Math.Min(size, decodeLimit);
     }
 
+    /// <summary>
+    /// What <paramref name="stream"/> is expected to decode to, by the same estimate as the rewrite's
+    /// own work, so the proof can hold its decoding to the same memory budgets.
+    /// </summary>
+    internal static long ExpectedDecodedSize(PdfFile file, PdfStream stream, long decodeLimit) =>
+        DecodedSize(file, stream.Dictionary, ImageLayout(file, stream.Dictionary), stream.EncodedLength, decodeLimit);
+
     /// <summary>Row layout of a raw image, used to try PNG prediction. Null when not applicable.</summary>
     private static PredictorParams? ImageLayout(PdfFile file, PdfDictionary d)
     {
