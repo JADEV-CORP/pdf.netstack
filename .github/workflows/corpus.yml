@@ -49,7 +49,7 @@ jobs:
       # are separate steps so a run that reports failures still keeps its downloads.
       - name: Restore the corpus
         id: restore
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: ${{ env.CORPUS_CACHE }}
           key: corpus-${{ hashFiles('eng/corpus/manifest.json') }}
@@ -62,7 +62,7 @@ jobs:
 
       - name: Save the corpus
         if: steps.restore.outputs.cache-hit != 'true' && steps.fetch.outcome == 'success'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: ${{ env.CORPUS_CACHE }}
           key: corpus-${{ hashFiles('eng/corpus/manifest.json') }}
@@ -123,7 +123,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends qpdf mupdf-tools ghostscript
 
       - name: Restore the corpus
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: ${{ env.CORPUS_CACHE }}
           key: corpus-${{ hashFiles('eng/corpus/manifest.json') }}
