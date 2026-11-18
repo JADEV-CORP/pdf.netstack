@@ -1370,6 +1370,7 @@ public sealed class PdfDocument : IDisposable
             Compression = options.Compression,
             UseObjectStreams = plan.Settings.UseObjectStreams,
             Verify = options.VerifyOptimization,
+            KeepMetadataUnfiltered = options.Conformance != PdfConformance.None,
         };
         (written, _) = PdfOptimizer.Optimize(written, optimizerOptions, ct);
         return Security.Target is { } encryption ? Encrypted(written, encryption, plan.Settings.UseObjectStreams, plan.Settings.CompressionLevel) : written;

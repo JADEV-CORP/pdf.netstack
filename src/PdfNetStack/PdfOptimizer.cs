@@ -45,20 +45,34 @@ public static partial class PdfOptimizer
         if (options.Streaming) return OptimizeStreaming(new Source(input), output, options, cancellationToken);
 
         var clock = Stopwatch.StartNew();
+        (ReadOnlyMemory<byte> written, PdfOptimizationResult result) = OptimizeInMemory(input, options, cancellationToken);
+        output.Write(written.Span);
+        return WithElapsed(result, clock);
+    }
+
+    /// <summary>
+    /// The in-memory run: the bytes to write, which are the input itself when it is kept, and the
+    /// result. Nothing is copied; each entry point writes or copies the bytes once, as it needs them.
+    /// </summary>
+    private static (ReadOnlyMemory<byte> Written, PdfOptimizationResult Result) OptimizeInMemory(ReadOnlyMemory<byte> input, PdfOptimizerOptions options, CancellationToken ct)
+    {
         string sourceHash = Sha256Hex(input.Span);
-        Outcome outcome = RunWithin(input, options, cancellationToken);
+        Outcome outcome = RunWithin(input, options, ct);
 
-        ReadOnlySpan<byte> written = outcome.Candidate is { } candidate ? candidate.Span : input.Span;
-        output.Write(written);
-        string outputHash = outcome.Candidate is null ? sourceHash : Sha256Hex(written);
-
-        OptimizationStatistics stats = (outcome.Statistics ?? OptimizationStatistics.Empty(TimeSpan.Zero)) with { Elapsed = clock.Elapsed };
-        return new PdfOptimizationResult(outcome.Disposition, input.Length, written.Length, sourceHash, outputHash,
+        ReadOnlyMemory<byte> written = outcome.Candidate ?? input;
+        string outputHash = outcome.Candidate is null ? sourceHash : Sha256Hex(written.Span);
+        OptimizationStatistics stats = outcome.Statistics ?? OptimizationStatistics.Empty(TimeSpan.Zero);
+        var result = new PdfOptimizationResult(outcome.Disposition, input.Length, written.Length, sourceHash, outputHash,
             outcome.PageCount, outcome.Reason, stats)
         {
             Diagnostics = outcome.Diagnostics,
         };
+        return (written, result);
     }
+
+    /// <summary>The result with the time since <paramref name="clock"/> started, writing the output included.</summary>
+    private static PdfOptimizationResult WithElapsed(PdfOptimizationResult result, Stopwatch clock) =>
+        result with { Statistics = result.Statistics with { Elapsed = clock.Elapsed } };
 
     /// <summary>
     /// <see cref="RunOnce"/> within <see cref="PdfLimits.Timeout"/>. Lossy work is the slow part, so
@@ -90,9 +104,20 @@ public static partial class PdfOptimizer
         CancellationToken cancellationToken = default)
     {
         Compat.ThrowIfNull(input, nameof(input));
-        using var output = new MemoryStream();
-        PdfOptimizationResult result = Optimize(input, output, options, cancellationToken);
-        return (output.ToArray(), result);
+        options ??= PdfOptimizerOptions.Default;
+        if (options.Streaming)
+        {
+            using var output = new MemoryStream();
+            PdfOptimizationResult streamed = Optimize(input, output, options, cancellationToken);
+            return (output.ToArray(), streamed);
+        }
+
+        // The rewrite is copied once, to an array of its exact size; a kept input is copied too, so
+        // the caller never holds the array it passed in.
+        options.Validate();
+        var clock = Stopwatch.StartNew();
+        (ReadOnlyMemory<byte> written, PdfOptimizationResult result) = OptimizeInMemory(input, options, cancellationToken);
+        return (written.ToArray(), WithElapsed(result, clock));
     }
 
     /// <summary>Reads <paramref name="input"/> to the end, optimizes it and writes to <paramref name="output"/>.</summary>
@@ -123,8 +148,10 @@ public static partial class PdfOptimizer
 
 #pragma warning disable CA1835 // Array overloads keep one code path for .NET Standard 2.0.
         // Buffer at most MaxInputBytes. Anything larger is streamed through untouched without
-        // ever being held in memory, as the in-memory path would return it unchanged anyway.
-        using var buffer = new MemoryStream();
+        // ever being held in memory, as the in-memory path would return it unchanged anyway. A
+        // seekable input of known length gets its buffer at once, rather than by doubling.
+        long known = input.CanSeek ? input.Length - input.Position : 0;
+        using var buffer = new MemoryStream(known > 0 && known <= Math.Min(options.MaxInputBytes, Compat.MaxArrayLength) ? (int)known : 0);
         byte[] chunk = new byte[81920];
         int read;
         while ((read = await input.ReadAsync(chunk, 0, chunk.Length, cancellationToken).ConfigureAwait(false)) > 0)
@@ -147,11 +174,13 @@ public static partial class PdfOptimizer
         }
 
 #pragma warning restore CA1835
-        using var result = new MemoryStream();
-        PdfOptimizationResult r = Optimize(buffer.GetBuffer().AsMemory(0, (int)buffer.Length), result, options, cancellationToken);
-        result.Position = 0;
-        await result.CopyToAsync(output, 81920, cancellationToken).ConfigureAwait(false);
-        return r;
+
+        // The rewrite goes to the output as it lies in memory, without a copy into another stream.
+        options.Validate();
+        var clock = Stopwatch.StartNew();
+        (ReadOnlyMemory<byte> written, PdfOptimizationResult r) = OptimizeInMemory(buffer.GetBuffer().AsMemory(0, (int)buffer.Length), options, cancellationToken);
+        await Compat.WriteAsync(output, written, cancellationToken).ConfigureAwait(false);
+        return WithElapsed(r, clock);
     }
 
     /// <summary>
@@ -275,6 +304,9 @@ public static partial class PdfOptimizer
             }
 
             bool pdfA1 = IsPdfA1(file, options.MaxDecodedStreamBytes);
+            bool objectStreams = options.UseObjectStreams && !pdfA1;
+            string version = OutputVersion(file.HeaderVersion, objectStreams);
+            bool progressive = options.ProgressiveJpeg && AllowsProgressiveJpeg(version) && (!options.Linearize || AllowsProgressiveJpeg(LinearizedVersion(file.HeaderVersion)));
             int stripped = graph.StrippedEntries + (usageRightsRemoved ? 1 : 0);
             timings = timings with { Analyze = phase.Elapsed };
             phase.Restart();
@@ -305,11 +337,11 @@ public static partial class PdfOptimizer
             RecompressionCounts recompressed = new(0, 0, []);
             if (options.RecompressStreams || compact.Count > 0)
             {
-                JpegSettings? jpeg = options.OptimizeJpegImages ? new JpegSettings(options.JpegQuality, options.ProgressiveJpeg, options.MinImageSsim) : null;
+                JpegSettings? jpeg = options.OptimizeJpegImages ? new JpegSettings(options.JpegQuality, progressive, options.MinImageSsim) : null;
                 ImageSettings? images = options.MaxImageDpi is not null || options.MaxBilevelImageDpi is not null || options.ConvertImagesToJpeg || options.QuantizeImages
-                    ? new ImageSettings(options.MaxImageDpi, options.ConvertImagesToJpeg, options.JpegQuality, options.MinImageSsim, options.ProgressiveJpeg) { Quantize = options.QuantizeImages, MaxBilevelDpi = options.MaxBilevelImageDpi }
+                    ? new ImageSettings(options.MaxImageDpi, options.ConvertImagesToJpeg, options.JpegQuality, options.MinImageSsim, progressive) { Quantize = options.QuantizeImages, MaxBilevelDpi = options.MaxBilevelImageDpi }
                     : null;
-                var scope = new RecompressionScope(options.RecompressStreams, compact, encoded, options.DeduplicateObjects);
+                var scope = new RecompressionScope(options.RecompressStreams, compact, encoded, options.DeduplicateObjects) { KeepMetadataUnfiltered = pdfA1 || options.KeepMetadataUnfiltered };
                 recompressed = StreamRecompressor.Run(file, graph, scope, options.ZlibLevel, options.Compression == CompressionEffort.Exhaustive, options.UseImagePredictors,
                     options.OptimizeBilevelImages, jpeg, images, options.MaxDecodedStreamBytes, options.Workers, ct);
 
@@ -320,11 +352,12 @@ public static partial class PdfOptimizer
             timings = timings with { Recompress = phase.Elapsed };
             phase.Restart();
 
+            // The obsolete XObject /Name is ignored when merging, unless the output stays PDF 1.0.
             Dictionary<int, int> representative;
-            int merged = 0;
+            int merged = 0, namesRemoved = 0;
             if (options.DeduplicateObjects)
             {
-                (representative, merged) = Deduplicator.Run(file, graph, recompressed.ContentHashes, ct);
+                (representative, merged, namesRemoved) = Deduplicator.Run(file, graph, recompressed.ContentHashes, ignoreXObjectNames: version != "1.0", ct);
             }
             else
             {
@@ -355,11 +388,10 @@ public static partial class PdfOptimizer
 
             if (file.Resolve(file.Trailer["ID"]) is PdfArray id) trailer.Set("ID", id);
 
-            bool objectStreams = options.UseObjectStreams && !pdfA1;
-            var settings = new WriterSettings(objectStreams, options.ObjectsPerStream,
-                OutputVersion(file.HeaderVersion, objectStreams), options.ZlibLevel)
+            var settings = new WriterSettings(objectStreams, options.ObjectsPerStream, version, options.ZlibLevel)
             {
                 Exhaustive = options.Compression == CompressionEffort.Exhaustive,
+                Parallelism = options.Workers,
             };
             ReadOnlyMemory<byte> candidate;
             bool linearized = false;
@@ -433,6 +465,7 @@ public static partial class PdfOptimizer
                     AllowFontMerging = fontsMerged > 0,
                     AllowInheritedAttributes = pushedDown,
                     AllowBilevelRecoding = recompressed.Group4 > 0,
+                    AllowXObjectNameRemoval = namesRemoved > 0,
                 };
                 string? difference = EquivalenceVerifier.Verify(reference, written, rules, options.MaxDecodedStreamBytes,
                     options.Workers, ct, out int compared);
@@ -664,6 +697,10 @@ public static partial class PdfOptimizer
             ? header
             : "1.5";
     }
+
+    /// <summary>Progressive JPEG (DCTDecode) arrived with PDF 1.3; output at an earlier version keeps sequential coding.</summary>
+    private static bool AllowsProgressiveJpeg(string version) =>
+        decimal.TryParse(version, NumberStyles.AllowDecimalPoint, CultureInfo.InvariantCulture, out decimal v) && v >= 1.3m;
 
     /// <summary>Linearization arrived with PDF 1.2.</summary>
     private static string LinearizedVersion(string header) =>

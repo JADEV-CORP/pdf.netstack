@@ -276,6 +276,9 @@ public static partial class PdfOptimizer
             }
 
             bool pdfA1 = IsPdfA1(file, options.MaxDecodedStreamBytes);
+            bool objectStreams = options.UseObjectStreams && !pdfA1;
+            string version = OutputVersion(file.HeaderVersion, objectStreams);
+            bool progressive = options.ProgressiveJpeg && AllowsProgressiveJpeg(version) && (!options.Linearize || AllowsProgressiveJpeg(LinearizedVersion(file.HeaderVersion)));
             int stripped = graph.StrippedEntries + (usageRightsRemoved ? 1 : 0);
             timings = timings with { Analyze = phase.Elapsed };
             phase.Restart();
@@ -306,11 +309,11 @@ public static partial class PdfOptimizer
             var contentKeys = new Dictionary<int, byte[]>();
             if (options.RecompressStreams || compact.Count > 0)
             {
-                JpegSettings? jpeg = options.OptimizeJpegImages ? new JpegSettings(options.JpegQuality, options.ProgressiveJpeg, options.MinImageSsim) : null;
+                JpegSettings? jpeg = options.OptimizeJpegImages ? new JpegSettings(options.JpegQuality, progressive, options.MinImageSsim) : null;
                 ImageSettings? images = options.MaxImageDpi is not null || options.MaxBilevelImageDpi is not null || options.ConvertImagesToJpeg || options.QuantizeImages
-                    ? new ImageSettings(options.MaxImageDpi, options.ConvertImagesToJpeg, options.JpegQuality, options.MinImageSsim, options.ProgressiveJpeg) { Quantize = options.QuantizeImages, MaxBilevelDpi = options.MaxBilevelImageDpi }
+                    ? new ImageSettings(options.MaxImageDpi, options.ConvertImagesToJpeg, options.JpegQuality, options.MinImageSsim, progressive) { Quantize = options.QuantizeImages, MaxBilevelDpi = options.MaxBilevelImageDpi }
                     : null;
-                var scope = new RecompressionScope(options.RecompressStreams, compact, encoded, options.DeduplicateObjects);
+                var scope = new RecompressionScope(options.RecompressStreams, compact, encoded, options.DeduplicateObjects) { KeepMetadataUnfiltered = pdfA1 || options.KeepMetadataUnfiltered };
                 work = StreamRecompressor.Prepare(file, graph, scope, options.ZlibLevel, options.Compression == CompressionEffort.Exhaustive, options.UseImagePredictors,
                     options.OptimizeBilevelImages, jpeg, images, options.MaxDecodedStreamBytes, ct);
                 if (options.DeduplicateObjects) contentKeys = ContentKeys(work, options.Workers, ct);
@@ -319,11 +322,12 @@ public static partial class PdfOptimizer
             timings = timings with { Recompress = phase.Elapsed };
             phase.Restart();
 
+            // The obsolete XObject /Name is ignored when merging, unless the output stays PDF 1.0.
             Dictionary<int, int> representative;
-            int merged = 0;
+            int merged = 0, namesRemoved = 0;
             if (options.DeduplicateObjects)
             {
-                (representative, merged) = Deduplicator.Run(file, graph, contentKeys, ct);
+                (representative, merged, namesRemoved) = Deduplicator.Run(file, graph, contentKeys, ignoreXObjectNames: version != "1.0", ct);
             }
             else
             {
@@ -356,11 +360,10 @@ public static partial class PdfOptimizer
 
             if (file.Resolve(file.Trailer["ID"]) is PdfArray id) trailer.Set("ID", id);
 
-            bool objectStreams = options.UseObjectStreams && !pdfA1;
-            var settings = new WriterSettings(objectStreams, options.ObjectsPerStream,
-                OutputVersion(file.HeaderVersion, objectStreams), options.ZlibLevel)
+            var settings = new WriterSettings(objectStreams, options.ObjectsPerStream, version, options.ZlibLevel)
             {
                 Exhaustive = options.Compression == CompressionEffort.Exhaustive,
+                Parallelism = options.Workers,
             };
 
             Func<int, PdfStream, PdfStream>? rewrite = work is null
@@ -443,6 +446,7 @@ public static partial class PdfOptimizer
                     AllowContentCompaction = compact.Count > 0,
                     AllowFontMerging = fontsMerged > 0,
                     AllowBilevelRecoding = recompressed.Group4 > 0,
+                    AllowXObjectNameRemoval = namesRemoved > 0,
                 };
                 string? difference = EquivalenceVerifier.Verify(reference, written, rules, options.MaxDecodedStreamBytes,
                     options.Workers, ct, out int compared);

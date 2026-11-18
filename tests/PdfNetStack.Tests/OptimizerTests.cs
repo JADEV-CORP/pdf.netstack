@@ -46,6 +46,70 @@ public sealed class OptimizerTests
     }
 
     [TestMethod]
+    public void ObjectStreamsHoldAlikeObjectsTogetherInNumberOrder()
+    {
+        // Annotations and fonts alternate in the order given; packed, each kind is contiguous.
+        var objects = new List<PdfObject>();
+        for (int i = 0; i < 6; i++)
+        {
+            objects.Add(new PdfDictionary { ["Type"] = new PdfName("Annot"), ["Subtype"] = new PdfName("Link") });
+            objects.Add(new PdfDictionary { ["Type"] = new PdfName("Font"), ["BaseFont"] = new PdfName("F" + i) });
+        }
+
+        objects.Add(PdfArray.Of(1, 2, 3));
+        List<int> grouped = Writing.PdfDocumentWriter.GroupByKind([.. Enumerable.Range(1, objects.Count)], objects);
+        CollectionAssert.AreEqual(new[] { 1, 3, 5, 7, 9, 11, 2, 4, 6, 8, 10, 12, 13 }, grouped);
+
+        // In a rewrite, the objects of each object stream are numbered one after another, so the
+        // cross-reference rows stay regular, and the file proves equal to its source.
+        PdfBuilder b = PdfBuilder.Simple("one", "two", "three", "four", "five");
+        b.SetStream(4, "", Repeat("0 0 m 100 100 l S\n", 200));
+        byte[] input = b.Build();
+        (byte[] output, PdfOptimizationResult result) = Run(input, NoThreshold with { ObjectsPerStream = 4 });
+        AssertOptimizedAndEquivalent(input, output, result);
+        PdfFile file = Open(output);
+        int streams = 0;
+        foreach ((int number, XrefEntry entry) in file.Xref)
+        {
+            if (entry.Type != XrefEntryType.InFile || file.GetObject(number) is not PdfStream { } stream || stream.Dictionary.GetName("Type") != "ObjStm") continue;
+            streams++;
+            using Filters.DecodedStream decoded = Filters.StreamCodec.Decode(stream.Data, Filters.StreamCodec.GetFilters(stream.Dictionary, file.Resolve), Filters.DecodeDepth.Full, 1 << 20, file.Resolve);
+            int first = (int)((PdfNumber)stream.Dictionary["First"]!).ToDouble();
+            int[] header = [.. Encoding.ASCII.GetString(decoded.Data.Span[..first]).Split(' ', StringSplitOptions.RemoveEmptyEntries).Select(int.Parse)];
+            for (int k = 2; k < header.Length; k += 2) Assert.AreEqual(header[k - 2] + 1, header[k]);
+        }
+
+        Assert.IsGreaterThan(1, streams);
+    }
+
+    [TestMethod]
+    public void BytesInAreNeverTheBytesOut()
+    {
+        byte[] input = PdfBuilder.Simple("x").Build();
+        (byte[] output, PdfOptimizationResult result) = PdfOptimizer.Optimize(input, new PdfOptimizerOptions { MinSavingPercent = 99 });
+        Assert.AreEqual(OptimizationDisposition.OriginalRetained, result.Disposition);
+        CollectionAssert.AreEqual(input, output);
+        Assert.AreNotSame(input, output, "The caller's array is never handed back.");
+    }
+
+    [TestMethod]
+    public void WorkersWaitForTheMemoryGate()
+    {
+        var gate = new StreamRecompressor.MemoryGate(100);
+
+        // A share larger than the budget is cut to it and runs alone.
+        long whole = gate.Enter(1000, CancellationToken.None);
+        Assert.AreEqual(100, whole);
+        Task<long> waiting = Task.Run(() => gate.Enter(10, CancellationToken.None));
+        Assert.IsFalse(waiting.Wait(300), "A second share waits while the budget is spent.");
+        gate.Exit(whole);
+        Assert.IsTrue(waiting.Wait(10_000));
+        Assert.AreEqual(10, waiting.Result);
+        gate.Exit(waiting.Result);
+        Assert.AreEqual(0, gate.Enter(0, CancellationToken.None));
+    }
+
+    [TestMethod]
     public void UnreachableObjectsAreRemoved()
     {
         PdfBuilder b = PdfBuilder.Simple("x");
@@ -152,6 +216,55 @@ public sealed class OptimizerTests
 
         AssertOptimizedAndEquivalent(input, output, result);
         StringAssert.Contains(Compat.Latin1.GetString(output), "/Predictor 15");
+    }
+
+    [TestMethod]
+    [DataRow(10, true)]
+    [DataRow(2, true)]
+    [DataRow(15, false)]
+    public void ProducerPredictorsAreChosenAgain(int predictor, bool streaming)
+    {
+        // Every row is one noisy pattern, a step brighter than the row above: the Up filter leaves
+        // almost nothing, while the producer's rows (PNG filter None, or TIFF differences along
+        // the row) keep the noise.
+        const int width = 300, height = 80;
+        var pattern = new byte[width];
+        new Random(4).NextBytes(pattern);
+        var samples = new byte[width * height];
+        for (int y = 0; y < height; y++)
+        {
+            for (int x = 0; x < width; x++) samples[(y * width) + x] = (byte)(pattern[x] + y);
+        }
+
+        byte[] predicted;
+        if (predictor == 2)
+        {
+            predicted = (byte[])samples.Clone();
+            for (int y = 0; y < height; y++)
+            {
+                for (int x = width - 1; x > 0; x--) predicted[(y * width) + x] -= samples[(y * width) + x - 1];
+            }
+        }
+        else
+        {
+            predicted = new byte[height * (width + 1)];
+            for (int y = 0; y < height; y++) samples.AsSpan(y * width, width).CopyTo(predicted.AsSpan((y * (width + 1)) + 1));
+        }
+
+        var b = PdfBuilder.Simple("x");
+        int image = b.AddStream($"/Type/XObject/Subtype/Image/Width {width}/Height {height}/ColorSpace/DeviceGray/BitsPerComponent 8/Filter/FlateDecode/DecodeParms<</Predictor {predictor}/Columns {width}>>", PdfBuilder.Deflate(predicted));
+        b.Set(5, $"<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]/Resources<</XObject<</I {image} 0 R>>>>/Contents 4 0 R>>");
+        b.SetStream(4, "", "q 300 0 0 80 0 0 cm /I Do Q"u8.ToArray());
+        byte[] input = b.Build();
+
+        (byte[] output, PdfOptimizationResult result) = Run(input, NoThreshold with { Streaming = streaming });
+
+        AssertOptimizedAndEquivalent(input, output, result);
+        PdfFile file = Open(output);
+        var page = file.ResolveDictionary(file.GetObject(FindPage(file)))!;
+        var written = (PdfStream)file.Resolve(file.ResolveDictionary(file.ResolveDictionary(page["Resources"])!["XObject"])!["I"])!;
+        Assert.AreEqual(15.0, ((PdfNumber)((PdfDictionary)written.Dictionary["DecodeParms"]!)["Predictor"]!).ToDouble(), "Rows predicted afresh win.");
+        Assert.IsLessThan(Filters.StreamCodec.Deflate(predicted, Compat.MaximumCompression).Length, written.Data.Length, "Smaller than the producer's rows at the same level.");
     }
 
     [TestMethod]
@@ -354,6 +467,31 @@ public sealed class OptimizerTests
         Assert.AreEqual(-1, text.IndexOf("/ObjStm", StringComparison.Ordinal));
         StringAssert.Contains(text, "xref\n0 ");
         StringAssert.Contains(text, "pdfaid:part='1'");
+    }
+
+    [TestMethod]
+    [DataRow("1", false, false)]
+    [DataRow("2", true, false)]
+    [DataRow("2", true, true)]
+    [DataRow(null, true, false)]
+    public void UnfilteredMetadataIsCompressedOutsidePdfA1(string? part, bool compressed, bool streaming)
+    {
+        PdfBuilder b = PdfBuilder.Simple("metadata");
+        string identification = part is null ? "" : $"<rdf:Description xmlns:pdfaid='http://www.aiim.org/pdfa/ns/id/' pdfaid:part='{part}' pdfaid:conformance='B'/>";
+        string xmp = "<?xpacket begin='' id='W5M0MpCehiHzreSzNTczkc9d'?><x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF>" + identification
+            + string.Concat(Enumerable.Repeat("<rdf:Description xmlns:dc='http://purl.org/dc/elements/1.1/'><dc:format>application/pdf</dc:format></rdf:Description>", 40))
+            + "</rdf:RDF></x:xmpmeta>" + new string(' ', 2000) + "<?xpacket end='w'?>";
+        int meta = b.AddStream("/Type/Metadata/Subtype/XML", Encoding.ASCII.GetBytes(xmp));
+        b.Set(1, $"<</Type/Catalog/Pages 2 0 R/Metadata {meta} 0 R>>");
+        byte[] input = b.Build();
+
+        (byte[] output, PdfOptimizationResult result) = Run(input, NoThreshold with { Streaming = streaming });
+
+        AssertOptimizedAndEquivalent(input, output, result);
+        PdfFile file = Open(output);
+        var metadata = (PdfStream)file.Resolve(file.ResolveDictionary(file.Trailer["Root"])!["Metadata"])!;
+        Assert.AreEqual(compressed, metadata.Dictionary["Filter"] is not null, "PDF/A-1 forbids a filter on metadata (ISO 19005-1, 6.7.2); nothing else does.");
+        Assert.AreEqual(!compressed, Compat.Latin1.GetString(output).Contains("<?xpacket begin", StringComparison.Ordinal));
     }
 
     [TestMethod]
