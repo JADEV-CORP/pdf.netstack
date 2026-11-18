@@ -772,9 +772,40 @@ See [docs/FIDELITY.md](docs/FIDELITY.md) for the full method and its limits.
 
 ## Results
 
-Measured on a mixed real world corpus of 1,296 files (569 MiB): invoices, reports, manuals,
-scanned documents, presentations and a 631 page spare parts catalogue, on an 8 core Windows
-machine with default options.
+### Public corpus, against qpdf and Ghostscript
+
+77 openly licensed and public domain PDFs that anyone can download: NIST and NASA publications,
+arXiv papers, government gazettes and test files from other PDF projects, listed in
+[eng/corpus/manifest.json](eng/corpus/manifest.json). [tools/compare_optimizers.py](tools/compare_optimizers.py)
+runs PdfNetStack with the library defaults next to the other tools and scores every output on
+size, on rendering in PDFium and on what it kept: tags, form fields, outlines, attachments,
+signatures, usage rights and PDF/A conformance. CI runs it every week and for every release,
+with MuPDF too. Measured on 18 November 2026 with qpdf 12.4.2 and Ghostscript 10.05, on the 76
+files PDFium can open:
+
+| Tool | Saved | Outputs that keep quality |
+|---|---:|---:|
+| PdfNetStack, lossless (defaults) | 11.2% | 76 of 76 |
+| qpdf, lossless | 5.7% | 64 of 76 |
+| PdfNetStack, `Balanced` preset | 21.8% | 76 of 76 |
+| PdfNetStack, `Smallest` preset | 33.3% | 73 of 76 |
+| Ghostscript, `/ebook` | 32.1% | 23 of 76 |
+
+qpdf's 12 outputs below the bar broke the signatures of 6 files and the usage rights of 2
+forms, wrote object streams into 3 PDF/A-1b files (PDF/A-1 is based on PDF 1.4, which has
+none) and lost the outline of a damaged file. On the 64 files where both keep quality,
+PdfNetStack's output is 8% smaller in total (154.1 MiB against 167.6 MiB). qpdf is smaller on
+18 of them: 15 that PdfNetStack keeps as they are by default (7 with incremental updates, 2
+encrypted, 1 that needed repair, 5 where the rewrite saved less than 1%) and 3 real gaps. With
+`AllowIncrementalUpdates` the 7 files go from 7.2 MiB to 5.5 MiB. Ghostscript's output falls
+below the bar on 53 files: changed text or page geometry, lost form fields, tags, annotations
+or signatures.
+
+### Private corpus
+
+Measured for version 1.0 on a mixed real world corpus of 1,296 files (569 MiB) that is not
+public: invoices, reports, manuals, scanned documents, presentations and a 631 page spare parts
+catalogue, on an 8 core Windows machine with default options.
 
 | | |
 |---|---|

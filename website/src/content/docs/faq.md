@@ -15,7 +15,7 @@ faq:
   - q: Is the compression lossless?
     a: Yes, by default. Text, vectors, fonts, images, annotations, forms, bookmarks, structure tags, metadata and attachments are carried over, and every output is compared to its source before it is returned. Lossy changes happen only when you ask for them, as JPEG requantization with JpegQuality, and from 1.1 image downsampling with MaxImageDpi and conversion of raw photographs to JPEG, both checked against the source and optionally held back by a perceptual quality gate.
   - q: How much smaller do files get?
-    a: On a mixed corpus of 1,296 real world files, the 1,003 files that were optimized went from 568.9 MiB to 469.0 MiB, 17.6% saved, with zero differing pixels at 150 DPI. Image heavy files often gain 20 to 40%. Files from producers that already use object streams gain little.
+    a: On a public corpus of 77 openly licensed PDFs, with default options, PdfNetStack saved 11.2% losslessly, against 5.7% for qpdf, and every output kept quality. On a private corpus of 1,296 real world files, the 1,003 files that were optimized went from 568.9 MiB to 469.0 MiB, 17.6% saved, with zero differing pixels at 150 DPI. Image heavy files often gain 20 to 40%. Files from producers that already use object streams gain little.
   - q: What happens with encrypted or signed PDFs?
     a: The optimizer returns them byte for byte, because rewriting would break the encryption or the signatures. The editing API opens encrypted files with a password and keeps their protection on save. Saving a signed document in full invalidates its signatures; from version 1.1, SaveIncremental appends the changes after the signed bytes and keeps them valid.
   - q: Can PdfNetStack render PDF pages to images?
