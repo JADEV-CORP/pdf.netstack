@@ -536,13 +536,197 @@ public sealed class PdfDocument : IDisposable
     }
 
     /// <summary>Creates a document holding all pages of the given documents, in order.</summary>
-    public static PdfDocument Merge(IEnumerable<PdfDocument> documents)
+    /// <remarks>
+    /// Form fields come along with their widgets. A tagged source keeps its tags: the part of its
+    /// structure tree that tags the pages is copied with them, its role map, class map and IDs
+    /// merged and renamed where they clash, and its language kept, on the merged document when it
+    /// is the first, else on its top level structure elements. Untagged sources add untagged
+    /// pages without breaking the tree of tagged ones. Outlines, named destinations and other
+    /// document level entries of the sources are not merged. The sources are not changed and must
+    /// stay open until the merge returns.
+    /// </remarks>
+    public static PdfDocument Merge(IEnumerable<PdfDocument> documents) => Merge(documents, null, CancellationToken.None);
+
+    /// <summary>Creates a document holding all pages of the given documents, in order, as <see cref="Merge(IEnumerable{PdfDocument})"/> does.</summary>
+    /// <param name="documents">The documents whose pages to copy.</param>
+    /// <param name="cancellationToken">Observed before each document and while its pages and their objects are copied.</param>
+    /// <exception cref="OperationCanceledException">Cancelled before the merge completed; nothing is returned.</exception>
+    public static PdfDocument Merge(IEnumerable<PdfDocument> documents, CancellationToken cancellationToken) => Merge(documents, null, cancellationToken);
+
+    /// <summary>
+    /// Creates a document holding all pages of the given documents, in order, as
+    /// <see cref="Merge(IEnumerable{PdfDocument})"/> does, reporting progress after each document.
+    /// </summary>
+    /// <param name="documents">The documents whose pages to copy.</param>
+    /// <param name="progress">Receives the pages merged so far out of all pages, once per document. May be null.</param>
+    /// <param name="cancellationToken">Observed before each document and while its pages and their objects are copied.</param>
+    /// <exception cref="OperationCanceledException">Cancelled before the merge completed; nothing is returned.</exception>
+    public static PdfDocument Merge(IEnumerable<PdfDocument> documents, IProgress<PdfProgress>? progress, CancellationToken cancellationToken = default)
     {
         Compat.ThrowIfNull(documents, nameof(documents));
+        List<PdfDocument> sources = [.. documents];
+        int total = sources.Sum(d => d.Pages.Count), done = 0;
         PdfDocument result = Create();
-        foreach (PdfDocument source in documents) result.Pages.Import(source.Pages);
+        foreach (PdfDocument source in sources)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            result.Pages.Import(source.Pages, null, cancellationToken);
+            done += source.Pages.Count;
+            progress?.Report(new PdfProgress(done, total));
+        }
+
         return result;
     }
+
+    /// <summary>
+    /// Merges PDFs read from streams into one written to <paramref name="output"/>, as
+    /// <see cref="Merge(IEnumerable{PdfDocument})"/> merges documents, holding one input at a time.
+    /// Each input stream is disposed as soon as it is read.
+    /// </summary>
+    /// <param name="inputs">The PDFs to merge, in order, each read from its position to its end.</param>
+    /// <param name="output">Receives the merged PDF from its position. It is flushed, not disposed.</param>
+    /// <param name="cancellationToken">Observed while each input is read and copied and while the output is written.</param>
+    /// <exception cref="PdfFormatException">An input is not a readable PDF.</exception>
+    /// <exception cref="PdfPasswordException">An input is encrypted and cannot be opened without a password.</exception>
+    /// <exception cref="OperationCanceledException">Cancelled; what reached <paramref name="output"/> is not a complete file.</exception>
+    public static Task MergeAsync(IEnumerable<Stream> inputs, Stream output, CancellationToken cancellationToken = default) =>
+        MergeAsync(inputs, output, null, null, cancellationToken);
+
+    /// <summary>
+    /// Merges PDFs read from streams into one written to <paramref name="output"/>, as
+    /// <see cref="Merge(IEnumerable{PdfDocument})"/> merges documents, holding one input at a time.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Inputs are taken from <paramref name="inputs"/> one by one, so an enumeration that opens
+    /// each stream as it is reached, such as <c>paths.Select(File.OpenRead)</c>, has one input
+    /// open at a time. Each is read to its end, asynchronously, and disposed straight away unless
+    /// <see cref="PdfMergeOptions.LeaveInputsOpen"/> is set; its pages are copied and the input
+    /// document is released before the next input is read. By default inputs are opened on demand
+    /// (<see cref="PdfLoadMode.OnDemand"/>), so only the objects the pages use are parsed, and a
+    /// large input is spooled to a temporary file that is deleted once its pages are copied.
+    /// </para>
+    /// <para>
+    /// The merged document is then saved as <see cref="SaveAsync(Stream, PdfSaveOptions?, CancellationToken)"/>
+    /// saves it. It holds a copy of every page's objects until it is written. With the default
+    /// save options the whole output is also built and optimized in memory; set
+    /// <see cref="PdfSaveOptions.Optimize"/> to false in <see cref="PdfMergeOptions.SaveOptions"/>
+    /// to write it progressively.
+    /// </para>
+    /// <para>
+    /// When an input fails to open, the exception propagates; inputs not reached yet are not
+    /// enumerated, and nothing is written to <paramref name="output"/>.
+    /// </para>
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// string[] paths = ["a.pdf", "b.pdf", "c.pdf"];
+    /// await using FileStream output = File.Create("merged.pdf");
+    /// await PdfDocument.MergeAsync(paths.Select(File.OpenRead), output, cancellationToken);
+    /// </code>
+    /// </example>
+    /// <param name="inputs">The PDFs to merge, in order, each read from its position to its end.</param>
+    /// <param name="output">Receives the merged PDF from its position. It is flushed, not disposed.</param>
+    /// <param name="options">How inputs are opened and handed back and how the output is saved; <see cref="PdfMergeOptions.Default"/> when null.</param>
+    /// <param name="progress">
+    /// Receives the inputs merged so far after each one, out of how many there are when
+    /// <paramref name="inputs"/> is a collection, else out of an unknown total. May be null.
+    /// </param>
+    /// <param name="cancellationToken">Observed while each input is read and copied and while the output is written.</param>
+    /// <exception cref="ArgumentException"><paramref name="inputs"/> holds a null stream or one that cannot be read.</exception>
+    /// <exception cref="PdfFormatException">An input is not a readable PDF.</exception>
+    /// <exception cref="PdfPasswordException">An input is encrypted and the load options' password does not open it.</exception>
+    /// <exception cref="OperationCanceledException">Cancelled; what reached <paramref name="output"/> is not a complete file.</exception>
+    public static async Task MergeAsync(IEnumerable<Stream> inputs, Stream output, PdfMergeOptions? options, IProgress<PdfProgress>? progress = null, CancellationToken cancellationToken = default)
+    {
+        Compat.ThrowIfNull(inputs, nameof(inputs));
+        Compat.ThrowIfNull(output, nameof(output));
+        options ??= PdfMergeOptions.Default;
+        PdfLoadOptions load = options.LoadOptions ?? PdfMergeOptions.OnDemand;
+        int? total = inputs switch
+        {
+            IReadOnlyCollection<Stream> c => c.Count,
+            ICollection<Stream> c => c.Count,
+            _ => null,
+        };
+
+        PdfDocument result = Create();
+        int done = 0;
+        foreach (Stream input in inputs)
+        {
+            if (input is null) throw new ArgumentException("The inputs hold a null stream.", nameof(inputs));
+            cancellationToken.ThrowIfCancellationRequested();
+            PdfDocument source;
+            try
+            {
+                source = await OpenAsync(input, load, cancellationToken).ConfigureAwait(false);
+            }
+            finally
+            {
+                // Opening reads the input to its end; it is not needed after that.
+                if (!options.LeaveInputsOpen) await DisposeAsync(input).ConfigureAwait(false);
+            }
+
+            using (source)
+            {
+                result.Pages.Import(source.Pages, null, cancellationToken);
+
+                // The copies hold their own data; the source and its parsed objects can go.
+                result.ForgetImporter(source);
+            }
+
+            done++;
+            progress?.Report(new PdfProgress(done, total));
+        }
+
+        await result.SaveAsync(output, options.SaveOptions, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static Task DisposeAsync(Stream stream)
+    {
+#if NET8_0_OR_GREATER
+        return stream.DisposeAsync().AsTask();
+#else
+        stream.Dispose();
+        return Task.CompletedTask;
+#endif
+    }
+
+    /// <summary>
+    /// Copies <paramref name="count"/> pages from <paramref name="start"/> into a new document,
+    /// with their resources, annotations, form fields and structure tags; this document is not
+    /// changed. Dispose the result when done with it.
+    /// </summary>
+    /// <param name="start">Zero based index of the first page.</param>
+    /// <param name="count">How many pages to copy.</param>
+    /// <param name="cancellationToken">Observed while the pages and their objects are copied.</param>
+    /// <exception cref="ArgumentOutOfRangeException">The pages are not all in the document.</exception>
+    /// <exception cref="OperationCanceledException">Cancelled before the copy completed.</exception>
+    public PdfDocument ExtractPages(int start, int count, CancellationToken cancellationToken = default)
+    {
+        if (start < 0 || start > Pages.Count) throw new ArgumentOutOfRangeException(nameof(start), start, "The start is not a page of the document.");
+        if (count < 0 || count > Pages.Count - start) throw new ArgumentOutOfRangeException(nameof(count), count, "The pages run past the end of the document.");
+        PdfDocument result = Create();
+        result.Pages.Import([.. Pages.Skip(start).Take(count)], null, cancellationToken);
+        return result;
+    }
+
+#if NET8_0_OR_GREATER
+    /// <summary>
+    /// Copies the pages in <paramref name="range"/> into a new document, as
+    /// <see cref="ExtractPages(int, int, CancellationToken)"/> does: <c>doc.ExtractPages(..3)</c>
+    /// copies the first three pages, <c>doc.ExtractPages(^2..)</c> the last two.
+    /// </summary>
+    /// <param name="range">The pages, by zero based index.</param>
+    /// <param name="cancellationToken">Observed while the pages and their objects are copied.</param>
+    /// <exception cref="ArgumentOutOfRangeException">The range is not within the document.</exception>
+    /// <exception cref="OperationCanceledException">Cancelled before the copy completed.</exception>
+    public PdfDocument ExtractPages(Range range, CancellationToken cancellationToken = default)
+    {
+        (int offset, int length) = range.GetOffsetAndLength(Pages.Count);
+        return ExtractPages(offset, length, cancellationToken);
+    }
+#endif
 
     /// <summary>
     /// Flattens the annotations of every page: each one's appearance becomes page content and the
@@ -556,16 +740,180 @@ public sealed class PdfDocument : IDisposable
     /// doc.Save("reviewed-flat.pdf");
     /// </code>
     /// </example>
-    public int FlattenAnnotations(PdfFlattenOptions? options = null) => Pages.Sum(page => page.Annotations.Flatten(options));
+    public int FlattenAnnotations(PdfFlattenOptions? options = null) => FlattenAnnotations(options, null, CancellationToken.None);
 
-    /// <summary>Returns one new document per page.</summary>
-    public IEnumerable<PdfDocument> Split()
+    /// <summary>Flattens the annotations of every page as <see cref="FlattenAnnotations(PdfFlattenOptions?)"/> does, stopping when cancelled.</summary>
+    /// <param name="options">Which annotations to flatten besides markup; null for the defaults.</param>
+    /// <param name="cancellationToken">Observed before each page. Pages done before it fires stay flattened.</param>
+    /// <exception cref="OperationCanceledException">Cancelled before every page was flattened.</exception>
+    public int FlattenAnnotations(PdfFlattenOptions? options, CancellationToken cancellationToken) => FlattenAnnotations(options, null, cancellationToken);
+
+    /// <summary>
+    /// Flattens the annotations of every page as <see cref="FlattenAnnotations(PdfFlattenOptions?)"/>
+    /// does, reporting progress after each page.
+    /// </summary>
+    /// <param name="options">Which annotations to flatten besides markup; null for the defaults.</param>
+    /// <param name="progress">Receives the pages done out of all pages, after each page. May be null.</param>
+    /// <param name="cancellationToken">Observed before each page. Pages done before it fires stay flattened.</param>
+    /// <exception cref="OperationCanceledException">Cancelled before every page was flattened.</exception>
+    public int FlattenAnnotations(PdfFlattenOptions? options, IProgress<PdfProgress>? progress, CancellationToken cancellationToken = default)
     {
+        int flattened = 0, done = 0, total = Pages.Count;
         foreach (PdfPage page in Pages.ToList())
         {
-            PdfDocument single = Create();
-            single.Pages.Import([page]);
-            yield return single;
+            cancellationToken.ThrowIfCancellationRequested();
+            flattened += page.Annotations.Flatten(options);
+            done++;
+            progress?.Report(new PdfProgress(done, total));
+        }
+
+        return flattened;
+    }
+
+    /// <summary>Returns one new document per page, made as the enumeration reaches it.</summary>
+    /// <remarks>
+    /// <para>
+    /// Each part is a new document the caller owns: dispose every one, for instance with a
+    /// <c>using</c> declaration in the loop. Parts are made lazily, one per step of the
+    /// enumeration, so a loop that saves and disposes each part holds one at a time; collecting
+    /// them with <c>ToList()</c> holds them all. Each part has its own copy of the resources its
+    /// page uses, and the page's form fields and structure tags. This document is not changed and
+    /// must stay open until the enumeration ends.
+    /// </para>
+    /// <para>
+    /// To write the parts straight to files or other streams, use
+    /// <see cref="SplitTo(Func{int, Stream}, PdfSaveOptions?, IProgress{PdfProgress}?, CancellationToken)"/>.
+    /// </para>
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// int number = 1;
+    /// foreach (PdfDocument part in doc.Split())
+    /// {
+    ///     using (part) part.Save($"page-{number++}.pdf");
+    /// }
+    /// </code>
+    /// </example>
+    public IEnumerable<PdfDocument> Split() => Split(null, CancellationToken.None);
+
+    /// <summary>Returns one new document per page, as <see cref="Split()"/> does, stopping when cancelled.</summary>
+    /// <param name="cancellationToken">Observed before each part and while its page is copied.</param>
+    /// <exception cref="OperationCanceledException">Cancelled; parts already returned stay the caller's to dispose.</exception>
+    public IEnumerable<PdfDocument> Split(CancellationToken cancellationToken) => Split(null, cancellationToken);
+
+    /// <summary>Returns one new document per page, as <see cref="Split()"/> does, reporting each part as it is made.</summary>
+    /// <param name="progress">Receives the parts made so far out of the page count, as each is made. May be null.</param>
+    /// <param name="cancellationToken">Observed before each part and while its page is copied.</param>
+    /// <exception cref="OperationCanceledException">Cancelled; parts already returned stay the caller's to dispose.</exception>
+    public IEnumerable<PdfDocument> Split(IProgress<PdfProgress>? progress, CancellationToken cancellationToken = default)
+    {
+        int done = 0;
+        foreach (PdfDocument part in SplitParts(cancellationToken))
+        {
+            done++;
+            progress?.Report(new PdfProgress(done, Pages.Count));
+            yield return part;
+        }
+    }
+
+    /// <summary>
+    /// Writes each page as a PDF of its own to the stream <paramref name="createOutput"/> returns
+    /// for it, holding one part at a time. Returns how many parts were written.
+    /// </summary>
+    /// <remarks>
+    /// Each part is saved as <see cref="Save(Stream, PdfSaveOptions?)"/> saves, then its stream is
+    /// disposed before the next one is asked for, which commits it for streams such as zip
+    /// entries, files and blob uploads. A <see cref="MemoryStream"/> still returns its bytes
+    /// through <see cref="MemoryStream.ToArray"/> once disposed. When a part fails or the token
+    /// fires, the stream asked for last is disposed and holds no complete file.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// using var zip = new ZipArchive(File.Create("pages.zip"), ZipArchiveMode.Create);
+    /// doc.SplitTo(i => zip.CreateEntry($"page-{i + 1}.pdf").Open());
+    /// </code>
+    /// </example>
+    /// <param name="createOutput">Called with each zero based page index; returns a writable stream for that page's PDF.</param>
+    /// <param name="options">Save options for every part; <see cref="PdfSaveOptions.Default"/> when null.</param>
+    /// <param name="progress">Receives the parts written so far out of the page count, after each part. May be null.</param>
+    /// <param name="cancellationToken">Observed before each part, while its page is copied and while it is saved.</param>
+    /// <exception cref="InvalidOperationException"><paramref name="createOutput"/> returned null.</exception>
+    /// <exception cref="OperationCanceledException">Cancelled; parts written before stay written.</exception>
+    public int SplitTo(Func<int, Stream> createOutput, PdfSaveOptions? options = null, IProgress<PdfProgress>? progress = null, CancellationToken cancellationToken = default)
+    {
+        Compat.ThrowIfNull(createOutput, nameof(createOutput));
+        int written = 0;
+        foreach (PdfDocument part in SplitParts(cancellationToken))
+        {
+            using (part)
+            {
+                using Stream output = createOutput(written) ?? throw new InvalidOperationException("The output factory returned no stream.");
+                part.Save(output, options, cancellationToken);
+            }
+
+            written++;
+            progress?.Report(new PdfProgress(written, Pages.Count));
+        }
+
+        return written;
+    }
+
+    /// <summary>
+    /// Writes each page as a PDF of its own to the stream <paramref name="createOutput"/> returns
+    /// for it, as <see cref="SplitTo(Func{int, Stream}, PdfSaveOptions?, IProgress{PdfProgress}?, CancellationToken)"/>
+    /// does, writing and disposing each stream asynchronously.
+    /// </summary>
+    /// <param name="createOutput">Called with each zero based page index; returns a writable stream for that page's PDF.</param>
+    /// <param name="options">Save options for every part; <see cref="PdfSaveOptions.Default"/> when null.</param>
+    /// <param name="progress">Receives the parts written so far out of the page count, after each part. May be null.</param>
+    /// <param name="cancellationToken">Observed before each part, while its page is copied and while it is saved.</param>
+    /// <exception cref="InvalidOperationException"><paramref name="createOutput"/> returned null.</exception>
+    /// <exception cref="OperationCanceledException">Cancelled; parts written before stay written.</exception>
+    public async Task<int> SplitToAsync(Func<int, Stream> createOutput, PdfSaveOptions? options = null, IProgress<PdfProgress>? progress = null, CancellationToken cancellationToken = default)
+    {
+        Compat.ThrowIfNull(createOutput, nameof(createOutput));
+        int written = 0;
+        foreach (PdfDocument part in SplitParts(cancellationToken))
+        {
+            using (part)
+            {
+                Stream output = createOutput(written) ?? throw new InvalidOperationException("The output factory returned no stream.");
+                try
+                {
+                    await part.SaveAsync(output, options, cancellationToken).ConfigureAwait(false);
+                }
+                finally
+                {
+                    await DisposeAsync(output).ConfigureAwait(false);
+                }
+            }
+
+            written++;
+            progress?.Report(new PdfProgress(written, Pages.Count));
+        }
+
+        return written;
+    }
+
+    /// <summary>
+    /// The parts of a split, one per page, made lazily. The structure tree is read once for all
+    /// parts, and no part keeps a link to this document once made.
+    /// </summary>
+    private IEnumerable<PdfDocument> SplitParts(CancellationToken ct)
+    {
+        StructureIndex? structure = null;
+        bool structureRead = false;
+        foreach (PdfPage page in Pages.ToList())
+        {
+            ct.ThrowIfCancellationRequested();
+            PdfDocument part = Create();
+            PageImporter importer = part.ImporterFor(this);
+            if (structureRead) importer.UseSourceStructure(structure);
+            else structure = importer.SourceStructure(ct);
+            structureRead = true;
+            part.Pages.Import([page], null, ct);
+            part.ForgetImporter(this);
+            yield return part;
         }
     }
 
@@ -593,7 +941,7 @@ public sealed class PdfDocument : IDisposable
     }
 
     /// <summary>
-    /// Saves the document as a new single revision PDF, the same bytes <see cref="ToArray"/>
+    /// Saves the document as a new single revision PDF, the same bytes <see cref="ToArray(PdfSaveOptions?)"/>
     /// returns for the same options.
     /// </summary>
     /// <remarks>
@@ -616,18 +964,32 @@ public sealed class PdfDocument : IDisposable
     /// not a complete file.
     /// </para>
     /// </remarks>
-    public void Save(Stream stream, PdfSaveOptions? options = null)
+    public void Save(Stream stream, PdfSaveOptions? options = null) => Save(stream, options, CancellationToken.None);
+
+    /// <summary>
+    /// Saves the document as <see cref="Save(Stream, PdfSaveOptions?)"/> does, stopping when
+    /// <paramref name="cancellationToken"/> fires.
+    /// </summary>
+    /// <param name="stream">Receives the PDF from its current position.</param>
+    /// <param name="options">Save options; <see cref="PdfSaveOptions.Default"/> when null.</param>
+    /// <param name="cancellationToken">
+    /// Observed before each object is written and, when optimizing, between and within the
+    /// optimizer's passes. When it fires, what reached the stream is not a complete file.
+    /// </param>
+    /// <exception cref="OperationCanceledException">Cancelled before the file was written.</exception>
+    public void Save(Stream stream, PdfSaveOptions? options, CancellationToken cancellationToken)
     {
         Compat.ThrowIfNull(stream, nameof(stream));
         options ??= PdfSaveOptions.Default;
+        cancellationToken.ThrowIfCancellationRequested();
         if (options.Optimize)
         {
-            stream.Write(Build(options, CancellationToken.None));
+            stream.Write(Build(options, cancellationToken));
             return;
         }
 
         SavePlan plan = PlanSave(options);
-        foreach (ReadOnlyMemory<byte> chunk in PdfDocumentWriter.WriteChunks(plan.Objects, plan.Trailer, plan.Map, plan.Settings))
+        foreach (ReadOnlyMemory<byte> chunk in PdfDocumentWriter.WriteChunks(plan.Objects, plan.Trailer, plan.Map, plan.Settings, ct: cancellationToken))
         {
             stream.Write(chunk.Span);
         }
@@ -988,6 +1350,12 @@ public sealed class PdfDocument : IDisposable
     /// in the instance id and time their metadata records.
     /// </summary>
     public byte[] ToArray(PdfSaveOptions? options = null) => Build(options ?? PdfSaveOptions.Default, CancellationToken.None);
+
+    /// <summary>The saved document as bytes, as <see cref="ToArray(PdfSaveOptions?)"/> returns them, stopping when cancelled.</summary>
+    /// <param name="options">Save options; <see cref="PdfSaveOptions.Default"/> when null.</param>
+    /// <param name="cancellationToken">Observed before each object is written and, when optimizing, between and within the optimizer's passes.</param>
+    /// <exception cref="OperationCanceledException">Cancelled before the file was built.</exception>
+    public byte[] ToArray(PdfSaveOptions? options, CancellationToken cancellationToken) => Build(options ?? PdfSaveOptions.Default, cancellationToken);
 
     /// <summary>The whole file in memory: written, then optimized and encrypted as the options say.</summary>
     private byte[] Build(PdfSaveOptions options, CancellationToken ct)
@@ -1385,6 +1753,9 @@ public sealed class PdfDocument : IDisposable
         PdfStream s => s.Dictionary,
         _ => null,
     };
+
+    /// <summary>Drops the importer for <paramref name="source"/>, so this document no longer keeps it reachable.</summary>
+    internal void ForgetImporter(PdfDocument source) => _importers.Remove(source);
 
     internal PageImporter ImporterFor(PdfDocument source)
     {

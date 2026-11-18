@@ -40,6 +40,10 @@ internal abstract class ContentInterpreter
     // Operators are charged to the document's budget in batches, and the deadline read as often.
     private const int Batch = 1024;
 
+    // Operators read between two looks at the cancellation token: often enough to stop within a
+    // millisecond or so, rarely enough that the check never shows next to parsing.
+    private const int CancellationInterval = 256;
+
     private readonly Stack<(PdfMatrix Ctm, TextState Text, PdfMatrix TextMatrix, PdfMatrix LineMatrix)> _saved = new();
     private readonly HashSet<PdfStream> _activeForms = [];
 
@@ -78,6 +82,11 @@ internal abstract class ContentInterpreter
     /// </summary>
     protected PdfMatrix TextMatrix { get; private set; } = PdfMatrix.Identity;
 
+    /// <summary>
+    /// Stops the walk with <see cref="OperationCanceledException"/> once cancelled: looked at
+    /// before each stream is decoded and every few hundred operators.
+    /// </summary>
+    public CancellationToken Cancellation { get; set; }
 
     /// <summary>Walks a page's content streams, in order, with the page's resources.</summary>
     /// <exception cref="PdfLimitExceededException">The walk ran past <see cref="PdfLimits.Timeout"/>.</exception>
@@ -181,6 +190,7 @@ internal abstract class ContentInterpreter
     {
         long left = Document.DecodeLimit - _bytes;
         if (left <= 0 || _stopped) return null;
+        Cancellation.ThrowIfCancellationRequested();
         try
         {
             byte[] data = Document.GetStreamData(stream, left);
@@ -222,6 +232,7 @@ internal abstract class ContentInterpreter
         while (!_stopped && reader.Next(op))
         {
             if (!Count()) break;
+            if (_operations % CancellationInterval == 0) Cancellation.ThrowIfCancellationRequested();
             List<PdfObject> o = op.Operands;
             switch (op.Operator)
             {

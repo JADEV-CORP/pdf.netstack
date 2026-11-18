@@ -33,12 +33,14 @@ internal ref struct JpegReader
     private int _eobRun;
 
     private readonly long _maxPixels;
+    private readonly CancellationToken _ct;
 
-    private JpegReader(ReadOnlySpan<byte> data, long limit, long maxPixels)
+    private JpegReader(ReadOnlySpan<byte> data, long limit, long maxPixels, CancellationToken ct)
     {
         _data = data;
         _limit = limit;
         _maxPixels = maxPixels;
+        _ct = ct;
     }
 
     private enum ScanMode
@@ -52,8 +54,10 @@ internal ref struct JpegReader
 
     /// <param name="coefficientByteLimit">Ceiling for the coefficient buffers, two bytes per coefficient.</param>
     /// <param name="maxPixels">Ceiling for the image area.</param>
+    /// <param name="ct">Observed every 1024 MCUs of each scan.</param>
     /// <exception cref="JpegFormatException">The data is damaged, too large or uses an unsupported coding process.</exception>
-    public static JpegImage Read(ReadOnlySpan<byte> data, long coefficientByteLimit, long maxPixels = long.MaxValue) => new JpegReader(data, coefficientByteLimit, maxPixels).ReadImage();
+    public static JpegImage Read(ReadOnlySpan<byte> data, long coefficientByteLimit, long maxPixels = long.MaxValue, CancellationToken ct = default) =>
+        new JpegReader(data, coefficientByteLimit, maxPixels, ct).ReadImage();
 
     private JpegImage ReadImage()
     {
@@ -356,6 +360,7 @@ internal ref struct JpegReader
         int mcus = components.Length == 1 ? single.BlocksPerLine * single.BlocksPerColumn : image.McusPerLine * image.McusPerColumn;
         for (int mcu = 0; mcu < mcus; mcu++)
         {
+            if ((mcu & 1023) == 0) _ct.ThrowIfCancellationRequested();
             if (_restartInterval > 0 && mcu > 0 && mcu % _restartInterval == 0)
             {
                 Restart(ref nextRestart);

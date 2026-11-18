@@ -181,11 +181,12 @@ internal static class Jpeg2000Decoder
     /// </summary>
     /// <param name="bandRows">Rows reconstructed together, or 0 to choose by width.</param>
     /// <param name="maxPixels">Ceiling for the image area.</param>
+    /// <param name="ct">Observed before each tile and each band of rows.</param>
     /// <exception cref="Jpeg2000FormatException">The data is damaged, too large or unsupported.</exception>
-    public static (Raster? Raster, ColorSpace? Space) DecodeForPdf(byte[] data, ColorSpace? space, long byteLimit, int bandRows = 0, long maxPixels = ImageSamples.MaxPixels) =>
-        Guarded(() => Pdf(data, space, byteLimit, bandRows, maxPixels));
+    public static (Raster? Raster, ColorSpace? Space) DecodeForPdf(byte[] data, ColorSpace? space, long byteLimit, int bandRows = 0, long maxPixels = ImageSamples.MaxPixels, CancellationToken ct = default) =>
+        Guarded(() => Pdf(data, space, byteLimit, bandRows, maxPixels, ct));
 
-    private static (Raster? Raster, ColorSpace? Space) Pdf(byte[] data, ColorSpace? space, long byteLimit, int bandRows, long maxPixels)
+    private static (Raster? Raster, ColorSpace? Space) Pdf(byte[] data, ColorSpace? space, long byteLimit, int bandRows, long maxPixels, CancellationToken ct)
     {
         bool keepIndexes = space?.IsIndexed == true, indexed = keepIndexes;
         (Jpeg2000Codestream stream, Jp2Header? header) = Open(data, maxPixels);
@@ -216,7 +217,7 @@ internal static class Jpeg2000Decoder
         if (sycc && !ordered.Take(3).All(c => stream.Components[c.Component].Dx == stream.Components[ordered[0].Component].Dx
             && stream.Components[c.Component].Dy == stream.Components[ordered[0].Component].Dy))
         {
-            int[][] planes = Planes(stream, byteLimit, bandRows);
+            int[][] planes = Planes(stream, byteLimit, bandRows, ct);
             Jpeg2000Image decoded = Assemble(stream, planes, header, applyPalette: !keepIndexes);
             List<Jpeg2000Channel> all = [.. decoded.Channels.Where(c => !c.Opacity), .. decoded.Channels.Where(c => c.Opacity)];
             var whole = new Jpeg2000Image { X0 = image.X0, Y0 = image.Y0, Width = image.Width, Height = image.Height, Channels = all, ColorSpace = image.ColorSpace };
@@ -228,7 +229,7 @@ internal static class Jpeg2000Decoder
         if (outputBytes > Compat.MaxArrayLength) throw new Jpeg2000FormatException("The image is too large.");
         if (ordered.Take(count).Any(c => c.Width <= 0 || c.Height <= 0)) throw new Jpeg2000FormatException("A channel has no samples.");
         var sink = new RasterSink(colorFirst, count, scale: !indexed, sycc);
-        Decode(stream, sink, byteLimit, outputBytes, bandRows, sink.Allocate);
+        Decode(stream, sink, byteLimit, outputBytes, bandRows, sink.Allocate, ct);
         return (sink.Raster, space);
     }
 
@@ -262,7 +263,7 @@ internal static class Jpeg2000Decoder
         ch.Count >= 3 && ch[0].Width == ch[1].Width && ch[0].Width == ch[2].Width && ch[0].Height == ch[1].Height && ch[0].Height == ch[2].Height;
 
     /// <summary>The image's components as planes at component resolution.</summary>
-    private static int[][] Planes(Jpeg2000Codestream stream, long byteLimit, int bandRows)
+    private static int[][] Planes(Jpeg2000Codestream stream, long byteLimit, int bandRows, CancellationToken ct = default)
     {
         Jpeg2000Component[] components = stream.Components;
         int n = components.Length;
@@ -275,7 +276,7 @@ internal static class Jpeg2000Decoder
         }
 
         var sink = new PlaneSink(stream);
-        Decode(stream, sink, byteLimit, planeBytes, bandRows, sink.Allocate);
+        Decode(stream, sink, byteLimit, planeBytes, bandRows, sink.Allocate, ct);
         return sink.Planes;
     }
 
@@ -286,7 +287,7 @@ internal static class Jpeg2000Decoder
     /// <summary>Decodes every tile into the sink, within <paramref name="byteLimit"/> bytes with the sink's own.</summary>
     /// <param name="sinkBytes">What the sink holds.</param>
     /// <param name="allocate">Allocates the sink's buffers once the first check has passed.</param>
-    private static void Decode(Jpeg2000Codestream stream, ISink sink, long byteLimit, long sinkBytes, int bandRows, Action allocate)
+    private static void Decode(Jpeg2000Codestream stream, ISink sink, long byteLimit, long sinkBytes, int bandRows, Action allocate, CancellationToken ct)
     {
         long workingLimit = byteLimit - sinkBytes;
 
@@ -310,7 +311,8 @@ internal static class Jpeg2000Decoder
         long blockLimit = Math.Max(4096, byteLimit / 128);
         for (int t = 0; t < stream.Tiles.Length; t++)
         {
-            if (stream.Tiles[t] is Jpeg2000TileParts parts) DecodeTile(stream, t, parts, sink, block, buffers, blockLimit, workingLimit, bandRows);
+            ct.ThrowIfCancellationRequested();
+            if (stream.Tiles[t] is Jpeg2000TileParts parts) DecodeTile(stream, t, parts, sink, block, buffers, blockLimit, workingLimit, bandRows, ct);
         }
     }
 
@@ -322,7 +324,7 @@ internal static class Jpeg2000Decoder
     }
 
     private static void DecodeTile(
-        Jpeg2000Codestream stream, int t, Jpeg2000TileParts parts, ISink sink, Jpeg2000BlockDecoder block, Jpeg2000Buffers buffers, long blockLimit, long workingLimit, int bandRows)
+        Jpeg2000Codestream stream, int t, Jpeg2000TileParts parts, ISink sink, Jpeg2000BlockDecoder block, Jpeg2000Buffers buffers, long blockLimit, long workingLimit, int bandRows, CancellationToken ct)
     {
         Jpeg2000Parameters main = stream.Main, tile = parts.Parameters;
         Jpeg2000Parameters general = tile.HasCod ? tile : main;
@@ -415,6 +417,8 @@ internal static class Jpeg2000Decoder
         for (int c = 0; c < n; c++) bands[c].Values = synthesis[c] is null ? null : buffers.Get<int>(Jpeg2000Buffers.Key(c, 0, Jpeg2000Buffers.Shifted), (long)tcs[c].Width * Math.Min(tcs[c].Height, rows));
         for (int y = 0; y < tallest; y += rows)
         {
+            // Code-blocks are decoded as the rows that need them are reconstructed, so this also bounds entropy decoding.
+            ct.ThrowIfCancellationRequested();
             for (int c = 0; c < n; c++)
             {
                 Jpeg2000TileComponent tc = tcs[c];

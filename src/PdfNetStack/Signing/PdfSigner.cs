@@ -148,14 +148,32 @@ public static class PdfSigner
     /// <exception cref="ArgumentException">The certificate has no usable private key.</exception>
     /// <exception cref="NotSupportedException">The document is encrypted.</exception>
     /// <exception cref="CryptographicException">A timestamp was requested and the authority refused it or replied with an invalid token.</exception>
-    public static byte[] Sign(byte[] pdf, X509Certificate2 certificate, PdfSignatureOptions? options = null)
+    public static byte[] Sign(byte[] pdf, X509Certificate2 certificate, PdfSignatureOptions? options = null) => Sign(pdf, certificate, options, CancellationToken.None);
+
+    /// <summary>Signs <paramref name="pdf"/> as <see cref="Sign(byte[], X509Certificate2, PdfSignatureOptions?)"/> does, stopping when cancelled.</summary>
+    /// <param name="pdf">The document to sign.</param>
+    /// <param name="certificate">The signer's certificate, with its private key.</param>
+    /// <param name="options">Field, appearance, timestamp and the rest; null for the defaults.</param>
+    /// <param name="cancellationToken">
+    /// Observed once the document is read, before the time stamp authority is asked and before
+    /// the signature is computed. A request to the authority already sent is not interrupted:
+    /// the application's delegate behind <see cref="PdfTimestampClient"/> makes it, and can take
+    /// a token of its own.
+    /// </param>
+    /// <exception cref="ArgumentException">The certificate has no usable private key.</exception>
+    /// <exception cref="NotSupportedException">The document is encrypted.</exception>
+    /// <exception cref="CryptographicException">A timestamp was requested and the authority refused it or replied with an invalid token.</exception>
+    /// <exception cref="OperationCanceledException">Cancelled; nothing was signed.</exception>
+    public static byte[] Sign(byte[] pdf, X509Certificate2 certificate, PdfSignatureOptions? options, CancellationToken cancellationToken)
     {
         Compat.ThrowIfNull(pdf, nameof(pdf));
         Compat.ThrowIfNull(certificate, nameof(certificate));
         options ??= new PdfSignatureOptions();
         if (!certificate.HasPrivateKey) throw new ArgumentException("The certificate has no private key.", nameof(certificate));
+        cancellationToken.ThrowIfCancellationRequested();
 
         var update = new IncrementalUpdate(pdf);
+        cancellationToken.ThrowIfCancellationRequested();
         PdfDocument doc = update.Doc;
         DateTimeOffset when = options.SigningTime ?? DateTimeOffset.UtcNow;
 
@@ -170,7 +188,12 @@ public static class PdfSigner
         int reserve = 8192 + certificate.RawData.Length + chain.Sum(c => c.Length) + (options.Timestamp?.ReservedSize ?? 0);
         HashAlgorithmName hash = HashName(options.Digest);
         PdfTimestampClient? tsa = options.Timestamp;
-        Func<byte[], byte[]>? stamp = tsa is null ? null : value => tsa.GetToken(value);
+        Func<byte[], byte[]>? stamp = tsa is null ? null : value =>
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return tsa.GetToken(value);
+        };
+        cancellationToken.ThrowIfCancellationRequested();
         return update.Seal(
             new IncrementalUpdate.Placeholder(signatureNumber, "/Type/Sig/Filter/Adobe.PPKLite/SubFilter/ETSI.CAdES.detached", reserve, sink =>
             {
@@ -187,7 +210,7 @@ public static class PdfSigner
 
     /// <summary>
     /// Adds a document timestamp (/DocTimeStamp, an RFC 3161 token with SubFilter ETSI.RFC3161)
-    /// over the whole file in an incremental update. After <see cref="AddValidationData"/> this
+    /// over the whole file in an incremental update. After <see cref="AddValidationData(byte[], IPdfRevocationSource, IReadOnlyList{X509Certificate2}?)"/> this
     /// makes a PAdES B-LTA document; repeating both later extends its life before the algorithms
     /// or certificates involved weaken or expire.
     /// </summary>
@@ -226,13 +249,32 @@ public static class PdfSigner
     /// <exception cref="InvalidOperationException">The document has no readable signature or timestamp.</exception>
     /// <exception cref="NotSupportedException">The document is encrypted.</exception>
     /// <exception cref="PdfFormatException">The document's certificates and validation data need an unreasonable number of signature checks.</exception>
-    public static byte[] AddValidationData(byte[] pdf, IPdfRevocationSource revocation, IReadOnlyList<X509Certificate2>? certificates = null)
+    public static byte[] AddValidationData(byte[] pdf, IPdfRevocationSource revocation, IReadOnlyList<X509Certificate2>? certificates = null) =>
+        AddValidationData(pdf, revocation, certificates, CancellationToken.None);
+
+    /// <summary>
+    /// Adds long term validation data as
+    /// <see cref="AddValidationData(byte[], IPdfRevocationSource, IReadOnlyList{X509Certificate2}?)"/>
+    /// does, stopping when cancelled. Fetching revocation data for many certificates can take long.
+    /// </summary>
+    /// <param name="pdf">A signed or timestamped document.</param>
+    /// <param name="revocation">Supplies OCSP responses and CRLs; <see cref="PdfRevocationValues.None"/> to embed certificates only.</param>
+    /// <param name="certificates">Extra certificates for the chains, such as intermediate and root CAs.</param>
+    /// <param name="cancellationToken">
+    /// Observed before each signature's chains are built and before each certificate's revocation
+    /// data is asked for. A request already handed to <paramref name="revocation"/> is not interrupted.
+    /// </param>
+    /// <exception cref="InvalidOperationException">The document has no readable signature or timestamp.</exception>
+    /// <exception cref="NotSupportedException">The document is encrypted.</exception>
+    /// <exception cref="PdfFormatException">The document's certificates and validation data need an unreasonable number of signature checks.</exception>
+    /// <exception cref="OperationCanceledException">Cancelled; nothing was added.</exception>
+    public static byte[] AddValidationData(byte[] pdf, IPdfRevocationSource revocation, IReadOnlyList<X509Certificate2>? certificates, CancellationToken cancellationToken)
     {
         Compat.ThrowIfNull(pdf, nameof(pdf));
         Compat.ThrowIfNull(revocation, nameof(revocation));
         try
         {
-            return CollectValidationData(pdf, revocation, certificates, new SignatureChecks());
+            return CollectValidationData(pdf, revocation, certificates, new SignatureChecks(), cancellationToken);
         }
         catch (SignatureChecks.ExhaustedException e)
         {
@@ -240,7 +282,7 @@ public static class PdfSigner
         }
     }
 
-    private static byte[] CollectValidationData(byte[] pdf, IPdfRevocationSource revocation, IReadOnlyList<X509Certificate2>? certificates, SignatureChecks checks)
+    private static byte[] CollectValidationData(byte[] pdf, IPdfRevocationSource revocation, IReadOnlyList<X509Certificate2>? certificates, SignatureChecks checks, CancellationToken ct)
     {
         var update = new IncrementalUpdate(pdf);
         PdfDocument doc = update.Doc;
@@ -281,6 +323,7 @@ public static class PdfSigner
         var fetched = new Dictionary<string, (List<PdfObject> Ocsps, List<PdfObject> Crls, List<X509Certificate2> Responders)>();
         foreach ((string key, List<X509Certificate2> leaves) in signatures)
         {
+            ct.ThrowIfCancellationRequested();
             var certs = new List<PdfObject>();
             var ocsps = new List<PdfObject>();
             var crls = new List<PdfObject>();
@@ -299,6 +342,7 @@ public static class PdfSigner
 
                     if (!fetched.TryGetValue(id, out var found))
                     {
+                        ct.ThrowIfCancellationRequested();
                         found = Fetch(store, revocation, cert, chain[i + 1], pool, checks);
                         fetched[id] = found;
                     }
@@ -319,7 +363,7 @@ public static class PdfSigner
     }
 
     /// <summary>Checks every signature of a file: byte range, digest and cryptographic validity, and any timestamp.</summary>
-    public static IReadOnlyList<PdfSignatureInfo> Verify(byte[] pdf) => Verify(pdf, null);
+    public static IReadOnlyList<PdfSignatureInfo> Verify(byte[] pdf) => Verify(pdf, null, CancellationToken.None);
 
     /// <summary>
     /// Checks every signature and document timestamp of a file and, with
@@ -329,14 +373,30 @@ public static class PdfSigner
     /// the qualified status the certificate claims. Certificates are checked at the time of a valid
     /// timestamp when there is one, else now, unless the options set a time.
     /// </summary>
-    public static IReadOnlyList<PdfSignatureInfo> Verify(byte[] pdf, PdfValidationOptions? options)
+    public static IReadOnlyList<PdfSignatureInfo> Verify(byte[] pdf, PdfValidationOptions? options) => Verify(pdf, options, CancellationToken.None);
+
+    /// <summary>
+    /// Checks every signature and document timestamp of a file as
+    /// <see cref="Verify(byte[], PdfValidationOptions?)"/> does, stopping when cancelled. A file
+    /// with many signatures, validated against revocation data, can take long.
+    /// </summary>
+    /// <param name="pdf">The signed file.</param>
+    /// <param name="options">Certificate validation options; null checks the signatures only.</param>
+    /// <param name="cancellationToken">
+    /// Observed once the file is read and before each signature. A revocation request already
+    /// handed to the application's source is not interrupted.
+    /// </param>
+    /// <exception cref="OperationCanceledException">Cancelled; no result is returned.</exception>
+    public static IReadOnlyList<PdfSignatureInfo> Verify(byte[] pdf, PdfValidationOptions? options, CancellationToken cancellationToken)
     {
         Compat.ThrowIfNull(pdf, nameof(pdf));
+        cancellationToken.ThrowIfCancellationRequested();
         PdfDocument doc = PdfDocument.Open(pdf);
         CertificateValidator? validator = options is null ? null : new CertificateValidator(options, options.UseDocumentSecurityStore ? SecurityStore.Read(doc) : new SecurityStore());
         var results = new List<PdfSignatureInfo>();
         foreach (PdfSignatureField field in doc.Form.Fields.OfType<PdfSignatureField>())
         {
+            cancellationToken.ThrowIfCancellationRequested();
             if (doc.Resolve(field.Dictionary["V"]) is not PdfDictionary sig) continue;
             var info = new PdfSignatureInfo
             {
