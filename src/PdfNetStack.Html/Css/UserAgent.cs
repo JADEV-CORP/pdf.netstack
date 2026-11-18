@@ -19,7 +19,7 @@ internal static class UserAgent
         dd { margin-left: 40px }
         address, i, cite, dfn, em, var { font-style: italic }
         b, strong, th { font-weight: bold }
-        center { text-align: center }
+        center { text-align: -webkit-center }
 
         h1 { margin-top: 0.67em; margin-bottom: 0.67em; font-size: 2em }
         h2 { margin-top: 0.83em; margin-bottom: 0.83em; font-size: 1.5em }

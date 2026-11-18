@@ -31,10 +31,42 @@ internal static class CssParser
 {
     private const int MaxDepth = 64;
 
-    public static List<CssRule> ParseStyleSheet(string css)
+    public static List<CssRule> ParseStyleSheet(string css) => ParseStyleSheet(css, null);
+
+    /// <summary>
+    /// Parses a style sheet, first passing every URL in it (url(), and the string of an @import)
+    /// through <paramref name="rebase"/>: a sheet fetched from an address resolves its relative
+    /// URLs against that address, not the document's (CSS Values 4, 4.5.1), so a font next to
+    /// the sheet loads wherever the sheet is linked from. A null result keeps the URL.
+    /// </summary>
+    public static List<CssRule> ParseStyleSheet(string css, Func<string, string?>? rebase)
     {
-        List<CssValue> values = ComponentValues(CssTokenizer.Tokenize(css));
-        return Rules(values, 0);
+        List<CssToken> tokens = CssTokenizer.Tokenize(css);
+        if (rebase is not null) Rebase(tokens, rebase);
+        return Rules(ComponentValues(tokens), 0);
+    }
+
+    private static void Rebase(List<CssToken> tokens, Func<string, string?> rebase)
+    {
+        for (int i = 0; i < tokens.Count; i++)
+        {
+            CssToken t = tokens[i];
+            int target = -1;
+            if (t.Type == CssTokenType.Url)
+            {
+                target = i;
+            }
+            else if ((t.Type == CssTokenType.Function && t.Value.Equals("url", StringComparison.OrdinalIgnoreCase))
+                     || (t.Type == CssTokenType.AtKeyword && t.Value.Equals("import", StringComparison.OrdinalIgnoreCase)))
+            {
+                // url("x") and @import "x": the string that follows, after any white space.
+                int j = i + 1;
+                while (j < tokens.Count && tokens[j].Type == CssTokenType.Whitespace) j++;
+                if (j < tokens.Count && tokens[j].Type == CssTokenType.String) target = j;
+            }
+
+            if (target >= 0 && rebase(tokens[target].Value) is string rebased) tokens[target] = tokens[target] with { Value = rebased };
+        }
     }
 
     /// <summary>Parses the contents of a style attribute.</summary>

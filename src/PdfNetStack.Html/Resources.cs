@@ -16,14 +16,22 @@ internal sealed class Resources
 
     private readonly Uri? _base;
     private readonly Func<Uri, byte[]?>? _loader;
+    private readonly Func<Uri, CancellationToken, Task<byte[]?>>? _asyncLoader;
+    private readonly CancellationToken _cancellationToken;
     private readonly string? _directory;
     private readonly Dictionary<string, byte[]?> _bytes = new(StringComparer.Ordinal);
     private readonly Dictionary<string, HtmlImage?> _images = new(StringComparer.Ordinal);
 
-    public Resources(Uri? baseUri, Func<Uri, byte[]?>? loader)
+    /// <param name="baseUri">The address relative URLs resolve against.</param>
+    /// <param name="loader">Fetches by absolute URL; null loads only data: URIs and files under the base.</param>
+    /// <param name="asyncLoader">Fetches by absolute URL with the conversion's token; used instead of <paramref name="loader"/> when set.</param>
+    /// <param name="cancellationToken">The conversion's token, passed to <paramref name="asyncLoader"/> and observed before each fetch.</param>
+    public Resources(Uri? baseUri, Func<Uri, byte[]?>? loader, Func<Uri, CancellationToken, Task<byte[]?>>? asyncLoader = null, CancellationToken cancellationToken = default)
     {
         _base = baseUri;
         _loader = loader;
+        _asyncLoader = asyncLoader;
+        _cancellationToken = cancellationToken;
         if (baseUri is { IsAbsoluteUri: true, IsFile: true })
         {
             string path = Path.GetFullPath(baseUri.LocalPath);
@@ -50,6 +58,12 @@ internal sealed class Resources
             : _base is not null && Uri.TryCreate(_base, url, out Uri? relative) ? relative
             : null;
         if (uri is null) return null;
+        _cancellationToken.ThrowIfCancellationRequested();
+
+        // The conversion runs on a thread of its own with no synchronization context, so waiting
+        // here for the fetch blocks only that thread and cannot deadlock: the fetch completes on
+        // the thread pool, and the token cancels it.
+        if (_asyncLoader is not null) return _asyncLoader(uri, _cancellationToken).GetAwaiter().GetResult();
         if (_loader is not null) return _loader(uri);
         if (!uri.IsFile || _directory is null) return null;
 
@@ -89,6 +103,19 @@ internal sealed class Resources
         }
 
         return Encoding.UTF8.GetBytes(Uri.UnescapeDataString(payload));
+    }
+
+    /// <summary>
+    /// The absolute form of a URL written in a style sheet: resolved against <paramref name="sheet"/>,
+    /// the sheet's own absolute URL, or against the document's base when that is null. Absolute
+    /// URLs, data: URIs and fragments come back as they are; null when there is no base.
+    /// </summary>
+    public string? Resolve(string url, string? sheet)
+    {
+        string trimmed = url.Trim();
+        if (trimmed.Length == 0 || trimmed[0] == '#' || trimmed.StartsWith("data:", StringComparison.OrdinalIgnoreCase) || Uri.TryCreate(trimmed, UriKind.Absolute, out _)) return trimmed;
+        Uri? against = sheet is not null && Uri.TryCreate(sheet, UriKind.Absolute, out Uri? own) ? own : _base;
+        return against is not null && Uri.TryCreate(against, trimmed, out Uri? resolved) ? resolved.AbsoluteUri : null;
     }
 
     /// <summary>A style sheet's text, decoded as UTF-8 unless a byte order mark says otherwise.</summary>
