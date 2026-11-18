@@ -81,6 +81,18 @@ internal sealed class PageMaster
 
     internal (double Width, double Height) PageSize(List<CssValue>? value) => PageSize(value, _root.FontSize);
 
+    /// <summary>The page area of a page with only <paramref name="pageStyle"/>'s size and margins, as media queries see it.</summary>
+    internal static CssMedia DefaultPageArea(string pageStyle)
+    {
+        List<CssDeclaration> declarations = CssParser.ParseDeclarations(pageStyle);
+        (double width, double height) = PageSize(declarations.LastOrDefault(d => d.Property == "size")?.Value, 16);
+
+        // Margins compute as for a page with no document styles: no var(), em of the default font size.
+        ComputedStyle style = new StyleResolver(CssMedia.Default).ComputeDeclarations(declarations.Where(d => d.Property != "size"), null);
+        Edges margins = BoxMetrics.Margins(style, width);
+        return new CssMedia(Math.Max(1, width - margins.Horizontal), Math.Max(1, height - margins.Vertical));
+    }
+
     /// <summary>The page size in px: a named size, one or two lengths, and an orientation.</summary>
     internal static (double Width, double Height) PageSize(List<CssValue>? value, double fontSize)
     {
@@ -320,18 +332,29 @@ internal static class Paginator
             }
         }
 
-        // Floats and positioned boxes are not in the flow: breaks go between in-flow siblings and never through them.
-        var blocks = new List<BoxFragment>();
+        // Floats and positioned boxes are not in the flow: breaks go between in-flow siblings and
+        // never through them. Each in-flow box remembers the top of the floats placed since the
+        // previous one, as a box cleared below them starts after them.
+        var blocks = new List<(BoxFragment Box, double FloatsTop)>();
+        double floatsTop = double.PositiveInfinity;
         foreach (BoxFragment child in box.Children.OfType<BoxFragment>())
         {
-            bool outOfFlow = child.Style.Keyword("float") is not ("none" or "") || child.Style.Keyword("position") is "absolute" or "fixed";
-            if (outOfFlow) avoid.Add((child.Y, child.Bottom));
-            else blocks.Add(child);
+            bool floating = child.Style.Keyword("float") is not ("none" or "");
+            if (floating || child.Style.Keyword("position") is "absolute" or "fixed")
+            {
+                avoid.Add((child.Y, child.Bottom));
+                if (floating) floatsTop = Math.Min(floatsTop, child.Y);
+            }
+            else
+            {
+                blocks.Add((child, floatsTop));
+                floatsTop = double.PositiveInfinity;
+            }
         }
 
         for (int i = 0; i < blocks.Count; i++)
         {
-            BoxFragment child = blocks[i];
+            BoxFragment child = blocks[i].Box;
             string before = child.Style.Keyword("break-before");
             if (i == 0)
             {
@@ -339,19 +362,24 @@ internal static class Paginator
             }
             else
             {
-                BoxFragment previous = blocks[i - 1];
+                BoxFragment previous = blocks[i - 1].Box;
                 string after = previous.Style.Keyword("break-after");
                 bool forced = IsForced(after) || IsForced(before);
                 bool header = previous.Box is TableRowGroupBox { IsHeader: true };
-                candidates.Add(new Candidate(previous.Bottom, Math.Max(previous.Bottom, child.Y), forced) { Avoid = !forced && (header || IsAvoid(after) || IsAvoid(before)) });
+
+                // The next page resumes at the next box, past the margins between, but no later
+                // than floats between the two: a clearfix below floats starts after them, and
+                // resuming there dropped the floats from every page.
+                double resume = Math.Max(previous.Bottom, Math.Min(child.Y, blocks[i].FloatsTop));
+                candidates.Add(new Candidate(previous.Bottom, resume, forced) { Avoid = !forced && (header || IsAvoid(after) || IsAvoid(before)) });
             }
 
             Collect(child, candidates, avoid, repeats);
         }
 
-        if (blocks.Count > 0 && IsForced(blocks[^1].Style.Keyword("break-after")))
+        if (blocks.Count > 0 && IsForced(blocks[^1].Box.Style.Keyword("break-after")))
         {
-            candidates.Add(new Candidate(blocks[^1].Bottom, blocks[^1].Bottom, true));
+            candidates.Add(new Candidate(blocks[^1].Box.Bottom, blocks[^1].Box.Bottom, true));
         }
     }
 

@@ -45,11 +45,9 @@ internal sealed class ComputedStyle
     {
         Parent = parent;
         PseudoElement = pseudoElement;
-        Custom = parent?.Custom ?? Empty;
+        Custom = parent?.Custom ?? CustomProperties.Empty;
         Language = parent?.Language;
     }
-
-    internal static readonly Dictionary<string, List<CssValue>> Empty = new(StringComparer.Ordinal);
 
     public ComputedStyle? Parent { get; }
 
@@ -57,8 +55,8 @@ internal sealed class ComputedStyle
 
     internal PropertyValues Values { get; } = new();
 
-    /// <summary>Custom properties, shared with the parent until this element sets its own.</summary>
-    internal Dictionary<string, List<CssValue>> Custom { get; set; }
+    /// <summary>Custom properties, shared with the parent until this element sets its own, and then mostly still shared.</summary>
+    internal CustomProperties Custom { get; set; }
 
     /// <summary>The nearest lang attribute of the element and its ancestors, as the text says it; null with none.</summary>
     public string? Language { get; internal set; }
@@ -151,18 +149,24 @@ internal sealed class StyleResolver
     private const double MaxLineHeight = 1000;
 
     private readonly CssMedia _media;
+    private readonly WorkBudget _budget;
+    private readonly AncestorFilter _ancestors = new();
     private readonly List<CssValue>[] _initial;
-    private readonly List<Entry> _universal = [];
-    private readonly Dictionary<string, List<Entry>> _byId = new(StringComparer.Ordinal);
-    private readonly Dictionary<string, List<Entry>> _byClass = new(StringComparer.Ordinal);
-    private readonly Dictionary<string, List<Entry>> _byTag = new(StringComparer.Ordinal);
+
+    // Rules for elements and rules for pseudo-elements apart: an element is asked about ::before
+    // and ::after too, and few rules target them.
+    private readonly RuleIndex _elementRules = new();
+    private readonly RuleIndex _pseudoElementRules = new();
     private int _order = 1;
     private int _imports;
     private double _rootFontSize = 16;
 
-    public StyleResolver(CssMedia media)
+    /// <param name="media">The media queries are evaluated against.</param>
+    /// <param name="budget">Counts selector tests and substitutions; unlimited when null.</param>
+    public StyleResolver(CssMedia media, WorkBudget? budget = null)
     {
         _media = media;
+        _budget = budget ?? WorkBudget.Unlimited();
 
         // Initial values hold no relative units, so they compute once per resolver.
         var probe = new ComputedStyle(null, null);
@@ -176,9 +180,26 @@ internal sealed class StyleResolver
 
     private sealed record Entry(CssSelector Selector, List<CssDeclaration> Declarations, CssOrigin Origin, int Order);
 
+    /// <summary>
+    /// Makes a URL from a style sheet absolute: resolved against the sheet's own absolute URL, or
+    /// the document's base when that is null; null when there is nothing to resolve against.
+    /// When set, sheets fetched by URL, linked or imported, have their relative URLs resolved
+    /// against their own address; without it they resolve against the document's.
+    /// </summary>
+    public Func<string, string?, string?>? ResolveUrl { get; init; }
+
     /// <summary>Adds a style sheet; <paramref name="load"/> fetches the text of @import targets.</summary>
     public void AddStyleSheet(string css, CssOrigin origin, Func<string, string?>? load = null) =>
         AddRules(CssParser.ParseStyleSheet(css), origin, load, 0);
+
+    /// <summary>Fetches a linked or imported style sheet and adds it, its own URLs made absolute against its address.</summary>
+    private void AddFetched(string url, CssOrigin origin, Func<string, string?> load, int depth)
+    {
+        string? absolute = ResolveUrl?.Invoke(url, null);
+        if (load(absolute ?? url) is not string css) return;
+        Func<string, string?>? rebase = absolute is null || ResolveUrl is null ? null : relative => ResolveUrl(relative, absolute);
+        AddRules(CssParser.ParseStyleSheet(css, rebase), origin, load, depth);
+    }
 
     /// <summary>Adds the document's style elements and linked style sheets, in document order.</summary>
     public void AddDocument(HtmlDocument document, Func<string, string?>? load = null)
@@ -194,7 +215,7 @@ internal sealed class StyleResolver
             else if (e.Name == "link" && load is not null && e.GetAttribute("href") is string href
                      && (e.GetAttribute("rel") ?? "").Split(' ').Any(r => r.Equals("stylesheet", StringComparison.OrdinalIgnoreCase)))
             {
-                if (load(href) is string css) AddStyleSheet(css, CssOrigin.Author, load);
+                AddFetched(href, CssOrigin.Author, load, 0);
             }
         }
     }
@@ -207,7 +228,7 @@ internal sealed class StyleResolver
             {
                 case CssImportRule import when load is not null && depth < MaxImportDepth && _imports < MaxImports && MediaQuery.Matches(import.Media, _media):
                     _imports++;
-                    if (load(import.Url) is string css) AddRules(CssParser.ParseStyleSheet(css), origin, load, depth + 1);
+                    AddFetched(import.Url, origin, load, depth + 1);
                     break;
                 case CssMediaRule media when MediaQuery.Matches(media.Query, _media):
                     AddRules(media.Rules, origin, load, depth);
@@ -216,7 +237,11 @@ internal sealed class StyleResolver
                     List<CssDeclaration> declarations = style.Declarations.SelectMany(d => CssProperties.Expand(d) ?? []).ToList();
                     if (declarations.Count == 0) break;
                     int order = _order++;
-                    foreach (CssSelector selector in style.Selectors) Index(new Entry(selector, declarations, origin, order));
+                    foreach (CssSelector selector in style.Selectors)
+                    {
+                        (selector.PseudoElement is null ? _elementRules : _pseudoElementRules).Add(new Entry(selector, declarations, origin, order));
+                    }
+
                     break;
                 case CssPageRule page:
                     PageRules.Add(page);
@@ -228,33 +253,44 @@ internal sealed class StyleResolver
         }
     }
 
-    private void Index(Entry entry)
+    /// <summary>Rules bucketed by the subject's most selective part, so each element only tests likely rules.</summary>
+    private sealed class RuleIndex
     {
-        // Bucket by the subject's most selective part, so each element only tests likely rules.
-        CssCompound subject = entry.Selector.Compounds[0];
-        if (subject.Conditions.OfType<IdCondition>().FirstOrDefault() is IdCondition id) Bucket(_byId, id.Id).Add(entry);
-        else if (subject.Conditions.OfType<ClassCondition>().FirstOrDefault() is ClassCondition c) Bucket(_byClass, c.Name).Add(entry);
-        else if (subject.Tag is string tag) Bucket(_byTag, tag).Add(entry);
-        else _universal.Add(entry);
-    }
+        private readonly List<Entry> _universal = [];
+        private readonly Dictionary<string, List<Entry>> _byId = new(StringComparer.Ordinal);
+        private readonly Dictionary<string, List<Entry>> _byClass = new(StringComparer.Ordinal);
+        private readonly Dictionary<string, List<Entry>> _byTag = new(StringComparer.Ordinal);
 
-    private static List<Entry> Bucket(Dictionary<string, List<Entry>> index, string key)
-    {
-        if (!index.TryGetValue(key, out List<Entry>? list)) index[key] = list = [];
-        return list;
-    }
-
-    private IEnumerable<Entry> Candidates(HtmlElement e)
-    {
-        if (e.GetAttribute("id") is string id && _byId.TryGetValue(id, out List<Entry>? byId)) foreach (Entry x in byId) yield return x;
-        foreach (string c in e.ClassList.Distinct())
+        public void Add(Entry entry)
         {
-            if (_byClass.TryGetValue(c, out List<Entry>? byClass)) foreach (Entry x in byClass) yield return x;
+            CssCompound subject = entry.Selector.Compounds[0];
+            if (subject.Conditions.OfType<IdCondition>().FirstOrDefault() is IdCondition id) Bucket(_byId, id.Id).Add(entry);
+            else if (subject.Conditions.OfType<ClassCondition>().FirstOrDefault() is ClassCondition c) Bucket(_byClass, c.Name).Add(entry);
+            else if (subject.Tag is string tag) Bucket(_byTag, tag).Add(entry);
+            else _universal.Add(entry);
         }
 
-        if (_byTag.TryGetValue(e.Name, out List<Entry>? byTag)) foreach (Entry x in byTag) yield return x;
-        foreach (Entry x in _universal) yield return x;
+        public IEnumerable<Entry> Candidates(HtmlElement e)
+        {
+            if (e.GetAttribute("id") is string id && _byId.TryGetValue(id, out List<Entry>? byId)) foreach (Entry x in byId) yield return x;
+            foreach (string c in e.ClassList.Distinct())
+            {
+                if (_byClass.TryGetValue(c, out List<Entry>? byClass)) foreach (Entry x in byClass) yield return x;
+            }
+
+            if (_byTag.TryGetValue(e.Name, out List<Entry>? byTag)) foreach (Entry x in byTag) yield return x;
+            foreach (Entry x in _universal) yield return x;
+        }
+
+        private static List<Entry> Bucket(Dictionary<string, List<Entry>> index, string key)
+        {
+            if (!index.TryGetValue(key, out List<Entry>? list)) index[key] = list = [];
+            return list;
+        }
     }
+
+    private IEnumerable<Entry> Candidates(HtmlElement e, string? pseudoElement) =>
+        (pseudoElement is null ? _elementRules : _pseudoElementRules).Candidates(e);
 
     private readonly Dictionary<string, List<CssDeclaration>> _inline = new(StringComparer.Ordinal);
 
@@ -273,12 +309,26 @@ internal sealed class StyleResolver
     /// <summary>Whether a rule targets this pseudo-element of the element: without one it generates nothing, and its style need not be computed.</summary>
     public bool HasRulesFor(HtmlElement element, string pseudoElement)
     {
-        foreach (Entry entry in Candidates(element))
+        _ancestors.MoveTo(element.ParentElement);
+        foreach (Entry entry in Candidates(element, pseudoElement))
         {
-            if (entry.Selector.PseudoElement == pseudoElement && entry.Selector.Matches(element)) return true;
+            if (entry.Selector.PseudoElement == pseudoElement && Matches(entry.Selector, element)) return true;
         }
 
         return false;
+    }
+
+    /// <summary>
+    /// Matches a candidate rule's selector; the ancestor filter, already moved to the element's
+    /// parent, rejects most descendant selectors before any walk up the tree. Every candidate
+    /// counts as style work, rejected or not, so a style sheet of many rules for one element type
+    /// is bounded too.
+    /// </summary>
+    private bool Matches(CssSelector selector, HtmlElement element)
+    {
+        _budget.Style(1);
+        if (selector.AncestorKeys.Length > 0 && !_ancestors.MightContainAll(selector.AncestorKeys)) return false;
+        return selector.Matches(element, _budget);
     }
 
     // The cascade's winners, one dictionary for every element: emptied, it lists what is added again in order.
@@ -297,9 +347,10 @@ internal sealed class StyleResolver
         }
 
         // Tiers, low to high: user agent, author, style attribute, then the same reversed for !important.
-        foreach (Entry entry in Candidates(element))
+        _ancestors.MoveTo(element.ParentElement);
+        foreach (Entry entry in Candidates(element, pseudoElement))
         {
-            if (entry.Selector.PseudoElement != pseudoElement || !entry.Selector.Matches(element)) continue;
+            if (entry.Selector.PseudoElement != pseudoElement || !Matches(entry.Selector, element)) continue;
             foreach (CssDeclaration d in entry.Declarations)
             {
                 int tier = entry.Origin == CssOrigin.UserAgent ? (d.Important ? 5 : 0) : (d.Important ? 3 : 1);
@@ -324,7 +375,21 @@ internal sealed class StyleResolver
         if (parent is null && pseudoElement is null) _rootFontSize = style.FontSize;
 
         Blockify(style, element, parent);
+        if (pseudoElement is null && element.Name == "table") LegacyAlignment(style);
         return style;
+    }
+
+    /// <summary>
+    /// A table does not inherit the legacy alignment of an align attribute or a center element
+    /// (-webkit-center and its kin): it goes back to start, as in Blink and Gecko. Email layouts
+    /// center an outer cell and expect the text of the tables inside it to start on the left.
+    /// </summary>
+    private static void LegacyAlignment(ComputedStyle style)
+    {
+        if (style.Keyword("text-align") is "-webkit-center" or "-webkit-left" or "-webkit-right")
+        {
+            style.Values["text-align"] = [new CssValue(new CssToken(CssTokenType.Ident, "start"))];
+        }
     }
 
     /// <summary>
@@ -588,24 +653,30 @@ internal sealed class StyleResolver
 
     private void ResolveCustomProperties(ComputedStyle style, ComputedStyle? parent, Dictionary<string, (CssDeclaration Declaration, long Rank)> winners)
     {
-        var own = winners.Where(w => CssProperties.IsCustom(w.Key)).ToDictionary(w => w.Key, w => w.Value.Declaration.Value, StringComparer.Ordinal);
-        if (own.Count == 0) return;
+        Dictionary<string, List<CssValue>>? own = null;
+        foreach (KeyValuePair<string, (CssDeclaration Declaration, long Rank)> w in winners)
+        {
+            if (CssProperties.IsCustom(w.Key)) (own ??= new(StringComparer.Ordinal))[w.Key] = w.Value.Declaration.Value;
+        }
 
-        Dictionary<string, List<CssValue>> inherited = parent?.Custom ?? ComputedStyle.Empty;
-        var custom = new Dictionary<string, List<CssValue>>(inherited, StringComparer.Ordinal);
+        if (own is null) return;
+
+        // The parent's map is shared, not copied: each property set here adds one path to it.
+        CustomProperties inherited = parent?.Custom ?? CustomProperties.Empty;
+        CustomProperties custom = inherited;
         var resolving = new HashSet<string>(StringComparer.Ordinal);
         var done = new HashSet<string>(StringComparer.Ordinal);
 
         List<CssValue>? Resolve(string name, int depth)
         {
-            if (done.Contains(name)) return custom.TryGetValue(name, out List<CssValue>? v) ? v : null;
-            if (!own.TryGetValue(name, out List<CssValue>? raw)) return inherited.TryGetValue(name, out List<CssValue>? p) ? p : null;
+            if (done.Contains(name)) return custom.Find(name);
+            if (!own.TryGetValue(name, out List<CssValue>? raw)) return inherited.Find(name);
             if (!resolving.Add(name) || depth > MaxVarDepth) return null; // a cycle makes the property invalid
 
             List<CssValue>? value;
             if (CssProperties.IsWideKeyword(raw, out string keyword))
             {
-                value = keyword is "initial" ? null : inherited.TryGetValue(name, out List<CssValue>? p) ? p : null;
+                value = keyword is "initial" ? null : inherited.Find(name);
             }
             else
             {
@@ -614,8 +685,7 @@ internal sealed class StyleResolver
 
             resolving.Remove(name);
             done.Add(name);
-            if (value is null) custom.Remove(name);
-            else custom[name] = value;
+            custom = custom.With(name, value);
             return value;
         }
 
@@ -623,14 +693,18 @@ internal sealed class StyleResolver
         style.Custom = custom;
     }
 
-    private static List<CssValue>? Substitute(List<CssValue> value, Dictionary<string, List<CssValue>> custom) =>
-        Substitute(value, n => custom.TryGetValue(n, out List<CssValue>? v) ? v : null);
+    private List<CssValue>? Substitute(List<CssValue> value, CustomProperties custom) => Substitute(value, custom.Find);
 
-    /// <summary>Replaces var() references; null when one cannot be resolved and has no fallback.</summary>
-    private static List<CssValue>? Substitute(List<CssValue> value, Func<string, List<CssValue>?> lookup)
+    /// <summary>
+    /// Replaces var() references; null when one cannot be resolved and has no fallback. Every
+    /// value copied counts as style work: one declaration may expand to 50,000 values, and a rule
+    /// can give it to every element.
+    /// </summary>
+    private List<CssValue>? Substitute(List<CssValue> value, Func<string, List<CssValue>?> lookup)
     {
         int budget = MaxVarOutput;
         List<CssValue>? result = Substitute(value, lookup, ref budget);
+        _budget.Style(MaxVarOutput - Math.Max(0, budget));
         return result is null ? null : CssProperties.Trim(result);
     }
 
@@ -686,8 +760,18 @@ internal sealed class StyleResolver
             string a = align.ToLowerInvariant();
             if (e.Name is "p" or "div" or "h1" or "h2" or "h3" or "h4" or "h5" or "h6" or "caption" or "td" or "th" or "tr" or "thead" or "tbody" or "tfoot" or "legend")
             {
-                if (a is "left" or "right" or "center" or "justify") css.Append("text-align:").Append(a).Append(';');
-                else if (a is "middle" or "absmiddle") css.Append("text-align:center;");
+                // The legacy values browsers map these to: they align like center, left and right,
+                // but a nested table drops them (see LegacyAlignment), as email layouts expect.
+                string? value = a switch
+                {
+                    "center" or "middle" => "-webkit-center",
+                    "left" => "-webkit-left",
+                    "right" => "-webkit-right",
+                    "justify" => "justify",
+                    "absmiddle" => "center",
+                    _ => null,
+                };
+                if (value is not null) css.Append("text-align:").Append(value).Append(';');
             }
             else if (e.Name == "table" && a == "center") css.Append("margin-left:auto;margin-right:auto;");
             else if (e.Name is "table" or "img" or "object" or "iframe" && a is "left" or "right") css.Append("float:").Append(a).Append(';');
