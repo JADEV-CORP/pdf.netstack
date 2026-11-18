@@ -163,10 +163,13 @@ public sealed record PdfOptimizerOptions
     /// <summary>
     /// Write a linearized file (ISO 32000-1, Annex F), which a viewer can start showing before the
     /// whole file has arrived ("fast web view"). Inherited page attributes are moved onto the
-    /// pages, and every object is written on its own without object streams, so the output can
-    /// be larger than the input; a linearized rewrite of a file that is not linearized yet is kept
-    /// even then, provided it verifies. A page tree that cannot be laid out page by page, such as
-    /// one listing a page twice, is written as usual and the result says why. Default false.
+    /// pages. With <see cref="UseObjectStreams"/> the objects of each part of the layout are packed
+    /// in object streams of their own, and only page objects and the catalog are written on their
+    /// own, which keeps the output close to the size of the plain rewrite; without object streams
+    /// (or for PDF/A-1) every object is written on its own, and the output can be larger than the
+    /// input. A linearized rewrite of a file that is not linearized yet is kept even then,
+    /// provided it verifies. A page tree that cannot be laid out page by page, such as one listing
+    /// a page twice, is written as usual and the result says why. Default false.
     /// </summary>
     public bool Linearize { get; init; }
 

@@ -225,10 +225,43 @@ A linearized file holds the same objects as any other rewrite, so the proof abov
 content. Its layout is checked separately. The tests read every linearized file back and check
 the linearization dictionary against the file (`/L`, `/O`, `/E`, `/N`, `/T`, `/H`), both
 cross-reference sections, and every entry of the page offset, shared object and outline hint
-tables against the real offsets and lengths of the objects. `tools/measure_optimizer.py
---linearize` also runs qpdf's `--check-linearization` on each output when qpdf, or pikepdf with
-its bundled libqpdf, is installed. The objects are assigned to the parts of Annex F the way qpdf
-assigns them, so its check computes the same layout.
+tables against the real offsets and lengths of the objects, an object in an object stream
+counting as the object stream; and that everything the first page uses ends before `/E`. Where
+qpdf 12.4.2 or later is installed, they also run its `--check-linearization` on each output.
+`tools/measure_optimizer.py --linearize` runs that check too, with qpdf or pikepdf. The objects
+are assigned to the parts of Annex F the way qpdf 12.4.2 assigns them, so its check computes
+the same layout. An object a page shares with the outlines or the structure tree goes with the
+page; qpdf before 12.4.2 put it in part 9, and its check reports such files.
+
+With object streams (the default, except for PDF/A-1) objects are packed only with objects of
+the same part, and page objects and the catalog stay outside object streams, as readers of the
+hint tables expect. A later page whose own objects come to 4 KB gets an object stream in its
+own section; smaller groups are pooled in page order with the objects later pages share, in
+part 8 streams that each page using them lists. Both cross-reference sections are streams, and
+in each the objects in object streams are numbered after the others. A reader of the hint
+tables takes an object stream in place of the objects it holds, used by whatever uses any of
+them, so the parts are computed again that way and the file is laid out by them. If the object
+streams cannot be laid out, the file is written without them and the result says why.
+
+Size against the plain rewrite of the same input, before and after object streams. qpdf
+12.4.2's `--check-linearization` passed on the linearized rewrite of each of the 65 public
+corpus files the optimizer rewrites (the other 12 are signed or encrypted) and of the synthetic
+samples; the classic layout drew warnings on four of the files below:
+
+| File | Plain | Linearized before | Linearized now |
+|---|---:|---:|---:|
+| NIST SP 800-53 Rev. 5 (492 pages, tagged) | 4,969,226 | +113.5% | +4.1% |
+| NIST SP 800-63-3 | 1,298,287 | +26.4% | +1.5% |
+| NIST FIPS 197 | 520,406 | +178.7% | +2.8% |
+| NASA SE handbook | 3,687,892 | +3.4% | +1.3% |
+| CDC MMWR 72-01 | 257,693 | +151.6% | +10.4% |
+| arXiv papers (8) | | +0.6% to +10.4% | +0.1% to +0.8% |
+
+What remains is mostly the page objects, written on their own, and a few hundred bytes of hint
+and cross-reference streams: CDC MMWR keeps 2.4 KB of InDesign `/PieceInfo` in each page
+dictionary (`RemovePieceInfo` drops it), and a file of a few kilobytes grows by those fixed
+parts. The first page section ends earlier too: `/E` at 166,603 bytes in the NIST file, against
+244,436.
 
 ### Bilevel images
 
@@ -431,9 +464,11 @@ PSNR says little. Read side by side, the reduced pages keep every stroke, rule a
   programs written in code with hint replacement, flex, seac, stem3, division, sbw and hex eexec,
   converted and proven, and each feature CFF cannot express refused; mutated Type 1 programs
   that may only fail as font errors.
-- Linearization: the layout checks above on documents with one and many pages, shared fonts,
-  bookmarks in and out of the first page, form fields, an open action and inherited attributes;
-  page trees it cannot lay out; mutated inputs.
+- Linearization: the layout checks above, with and without object streams, on documents with
+  one and many pages, shared fonts, bookmarks in and out of the first page, form fields, an open
+  action and inherited attributes, and on tagged documents of many small objects, against the
+  size of the plain rewrite; PDF/A-1 written without object streams; page trees it cannot lay
+  out; mutated inputs.
 - JPEG: libjpeg-turbo fixtures (4:2:0, 4:2:2, 4:4:4, gray, Adobe CMYK, untransformed RGB, odd
   sizes) in baseline, optimized, progressive and restart marker layouts; lossless and requantized
   round trips; soft masks, Flate wrapped JPEG, color space mismatches, palettes, damaged and

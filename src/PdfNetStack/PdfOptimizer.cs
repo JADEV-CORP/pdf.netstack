@@ -412,10 +412,15 @@ public static partial class PdfOptimizer
             if (encryption is not null) map = EncryptLikeSource(encryption, objects, trailer, map, ref settings);
             ReadOnlyMemory<byte> candidate;
             bool linearized = false;
-            if (pushedDown && LinearizedWriter.Write(objects, trailer, map, settings with { UseObjectStreams = false, Version = LinearizedVersion(file.HeaderVersion) }) is { } lin)
+            string? withoutObjectStreams = null;
+
+            // With object streams the version is the one any rewrite with them has; the writer
+            // falls back to the linearization version when it has to leave them out.
+            if (pushedDown && LinearizedWriter.Write(objects, trailer, map, settings, LinearizedVersion(file.HeaderVersion), ct) is { } lin)
             {
-                candidate = lin;
+                candidate = lin.Bytes;
                 linearized = true;
+                withoutObjectStreams = lin.WithoutObjectStreams;
             }
             else
             {
@@ -519,7 +524,7 @@ public static partial class PdfOptimizer
             string reason = Reason(options, recompressed) + fonts.Note();
             if (usageRightsRemoved) reason += " Usage rights removed.";
             if (encryption is not null) reason += Reencrypted(encryption);
-            if (linearized) reason += " The output is linearized.";
+            if (linearized) reason += " The output is linearized." + (withoutObjectStreams is null ? "" : " Object streams were left out: " + withoutObjectStreams + ".");
             else if (notLinearized is not null) reason += " Not linearized: " + notLinearized + ".";
             return new Outcome(OptimizationDisposition.Optimized, candidate, reason, pageCount, stats);
         }
