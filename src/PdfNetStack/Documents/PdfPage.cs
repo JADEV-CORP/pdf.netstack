@@ -95,9 +95,17 @@ public sealed class PdfPage
     /// The images the page draws, in drawing order, with where each lands: image XObjects
     /// (inside forms too) and inline images. Damaged content is read as far as it goes.
     /// </summary>
-    public IReadOnlyList<PdfPageImage> GetImages()
+    public IReadOnlyList<PdfPageImage> GetImages() => GetImages(CancellationToken.None);
+
+    /// <summary>
+    /// The images the page draws, as <see cref="GetImages()"/> finds them, stopping when
+    /// <paramref name="cancellationToken"/> fires.
+    /// </summary>
+    /// <param name="cancellationToken">Observed while the content is read: before each stream is decoded and every few hundred operators.</param>
+    /// <exception cref="OperationCanceledException">Cancelled before the content was read.</exception>
+    public IReadOnlyList<PdfPageImage> GetImages(CancellationToken cancellationToken)
     {
-        var finder = new PdfPageImage.Finder(Owner);
+        var finder = new PdfPageImage.Finder(Owner) { Cancellation = cancellationToken };
         finder.Run(this);
         return finder.Images;
     }
@@ -112,7 +120,8 @@ public sealed class PdfPage
     /// dozen characters, separated by a gutter of an em or more. Narrower or shorter side by side
     /// text, such as a table, reads row by row. A character the font gives no Unicode value for
     /// reads as U+FFFD; see
-    /// <see cref="GetLetters"/> for what is decoded.
+    /// <see cref="GetLetters()"/> for what is decoded. <see cref="ExtractText(CancellationToken)"/>
+    /// stops a long read when asked.
     /// </remarks>
     /// <example>
     /// <code>
@@ -129,7 +138,20 @@ public sealed class PdfPage
     /// }
     /// </code>
     /// </example>
-    public string ExtractText() => Text.Extraction.TextLayout.Text(GetLetters());
+    public string ExtractText() => ExtractText(CancellationToken.None);
+
+    /// <summary>
+    /// The page's text in reading order, as <see cref="ExtractText()"/> reads it, stopping when
+    /// <paramref name="cancellationToken"/> fires. Suits servers that bound the time a request may take.
+    /// </summary>
+    /// <param name="cancellationToken">Observed while the content is read, and before the lines are laid out.</param>
+    /// <exception cref="OperationCanceledException">Cancelled before the text was read.</exception>
+    public string ExtractText(CancellationToken cancellationToken)
+    {
+        IReadOnlyList<PdfLetter> letters = GetLetters(cancellationToken);
+        cancellationToken.ThrowIfCancellationRequested();
+        return Text.Extraction.TextLayout.Text(letters);
+    }
 
     /// <summary>
     /// The glyphs the page draws, in content order, with their text, box, baseline and font. Text
@@ -142,18 +164,39 @@ public sealed class PdfPage
     /// CJK CMap other than Identity-H, Identity-V and the Unicode CMaps rely on /ToUnicode for their
     /// text and use the default width for spacing. At most 500,000 letters are read per page.
     /// </remarks>
-    public IReadOnlyList<PdfLetter> GetLetters()
+    public IReadOnlyList<PdfLetter> GetLetters() => GetLetters(CancellationToken.None);
+
+    /// <summary>
+    /// The glyphs the page draws, as <see cref="GetLetters()"/> reads them, stopping when
+    /// <paramref name="cancellationToken"/> fires.
+    /// </summary>
+    /// <param name="cancellationToken">Observed while the content is read: before each stream is decoded and every few hundred operators.</param>
+    /// <exception cref="OperationCanceledException">Cancelled before the content was read.</exception>
+    public IReadOnlyList<PdfLetter> GetLetters(CancellationToken cancellationToken)
     {
-        var extractor = new Text.Extraction.TextExtractor(Owner);
+        var extractor = new Text.Extraction.TextExtractor(Owner) { Cancellation = cancellationToken };
         extractor.Run(this);
         return extractor.Letters;
     }
 
     /// <summary>
-    /// The page's words in reading order, as <see cref="ExtractText"/> reads them: letters on one
+    /// The page's words in reading order, as <see cref="ExtractText()"/> reads them: letters on one
     /// line, split at space characters and at gaps wider than 0.15 times the font size.
     /// </summary>
-    public IReadOnlyList<PdfWord> GetWords() => [.. Text.Extraction.TextLayout.Lines(GetLetters()).SelectMany(line => line)];
+    public IReadOnlyList<PdfWord> GetWords() => GetWords(CancellationToken.None);
+
+    /// <summary>
+    /// The page's words in reading order, as <see cref="GetWords()"/> finds them, stopping when
+    /// <paramref name="cancellationToken"/> fires.
+    /// </summary>
+    /// <param name="cancellationToken">Observed while the content is read, and before the lines are laid out.</param>
+    /// <exception cref="OperationCanceledException">Cancelled before the words were read.</exception>
+    public IReadOnlyList<PdfWord> GetWords(CancellationToken cancellationToken)
+    {
+        IReadOnlyList<PdfLetter> letters = GetLetters(cancellationToken);
+        cancellationToken.ThrowIfCancellationRequested();
+        return [.. Text.Extraction.TextLayout.Lines(letters).SelectMany(line => line)];
+    }
 }
 
 /// <summary>The ordered pages of a document.</summary>
@@ -211,7 +254,23 @@ public sealed class PdfPageCollection : IReadOnlyList<PdfPage>
     /// <paramref name="index"/>. Links between pages copied in the same call keep working; links to
     /// pages that are not copied become empty. Returns the new pages.
     /// </summary>
-    public IReadOnlyList<PdfPage> Import(IEnumerable<PdfPage> pages, int? index = null)
+    public IReadOnlyList<PdfPage> Import(IEnumerable<PdfPage> pages, int? index = null) => Import(pages, index, CancellationToken.None);
+
+    /// <summary>
+    /// Copies pages, from this or another document, as <see cref="Import(IEnumerable{PdfPage}, int?)"/>
+    /// does, stopping when <paramref name="cancellationToken"/> fires. Returns the new pages.
+    /// </summary>
+    /// <param name="pages">The pages to copy.</param>
+    /// <param name="index">Where to insert them; null appends.</param>
+    /// <param name="cancellationToken">
+    /// Observed while pages and the objects they use are copied. When it fires, no page is added
+    /// and the document's form and structure tree are as they were; objects already copied stay
+    /// in the document unused, and saving leaves them out. With pages from several documents,
+    /// those are copied one document at a time, and the form fields and structure elements of
+    /// documents copied before the token fired stay, tied to no page: discard the document then.
+    /// </param>
+    /// <exception cref="OperationCanceledException">Cancelled before the pages were added.</exception>
+    public IReadOnlyList<PdfPage> Import(IEnumerable<PdfPage> pages, int? index, CancellationToken cancellationToken)
     {
         Compat.ThrowIfNull(pages, nameof(pages));
         List<PdfPage> source = pages.ToList();
@@ -224,7 +283,7 @@ public sealed class PdfPageCollection : IReadOnlyList<PdfPage>
         foreach (IGrouping<PdfDocument, PdfPage> group in source.GroupBy(p => p.Owner))
         {
             List<PdfPage> originals = group.ToList();
-            IReadOnlyList<PdfPage> imported = _owner.ImporterFor(group.Key).Import(originals);
+            IReadOnlyList<PdfPage> imported = _owner.ImporterFor(group.Key).Import(originals, cancellationToken);
             for (int i = 0; i < originals.Count; i++)
             {
                 if (!copies.TryGetValue(originals[i], out Queue<PdfPage>? queue)) copies[originals[i]] = queue = new Queue<PdfPage>();
