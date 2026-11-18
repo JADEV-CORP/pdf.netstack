@@ -105,24 +105,26 @@ change that goes too far. [Compress PDF](/guides/compress-pdf/)
 
 ## Performance
 
-### Public corpus, measured on every release
+### Public corpus, against qpdf and Ghostscript
 
 CI downloads 77 openly licensed and public domain PDFs (NIST and NASA publications, arXiv papers,
-government gazettes, test files) and optimizes each one with three profiles. Results for 1.1.0 on
-a 4 core Linux runner:
+government gazettes, test files) and runs PdfNetStack with its defaults next to qpdf, MuPDF and
+Ghostscript. Each output is scored on size, on rendering in PDFium and on what it kept: tags,
+forms, outlines, signatures, usage rights and PDF/A conformance. On the 76 files PDFium can open,
+18 November 2026:
 
-| Profile | Saved | Failures | Rendering |
-|---|---:|---:|---|
-| Lossless, the default | 12.1% | 0 | Checked pages identical in PDFium |
-| Balanced preset | 23.4% | 0 | Image changes gated at SSIM 0.95 |
-| Lossy profile | 29.5% | 0 | Image changes gated at SSIM 0.95 |
+| Tool | Saved | Outputs that keep quality |
+|---|---:|---:|
+| PdfNetStack, lossless (defaults) | 11.2% | 76 of 76 |
+| qpdf 12.4.2, lossless | 5.7% | 64 of 76 |
+| PdfNetStack, balanced preset | 21.8% | 76 of 76 |
+| Ghostscript 10.05, `/ebook` | 32.1% | 23 of 76 |
 
-Signed and encrypted files are kept as they are, by design. The lossless run took 44 seconds for
-196.6 MiB, proof included. The full report is attached to the
-[1.1.0 release](https://github.com/jams4code/pdf.netstack/releases/tag/v1.1.0), and you can run
-the same benchmark yourself.
+On the 64 files where both keep quality, PdfNetStack's output is 8% smaller than qpdf's, in about
+the same time on one thread, its proof of every output included. Signed and encrypted files are
+kept as they are, by design. Method and how to run it yourself on [Benchmarks](/benchmarks/).
 
-### Real world corpus
+### Private corpus
 
 <div class="proof">
   <div><strong>1,296</strong> <span>invoices, reports, manuals, scans and slides, 569 MiB</span></div>
@@ -131,9 +133,9 @@ the same benchmark yourself.
   <div><strong>0</strong> <span>differing pixels at 150 DPI, 2,161 pages</span></div>
 </div>
 
-Measured for 1.0 with default options, in about 65 seconds on 8 cores. Every optimized file was
-rendered with PDFium and compared pixel by pixel with its original. Method and details on
-[Benchmarks](/benchmarks/).
+Measured for 1.0 with default options, in about 65 seconds on 8 cores, on a corpus that is not
+public. Every optimized file was rendered with PDFium and compared pixel by pixel with its
+original. Method and details on [Benchmarks](/benchmarks/).
 
 ## See it in code
 

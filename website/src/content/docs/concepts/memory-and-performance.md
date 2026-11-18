@@ -59,8 +59,10 @@ took about 5 seconds with all cores and peaked at a working set of about 690 MB.
 Parsing and graph work run on one thread. Stream recompression and stream comparison run in
 parallel, after every object they need has been resolved.
 
-On the reference corpus of 1,296 files (569 MiB), the whole run took about 65 seconds on an 8 core
-machine, 8 to 9 MB/s, lossless JPEG re-encoding included. See [Benchmarks](/benchmarks/).
+On the public corpus (196.6 MiB), the Native AOT command line tool on one thread per file took
+about as long as qpdf, its proof of every output included. On a private corpus of 1,296 files
+(569 MiB), version 1.0 took about 65 seconds on an 8 core machine, 8 to 9 MB/s, lossless JPEG
+re-encoding included. See [Benchmarks](/benchmarks/).
 
 ## Many documents at once
 

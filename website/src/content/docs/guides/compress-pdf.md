@@ -8,7 +8,7 @@ faq:
   - q: Is PdfNetStack compression lossless?
     a: Yes, by default. Text, vectors, fonts, images, forms, tags and metadata are carried over, and every output is compared to its source before it is returned. The lossy image options (JPEG requantization, downsampling, JPEG conversion) are opt-in.
   - q: How much smaller do PDFs get?
-    a: On a mixed corpus of 1,296 real world files the optimized ones went from 568.9 MiB to 469.0 MiB, 17.6% saved, losslessly. Image heavy files often gain 20 to 40%. Files from producers that already use object streams gain little.
+    a: On a public corpus of 77 openly licensed PDFs, with default options, PdfNetStack saved 11.2% losslessly, against 5.7% for qpdf, and every output kept quality. On a private corpus of 1,296 real world files the optimized ones went from 568.9 MiB to 469.0 MiB, 17.6% saved. Image heavy files often gain 20 to 40%. Files from producers that already use object streams gain little.
   - q: Can it downsample images?
     a: Yes, from version 1.1, with MaxImageDpi. Images drawn above 1.5 times the target resolution are resampled with a Lanczos filter, and MinImageSsim keeps any image the change would visibly hurt.
   - q: Can PdfNetStack write linearized PDFs for fast web view?
@@ -278,8 +278,24 @@ method and its limits are on the [fidelity](/concepts/fidelity/) page.
 
 ## Results
 
-Measured on a mixed real world corpus of 1,296 files (569 MiB) with default options, lossless, on
-an 8 core Windows machine:
+On the public corpus of 77 openly licensed PDFs, with the library defaults, next to qpdf 12.4.2 and
+Ghostscript 10.05, on the 76 files PDFium can open (18 November 2026):
+
+| Tool | Saved | Outputs that keep quality |
+|---|---:|---:|
+| PdfNetStack, lossless (defaults) | 11.2% | 76 of 76 |
+| qpdf, lossless | 5.7% | 64 of 76 |
+| PdfNetStack, `Balanced` preset | 21.8% | 76 of 76 |
+| PdfNetStack, `Smallest` preset | 33.3% | 73 of 76 |
+| Ghostscript, `/ebook` | 32.1% | 23 of 76 |
+
+An output keeps quality when PDFium renders the same pages and text at an SSIM of at least 0.95,
+and it keeps its tags, forms, outlines, attachments, signatures, usage rights and PDF/A
+conformance. On the 64 files where both keep quality, PdfNetStack's output is 8% smaller than
+qpdf's. Method, head to head tables and how to run it: [Benchmarks](/benchmarks/).
+
+On a mixed private corpus of 1,296 files (569 MiB), with default options, lossless, on an 8 core
+Windows machine:
 
 | | |
 |---|---|
@@ -290,9 +306,9 @@ an 8 core Windows machine:
 | With `AllowIncrementalUpdates` and `AllowRepairedFiles` | 1,118 files optimized, 20.1% saved |
 
 Every optimized file was rendered with PDFium at 150 DPI and compared with its original: 2,161
-pages, zero differing pixels. See [Benchmarks](/benchmarks/) for the method. These figures were
-measured with version 1.0, before the structural passes of 1.1, which have so far been measured
-on synthetic files (`tools/make_optimizer_samples.py` and `tools/measure_optimizer.py`).
+pages, zero differing pixels. These figures were measured with version 1.0, before the
+structural passes of 1.1. The corpus is not public, so they cannot be reproduced; the public
+corpus above can.
 
 ## Limits
 

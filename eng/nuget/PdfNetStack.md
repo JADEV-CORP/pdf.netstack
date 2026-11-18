@@ -69,8 +69,14 @@ Tested on Windows, Linux and macOS, on .NET Framework 4.8, .NET 8 and .NET 10.
 
 ## Results
 
-On a real-world corpus of 1,296 PDFs (569 MiB), every optimized file was rendered with PDFium and
-compared with its original: zero differing pixels, zero verification failures.
+On the public corpus of 77 openly licensed PDFs, with default options, PdfNetStack saved 11.2%
+losslessly and all 76 files PDFium can open kept their pages, text, rendering, tags, forms and
+signatures. qpdf 12.4.2 saved 5.7% and, on 12 of them, broke signatures, usage rights or PDF/A-1
+conformance or lost an outline; on the 64 files where both kept quality, PdfNetStack's output was
+8% smaller. Method, corpus and how to run it: [benchmarks](https://www.jadev-corp.com/pdfnetstack/benchmarks/).
+
+On a private corpus of 1,296 real world PDFs (569 MiB), every optimized file was rendered with
+PDFium and compared with its original: zero differing pixels, zero verification failures.
 
 ## Links
 
