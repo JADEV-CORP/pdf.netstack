@@ -76,6 +76,8 @@ namespace PdfNetStack.Cli
               --allow-repaired          Rewrite damaged files that needed repair
               --strip-thumbnails        Remove page thumbnails (not lossless)
               --strip-pieceinfo         Remove application private data (not lossless)
+              --remove-usage-rights     Rewrite files whose only signature is Adobe Reader
+                                        usage rights (/UR3), removing them
               --min-saving <percent>    Minimum saving to keep a rewrite (default 1)
               --threads <n>             Threads per document (default: all cores)
               --jobs <n>                Documents processed in parallel by batch (default: all cores)
@@ -573,6 +575,7 @@ namespace PdfNetStack.Cli
                     case "--allow-repaired": o = o with { AllowRepairedFiles = true }; break;
                     case "--strip-thumbnails": o = o with { RemovePageThumbnails = true }; break;
                     case "--strip-pieceinfo": o = o with { RemovePieceInfo = true }; break;
+                    case "--remove-usage-rights": o = o with { RemoveUsageRights = true }; break;
                     case "--min-saving": o = o with { MinSavingPercent = double.Parse(Value(args, ref i), CultureInfo.InvariantCulture) }; break;
                     case "--threads":
                         o = o with { MaxDegreeOfParallelism = int.Parse(Value(args, ref i), CultureInfo.InvariantCulture) };

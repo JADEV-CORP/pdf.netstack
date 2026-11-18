@@ -277,6 +277,16 @@ public sealed record PdfOptimizerOptions
     public bool RemovePieceInfo { get; init; }
 
     /// <summary>
+    /// Remove usage rights (/Perms /UR3, or /UR in older files): the signature with which Adobe
+    /// Reader enables features such as saving filled forms. A rewrite changes the signed bytes, so
+    /// such a file is otherwise left as it is; with this option it is rewritten without them, and
+    /// Reader opens it as a plain PDF instead of warning that the features are no longer available.
+    /// Files that also carry a certification or another signature are still left as they are.
+    /// Default false.
+    /// </summary>
+    public bool RemoveUsageRights { get; init; }
+
+    /// <summary>
     /// Worker threads for compression and verification, at most. Default: processor count. Fewer
     /// run when memory is short: each worker can hold several streams of up to
     /// <see cref="MaxDecodedStreamBytes"/>, so the count is also capped by half the memory the
