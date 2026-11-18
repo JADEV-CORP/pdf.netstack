@@ -341,6 +341,7 @@ internal sealed class EquivalenceVerifier
             if (mergedProgram && key == "Length1") continue;
             if ((page || node) && Inheritable(key)) continue;
             if (_ignoredSourceKeys.Contains(key) && b[key] is null) continue;
+            if (isStream && key == "Name" && b[key] is null && _rules.AllowXObjectNameRemoval && Deduplicator.IsXObject(a)) continue;
             if (b[key] is null && _rules.AllowResourcePruning && Unused(a, key)) continue;
             string? d = Compare(a[key], b[key] ?? PdfNull.Instance, path + "/" + key, depth + 1);
             if (d is not null) return d;
@@ -577,6 +578,9 @@ internal sealed record VerificationRules
     /// <summary>Bilevel images stored as samples or CCITT data may be coded again as CCITT data with the same pixels.</summary>
     public bool AllowBilevelRecoding { get; init; }
 
+    /// <summary>An XObject may lose its /Name, which readers ignore after PDF 1.0, when the deduplicator merged copies that named it differently.</summary>
+    public bool AllowXObjectNameRemoval { get; init; }
+
     /// <summary>Every lossless structural change the optimizer makes, and no lossy image change.</summary>
-    public static VerificationRules Lossless { get; } = new() { AllowResourcePruning = true, AllowContentCompaction = true, AllowFontMerging = true, AllowInheritedAttributes = true, AllowBilevelRecoding = true };
+    public static VerificationRules Lossless { get; } = new() { AllowResourcePruning = true, AllowContentCompaction = true, AllowFontMerging = true, AllowInheritedAttributes = true, AllowBilevelRecoding = true, AllowXObjectNameRemoval = true };
 }

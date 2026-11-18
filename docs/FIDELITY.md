@@ -84,6 +84,12 @@ copies of a font program or image merge even when they were encoded differently.
 covers the decoded bytes, any predictor and filter still applied, and the stream dictionary
 without its encoding entries.
 
+**Obsolete XObject names.** An image, form or PostScript XObject's `/Name` was required only in
+PDF 1.0; later readers ignore it (ISO 32000-1, tables 89 and 95). Unless the output stays PDF
+1.0, deduplication leaves it out of the comparison, and a merged XObject whose copies were named
+differently is written without it. The verifier then lets `/Name` be missing from such an
+XObject in the output, and from nothing else; a name may never appear or change.
+
 **Inherited page attributes.** With `Linearize`, `/Resources`, `/MediaBox`, `/CropBox` and
 `/Rotate` move from intermediate page tree nodes onto the pages that inherit them. The verifier
 then compares each page by the value it ends up with, its own or its nearest ancestor's, and does

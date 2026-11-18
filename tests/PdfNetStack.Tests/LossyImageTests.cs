@@ -514,6 +514,26 @@ public sealed class LossyImageTests
     }
 
     [TestMethod]
+    public void ProgressiveCodingIsTheDefaultFromPdf13()
+    {
+        byte[] input = Pdf((Dct(new Raster(320, 240, 3, new byte[320 * 240 * 3])), JpegCodecTests.Fixture("photo-q95.jpg"), "320 0 0 240 0 0"));
+
+        (byte[] output, PdfOptimizationResult result) = PdfOptimizer.Optimize(input, NoThreshold);
+
+        Assert.AreEqual(OptimizationDisposition.Optimized, result.Disposition, result.Reason);
+        using (JpegImage written = JpegReader.Read(Image(output, 0).Data.Span, Limit)) Assert.AreEqual(JpegCoding.Progressive, written.Coding);
+        Assert.IsNull(PdfEquivalence.FindDifference(input, output));
+
+        // Output that stays PDF 1.2 keeps sequential coding, which is all that version allows.
+        byte[] old = Compat.Latin1.GetBytes(Compat.Latin1.GetString(input).Replace("%PDF-1.4", "%PDF-1.2", StringComparison.Ordinal));
+        (byte[] sequential, PdfOptimizationResult r2) = PdfOptimizer.Optimize(old, NoThreshold with { UseObjectStreams = false });
+        Assert.AreEqual(OptimizationDisposition.Optimized, r2.Disposition, r2.Reason);
+        StringAssert.StartsWith(Compat.Latin1.GetString(sequential, 0, 8), "%PDF-1.2");
+        using (JpegImage written = JpegReader.Read(Image(sequential, 0).Data.Span, Limit)) Assert.AreNotEqual(JpegCoding.Progressive, written.Coding);
+        Assert.IsNull(PdfEquivalence.FindDifference(old, sequential));
+    }
+
+    [TestMethod]
     public void InvalidLossyOptionsAreRejected()
     {
         byte[] input = Pdf((Raw(SyntheticImages.Photo(20, 20, 1)), Deflate(new byte[400]), "20 0 0 20 0 0"));
@@ -526,6 +546,8 @@ public sealed class LossyImageTests
         Assert.ThrowsExactly<ArgumentException>(() => PdfOptimizer.Optimize(input, new PdfOptimizerOptions { ConvertImagesToJpeg = true }));
         Assert.ThrowsExactly<ArgumentException>(() => PdfOptimizer.Optimize(input, new PdfOptimizerOptions { MaxImageDpi = 150, RecompressStreams = false }));
         Assert.ThrowsExactly<ArgumentException>(() => PdfOptimizer.Optimize(input, new PdfOptimizerOptions { MaxBilevelImageDpi = 300, RecompressStreams = false }));
-        Assert.ThrowsExactly<ArgumentException>(() => PdfOptimizer.Optimize(input, new PdfOptimizerOptions { ProgressiveJpeg = true, RecompressStreams = false }));
+
+        // Progressive coding is the default; without recompression it simply has nothing to do.
+        Assert.AreNotEqual(OptimizationDisposition.LimitExceeded, PdfOptimizer.Optimize(input, new PdfOptimizerOptions { RecompressStreams = false }).Result.Disposition);
     }
 }

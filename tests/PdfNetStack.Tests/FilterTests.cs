@@ -107,6 +107,53 @@ public sealed class FilterTests
     }
 
     [TestMethod]
+    [DataRow(1, 8, 1)]
+    [DataRow(1, 8, 15)]
+    [DataRow(1, 8, 16)]
+    [DataRow(1, 8, 300)]
+    [DataRow(3, 8, 5)]
+    [DataRow(3, 8, 401)]
+    [DataRow(4, 8, 77)]
+    [DataRow(1, 1, 999)]
+    [DataRow(2, 16, 45)]
+    [DataRow(32, 16, 3)]
+    [DataRow(5, 8, 64)]
+    public void VectorPngPredictionMatchesTheScalarCode(int colors, int bpc, int columns)
+    {
+        var p = new PredictorParams(15, colors, bpc, columns);
+        var random = new Random(columns);
+        var data = new byte[p.RowBytes * 19];
+
+        // Smooth gradients, noise, flat runs and extremes, so every row filter wins somewhere and
+        // differences cross the signed byte boundary (-128 scores 128).
+        for (int i = 0; i < data.Length; i++)
+        {
+            int row = i / p.RowBytes;
+            data[i] = (row % 4) switch
+            {
+                0 => (byte)(i * 3),
+                1 => (byte)random.Next(256),
+                2 => (byte)(random.Next(2) * 255),
+                _ => (byte)(128 + (i % 7)),
+            };
+        }
+
+        byte[] scalar = D.Take(Predictors.EncodePng(data, p, vectorize: false));
+        byte[] vector = D.Take(Predictors.EncodePng(data, p));
+        CollectionAssert.AreEqual(scalar, vector);
+
+        // Written to a stream as they are made, the rows are the same bytes, and deflated that way
+        // they inflate back to them.
+        using var rows = new MemoryStream();
+        Predictors.WritePng(data, p, rows);
+        CollectionAssert.AreEqual(vector, rows.ToArray());
+        CollectionAssert.AreEqual(vector, D.Flate(StreamCodec.Deflate(s => Predictors.WritePng(data, p, s), vector.Length, Compat.MaximumCompression), Limit));
+        Assert.IsGreaterThan(0, StreamCodec.DeflatedLength(s => Predictors.WritePng(data, p, s), CompressionLevel.Fastest));
+        Assert.IsTrue(Predictors.TryDecode(vector, p, Limit, out BoundedBuffer? decoded));
+        CollectionAssert.AreEqual(data, D.Take(decoded!));
+    }
+
+    [TestMethod]
     public void TiffPredictorDecodes8Bit()
     {
         var p = new PredictorParams(2, 1, 8, 4);
