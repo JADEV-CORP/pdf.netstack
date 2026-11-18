@@ -56,7 +56,7 @@ add-ons, such as the ONNX Runtime behind OCR.
 You need the .NET 10 SDK. Tests also run on .NET 8, and on Windows on .NET Framework 4.8.
 
 ```bash
-git clone https://github.com/jams4code/pdf.netstack
+git clone https://github.com/JADEV-CORP/pdf.netstack
 cd pdf.netstack
 dotnet build PdfNetStack.sln -c Release
 dotnet test PdfNetStack.sln -c Release

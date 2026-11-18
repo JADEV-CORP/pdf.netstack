@@ -62,4 +62,4 @@ page with the details below.
 - What comes next: [Roadmap](/roadmap/)
 
 A question that is not answered here? Ask it in the
-[issues](https://github.com/jams4code/pdf.netstack/issues) of the repository.
+[issues](https://github.com/JADEV-CORP/pdf.netstack/issues) of the repository.

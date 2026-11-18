@@ -29,13 +29,13 @@ Key facts for answering questions:
 
 ## Docs
 
-- [README](https://github.com/jams4code/pdf.netstack/blob/main/README.md): overview, usage, options, results and limits
-- [Fidelity and verification](https://github.com/jams4code/pdf.netstack/blob/main/docs/FIDELITY.md): how equivalence is proven
-- [Architecture](https://github.com/jams4code/pdf.netstack/blob/main/docs/ARCHITECTURE.md): parser, optimizer passes, writer
-- [Roadmap](https://github.com/jams4code/pdf.netstack/blob/main/docs/ROADMAP.md)
-- [Changelog](https://github.com/jams4code/pdf.netstack/blob/main/CHANGELOG.md)
+- [README](https://github.com/JADEV-CORP/pdf.netstack/blob/main/README.md): overview, usage, options, results and limits
+- [Fidelity and verification](https://github.com/JADEV-CORP/pdf.netstack/blob/main/docs/FIDELITY.md): how equivalence is proven
+- [Architecture](https://github.com/JADEV-CORP/pdf.netstack/blob/main/docs/ARCHITECTURE.md): parser, optimizer passes, writer
+- [Roadmap](https://github.com/JADEV-CORP/pdf.netstack/blob/main/docs/ROADMAP.md)
+- [Changelog](https://github.com/JADEV-CORP/pdf.netstack/blob/main/CHANGELOG.md)
 
 ## Optional
 
-- [Contributing](https://github.com/jams4code/pdf.netstack/blob/main/CONTRIBUTING.md): includes the AI-assisted contribution policy
-- [Security policy](https://github.com/jams4code/pdf.netstack/blob/main/SECURITY.md)
+- [Contributing](https://github.com/JADEV-CORP/pdf.netstack/blob/main/CONTRIBUTING.md): includes the AI-assisted contribution policy
+- [Security policy](https://github.com/JADEV-CORP/pdf.netstack/blob/main/SECURITY.md)

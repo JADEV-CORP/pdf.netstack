@@ -50,7 +50,7 @@ function displayFile({ text, since }) {
       if (!noted) {
         out.push(
           since === 'unreleased' ? '// Not on NuGet yet. Clone' : `// Uses features from ${since}, not on NuGet yet. Clone`,
-          '// https://github.com/jams4code/pdf.netstack next to this file to build against it.',
+          '// https://github.com/JADEV-CORP/pdf.netstack next to this file to build against it.',
         );
         noted = true;
       }

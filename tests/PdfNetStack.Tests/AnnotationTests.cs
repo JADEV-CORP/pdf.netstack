@@ -29,13 +29,13 @@ public sealed class AnnotationTests
     {
         PdfDocument doc = PdfDocument.Create();
         PdfPage page = doc.Pages.Add(new PdfRectangle(0, 0, 600, 800));
-        page.Annotations.AddLink(50, 100, 200, 20, new Uri("https://github.com/jams4code/pdf.netstack?a=b c"));
+        page.Annotations.AddLink(50, 100, 200, 20, new Uri("https://github.com/JADEV-CORP/pdf.netstack?a=b c"));
 
         PdfDocument back = Reopen(doc);
         PdfAnnotation link = back.Pages[0].Annotations.Single();
         Assert.AreEqual("Link", link.Subtype);
         Assert.AreEqual(new PdfRectangle(50, 680, 250, 700), link.Rectangle);
-        Assert.AreEqual("https://github.com/jams4code/pdf.netstack?a=b%20c", link.Uri);
+        Assert.AreEqual("https://github.com/JADEV-CORP/pdf.netstack?a=b%20c", link.Uri);
         CollectionAssert.AreEqual(new double[] { 0, 0, 0 }, Numbers(link.Dictionary["Border"]));
         Assert.IsNull(link.Destination);
         Assert.ThrowsExactly<ArgumentException>(() => page.Annotations.AddLink(0, 0, 10, 10, new Uri("/relative", UriKind.Relative)));

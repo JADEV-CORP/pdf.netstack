@@ -26,7 +26,7 @@ import urllib.request
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 DEFAULT_MANIFEST = os.path.join(ROOT, "eng", "corpus", "manifest.json")
 DEFAULT_CACHE = os.path.join(ROOT, "artifacts", "corpus", "files")
-USER_AGENT = "PdfNetStack-corpus/1.0 (+https://github.com/jams4code/pdf.netstack)"
+USER_AGENT = "PdfNetStack-corpus/1.0 (+https://github.com/JADEV-CORP/pdf.netstack)"
 ATTEMPTS = 3
 
 

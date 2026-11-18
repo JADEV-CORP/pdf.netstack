@@ -11,7 +11,7 @@ name: Release
 # - Otherwise the NUGET_API_KEY repository secret.
 #
 # Every package and command line binary gets a build provenance attestation (verify one with
-# `gh attestation verify <file> --repo jams4code/pdf.netstack`), and every package a CycloneDX
+# `gh attestation verify <file> --repo JADEV-CORP/pdf.netstack`), and every package a CycloneDX
 # SBOM attached to the GitHub release.
 on:
   push:
