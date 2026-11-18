@@ -48,8 +48,8 @@ small build file that copies the models is part of PdfNetStack, MIT License.
 
 ## Links
 
-- Project and documentation: https://github.com/jams4code/pdf.netstack
-- OCR design notes: https://github.com/jams4code/pdf.netstack/blob/main/docs/OCR.md
-- Changelog: https://github.com/jams4code/pdf.netstack/blob/main/CHANGELOG.md
+- Project and documentation: https://github.com/JADEV-CORP/pdf.netstack
+- OCR design notes: https://github.com/JADEV-CORP/pdf.netstack/blob/main/docs/OCR.md
+- Changelog: https://github.com/JADEV-CORP/pdf.netstack/blob/main/CHANGELOG.md
 
 By Jamal Abdelkhalek, [JADEV](https://jadev-corp.com). Models Apache-2.0.

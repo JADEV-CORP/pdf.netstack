@@ -3,7 +3,7 @@
 Shrink PDFs on a server without breaking them, in pure C#. Forms, tags, signatures and PDF/A
 survive, and every output is proved equivalent to its input before it is returned. MIT licensed,
 no native binaries, no Ghostscript. Created and maintained by Jamal Abdelkhalek at
-[JADEV](https://github.com/jams4code).
+[JADEV](https://github.com/JADEV-CORP).
 
 PdfNetStack makes PDFs smaller without changing a single rendered pixel, then proves it: the
 output is re-read and compared to the source object by object before it is returned. If anything
@@ -89,8 +89,8 @@ PDFium and compared with its original: zero differing pixels, zero verification 
 
 ## Links
 
-- [Documentation and source](https://github.com/jams4code/pdf.netstack)
+- [Documentation and source](https://github.com/JADEV-CORP/pdf.netstack)
 - [Command line tool: PdfNetStack.Tool](https://www.nuget.org/packages/PdfNetStack.Tool)
-- [Fidelity and verification method](https://github.com/jams4code/pdf.netstack/blob/main/docs/FIDELITY.md)
-- [Changelog](https://github.com/jams4code/pdf.netstack/blob/main/CHANGELOG.md)
-- [Report an issue](https://github.com/jams4code/pdf.netstack/issues)
+- [Fidelity and verification method](https://github.com/JADEV-CORP/pdf.netstack/blob/main/docs/FIDELITY.md)
+- [Changelog](https://github.com/JADEV-CORP/pdf.netstack/blob/main/CHANGELOG.md)
+- [Report an issue](https://github.com/JADEV-CORP/pdf.netstack/issues)

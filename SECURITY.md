@@ -54,7 +54,7 @@ Out of scope: high memory use that stays within the documented limits and scales
 
 - The release workflow publishes to NuGet with trusted publishing, without a stored API key.
 - Every `.nupkg` and command line binary has a build provenance attestation:
-  `gh attestation verify <file> --repo jams4code/pdf.netstack` checks that this repository's
+  `gh attestation verify <file> --repo JADEV-CORP/pdf.netstack` checks that this repository's
   release workflow built it from the tagged commit.
 - Each GitHub release carries a CycloneDX SBOM per package (`<package>.<version>.cdx.json`) and
   `SHA256SUMS.txt` for the command line binaries.

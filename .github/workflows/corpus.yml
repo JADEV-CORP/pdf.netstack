@@ -23,7 +23,7 @@ concurrency:
 
 jobs:
   benchmark:
-    if: github.repository == 'jams4code/pdf.netstack'
+    if: github.repository == 'JADEV-CORP/pdf.netstack'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -103,7 +103,7 @@ jobs:
     # (tools/compare_optimizers.py) and scores each output on size, rendering and what it kept,
     # PDF/A conformance (veraPDF) and usage rights included. PdfNetStack runs with the library
     # defaults as the Native AOT command line tool on one thread, so start up does not count.
-    if: github.repository == 'jams4code/pdf.netstack'
+    if: github.repository == 'JADEV-CORP/pdf.netstack'
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -227,7 +227,7 @@ jobs:
     # Attaches the report of a version tag to its release, with the comparison. The release itself
     # is created by the Release workflow; this job waits for it.
     needs: benchmark
-    if: always() && startsWith(github.ref, 'refs/tags/v') && github.repository == 'jams4code/pdf.netstack'
+    if: always() && startsWith(github.ref, 'refs/tags/v') && github.repository == 'JADEV-CORP/pdf.netstack'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     permissions:

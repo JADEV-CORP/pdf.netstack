@@ -23,7 +23,7 @@ Publish ready to run.
 ```
 
 A complete app with an HTTP trigger for HTML and an Event Grid blob trigger for optimization is
-in [samples/serverless/azure-functions](https://github.com/jams4code/pdf.netstack/tree/main/samples/serverless/azure-functions).
+in [samples/serverless/azure-functions](https://github.com/JADEV-CORP/pdf.netstack/tree/main/samples/serverless/azure-functions).
 
 ## Fonts
 
