@@ -116,6 +116,14 @@ internal static class ChildProcess
             throw new TimeoutException($"Tesseract took longer than {timeout} and was stopped.");
         }
 
+        // A cancelled input writer closes the pipe early, so the process can end, on the truncated
+        // input, before the wait sees the token. Its result is then meaningless: cancelled wins.
+        if (cancellationToken.IsCancellationRequested)
+        {
+            Stop(process, pumps);
+            cancellationToken.ThrowIfCancellationRequested();
+        }
+
         if (Volatile.Read(ref overflow)) Stop(process, pumps);
         bool settled = Task.WaitAll(pumps, SettleMilliseconds, CancellationToken.None);
 
