@@ -33,6 +33,7 @@ internal static class Jbig2Generic
         int ltp = 0;
         int pairs = template == 0 ? 4 : 1;
         var atRows = new int[pairs];
+        bool nominal = template == 0 && skip is null && at.AsSpan().SequenceEqual(NominalAt(0));
         for (int y = 0; y < b.Height; y++)
         {
             if (typical)
@@ -47,6 +48,12 @@ internal static class Jbig2Generic
 
             // Rows are read through their offsets, -1 for a row outside the bitmap, which reads as 0.
             int row = y * stride, up1 = Row(y - 1, b), up2 = Row(y - 2, b);
+            if (nominal)
+            {
+                NominalTemplate0Row(decoder, contexts, d, row, up1, up2, w);
+                continue;
+            }
+
             for (int k = 0; k < pairs; k++) atRows[k] = Row((long)y + at[(2 * k) + 1], b);
 
             // The pixel order follows each template's rows, so each row of the template slides by one bit per pixel.
@@ -146,6 +153,28 @@ internal static class Jbig2Generic
         }
 
         return b;
+    }
+
+    /// <summary>
+    /// One row of template 0 with its adaptive pixels at their nominal places, as most encoders
+    /// write it. The 16 pixels of the context are then three windows side by side, 5 pixels two
+    /// rows up (x - 2 to x + 2), 7 one row up (x - 3 to x + 3) and the 4 before x, each sliding one
+    /// column a pixel: two pixels are read per pixel decoded rather than six. The contexts are
+    /// those of the general case, bit for bit.
+    /// </summary>
+    private static void NominalTemplate0Row(Jbig2ArithmeticDecoder decoder, byte[] contexts, byte[] d, int row, int up1, int up2, int w)
+    {
+        int w1 = (Pixel(d, up2, 0, w) << 2) | (Pixel(d, up2, 1, w) << 1) | Pixel(d, up2, 2, w);
+        int w2 = (Pixel(d, up1, 0, w) << 3) | (Pixel(d, up1, 1, w) << 2) | (Pixel(d, up1, 2, w) << 1) | Pixel(d, up1, 3, w);
+        int w3 = 0;
+        for (int x = 0; x < w; x++)
+        {
+            int bit = decoder.Decode(contexts, w3 | (w2 << 4) | (w1 << 11));
+            if (bit != 0) d[row + (x >> 3)] |= (byte)(0x80 >> (x & 7));
+            w1 = ((w1 << 1) | Pixel(d, up2, x + 3, w)) & 0x1F;
+            w2 = ((w2 << 1) | Pixel(d, up1, x + 4, w)) & 0x7F;
+            w3 = ((w3 << 1) | bit) & 0x0F;
+        }
     }
 
     /// <summary>Where row <paramref name="y"/> starts in the bitmap's data, or -1 outside it.</summary>
