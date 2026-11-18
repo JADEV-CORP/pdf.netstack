@@ -331,7 +331,7 @@ public static class HtmlConverter
     /// <exception cref="HtmlConversionException">The document goes past a limit of <paramref name="options"/>, such as <see cref="HtmlConverterOptions.MaxPages"/>.</exception>
     /// <exception cref="OperationCanceledException">The token fired.</exception>
     public static byte[] ConvertToPdf(string html, HtmlConverterOptions? options, CancellationToken cancellationToken) =>
-        ConvertToDocument(html, options, cancellationToken).ToArray(SaveOptions(options));
+        ConvertToDocument(html, options, cancellationToken).ToArray(SaveOptions(options), CancellationToken.None);
 
     /// <summary>Converts an HTML string and writes the PDF to a stream.</summary>
     /// <param name="html">The HTML.</param>
