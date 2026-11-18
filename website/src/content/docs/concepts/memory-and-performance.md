@@ -5,7 +5,7 @@ sidebar:
   label: Memory and performance
 faq:
   - q: How much memory does PdfNetStack need to optimize a PDF?
-    a: The optimizer holds the whole document in memory. Plan for about 10 times the file size, more for image heavy files, or lower MaxDegreeOfParallelism. To read or edit a large file without loading it, open it with PdfDocument.OpenOnDemand (1.1).
+    a: Measured on 1.2.0 with default options, the optimizer peaked at 24 to 60 times the input file, and needed a GC heap limit of 256 MB for a 5.8 MiB file and 512 MB for a 16 MiB image heavy one. Size containers from those numbers and lower MaxDegreeOfParallelism to cut the peak. To read or edit a large file without loading it, open it with PdfDocument.OpenOnDemand (1.1).
   - q: Is PdfNetStack compatible with Native AOT and trimming?
     a: Yes, on .NET 8 and later. The core, HTML and OCR libraries are marked AOT compatible, and CI publishes them with Native AOT on Linux x64 and arm64 and fails on any trim or AOT warning.
 ---
@@ -14,10 +14,73 @@ What PdfNetStack costs in memory and time, and the settings that change it.
 
 ## Short answer
 
-The optimizer reads a document whole into memory and processes it there. Plan for about 10 times
-the file size, more for image heavy files. From 1.1, `PdfDocument.OpenOnDemand` reads and edits a
-file of any size page by page, without loading it. `MaxDegreeOfParallelism` is the main lever on peak memory, and
-`Compression` is the main lever on time.
+The optimizer reads a document whole into memory and processes it there. On 1.2.0, with default
+options, its peak working set measured 24 to 60 times the input file, and it needed a GC heap
+limit of 256 MB for a 5.8 MiB file and 512 MB for a 16 MiB image heavy file. Size
+containers and functions from the [measured numbers](#measured-memory-use), not from the file
+size alone. `MaxDegreeOfParallelism` is the main lever on peak memory, and `Compression` is the
+main lever on time. From 1.1, `PdfDocument.OpenOnDemand` reads and edits a file of any size page
+by page, without loading it.
+
+Work for 1.3 is reducing these numbers. This page will be updated with that release.
+
+## Measured memory use
+
+Measured on 17 November 2026 with PdfNetStack 1.2.0 on .NET 10, macOS arm64, lossless default
+options (`MaxDegreeOfParallelism` equal to the processor count), in a warm process with
+workstation GC:
+
+| Input | Size | Peak working set | Times the input | GC heap limit needed |
+|---|---:|---:|---:|---|
+| NIST SP 800-53 rev. 5 (61,000 objects) | 5.8 MiB | 323 to 350 MB | 56 to 60 | 256 MB (192 MB failed) |
+| arXiv 2306.01681 | 34.5 MiB | 821 MB | 24 | Not measured |
+| arXiv 2311.06340 (image heavy) | 16.0 MiB | Not measured | | 512 MB, in memory and with `Streaming` |
+
+One NIST run allocated 1.64 GB in total and took 1.2 to 1.5 seconds. The lossy image options
+decode images to pixels and need more: on the public corpus in CI (77 files, Linux, 4 cores, 16
+November 2026), the largest peak working set was 618 MiB for the lossless default, 1.8 GiB for the
+lossy profile and 2.4 GiB for the `Balanced` preset.
+
+`Streaming` keeps the file itself out of memory, but memory still follows the objects and the
+streams being recompressed, so image heavy files need room in that mode too.
+
+## Sizing containers and functions
+
+- **Start from the largest file you accept.** Set `MaxInputBytes` to it and size for about 60
+  times that file for lossless optimization at the default parallelism, more with the lossy image
+  options, and not below 512 MB. Measure your own files: the ratio depends on how many objects and
+  how many decoded image bytes a file has, not on its size.
+- **Leave room for the heap limit.** In a container with a memory limit, .NET caps the GC heap at
+  75% of that limit by default. A 256 MB container gives a 192 MB heap, which is not enough for
+  NIST SP 800-53 above. `System.GC.HeapHardLimitPercent` in `runtimeconfig.json`, or
+  `DOTNET_GCHeapHardLimitPercent` as an environment variable (a hexadecimal value), changes the
+  share; `System.GC.HeapHardLimit` and `DOTNET_GCHeapHardLimit` set it in bytes. See
+  [GC configuration](https://learn.microsoft.com/dotnet/core/runtime-config/garbage-collector).
+- **Lower `MaxDegreeOfParallelism` to cut the peak.** Each worker decodes its own streams. In a
+  service, set it per request; in a batch, see [Many documents at once](#many-documents-at-once).
+- **Watch the reason when a file comes back unchanged.** On 1.2.0, a rewrite that runs out of
+  memory is not thrown: the optimizer returns your input with `OriginalRetained` and a reason that
+  starts with `Rewrite failed (OutOfMemoryException)`. This is being changed for 1.3.
+- **Serverless.** In AWS Lambda, memory also buys CPU, so size the function from the numbers above
+  and cap the input size. See [AWS Lambda](/guides/aws-lambda/) and
+  [Azure Functions](/guides/azure-functions/).
+
+## Server GC and DATAS
+
+The runtime's default for a standalone app is workstation GC; hosts such as ASP.NET Core choose
+their own. `GCSettings.IsServerGC` tells you which one a process uses.
+
+- **Server GC is faster here.** On NIST SP 800-53 (1.2.0, same machine as above), Server GC ran
+  the optimizer 17 to 22% faster than workstation GC, and total GC pause time per run fell from 258
+  ms to 80 ms. Turn it on with `<ServerGarbageCollection>true</ServerGarbageCollection>` in the
+  project, or `DOTNET_gcServer=1`.
+- **Keep DATAS with Server GC.** Server GC keeps a heap per logical CPU, which costs memory.
+  DATAS (dynamic adaptation to application sizes) adapts the number of heaps to the load and is
+  on by default from .NET 9. On .NET 8, turn it on with
+  `<GarbageCollectionAdaptationMode>1</GarbageCollectionAdaptationMode>` or
+  `DOTNET_GCDynamicAdaptationMode=1`.
+- **Many small instances.** For many processes on few cores, such as one container per request,
+  workstation GC can be the better choice. Measure both on your files.
 
 ## Memory
 

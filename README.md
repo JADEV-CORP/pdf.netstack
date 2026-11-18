@@ -1,7 +1,9 @@
 # PdfNetStack
 
-Compress, optimize, edit and create PDF files in .NET, and convert HTML and CSS to PDF. Pure C#,
-MIT licensed, no native binaries, no dependencies on .NET 8 and later.
+Shrink PDFs on a server without breaking them, in pure C#. Forms, tags, signatures and PDF/A
+survive, and every output is proved equivalent to its input before you get it. MIT licensed, so
+it is also a home for code leaving PDFsharp now that 6.5.0 is AGPL-3.0. No native binaries, no
+dependencies on .NET 8 and later.
 
 [![CI](https://github.com/jams4code/pdf.netstack/actions/workflows/ci.yml/badge.svg)](https://github.com/jams4code/pdf.netstack/actions/workflows/ci.yml)
 [![NuGet](https://img.shields.io/nuget/v/PdfNetStack.svg)](https://www.nuget.org/packages/PdfNetStack)
@@ -11,13 +13,26 @@ MIT licensed, no native binaries, no dependencies on .NET 8 and later.
 Documentation, guides and benchmarks: **[jadev-corp.com/pdfnetstack](https://www.jadev-corp.com/pdfnetstack/)**.
 Built and maintained by [JADEV](https://www.jadev-corp.com/en), software engineering.
 
-PdfNetStack makes PDFs smaller without changing a single rendered pixel. It rewrites the file
-with compressed object streams and a compressed cross-reference stream, drops objects nothing
-points to and resources no page uses, recompresses streams, rewrites content streams compactly,
-adds PNG prediction to raw images, and merges duplicate fonts, images and resources, including
-separately embedded subsets of one font. Then it reads its own output back and proves, object by
-object, that the document is the same as the one you gave it. If anything is off, you get your
-original bytes back.
+Two jobs come first.
+
+**Shrink PDFs on a server without breaking them.** The optimizer makes PDFs smaller without
+changing a single rendered pixel. It rewrites the file with compressed object streams and a
+compressed cross-reference stream, drops objects nothing points to and resources no page uses,
+recompresses streams, rewrites content streams compactly, adds PNG prediction to raw images, and
+merges duplicate fonts, images and resources, including separately embedded subsets of one font.
+Then it reads its own output back and proves, object by object, that the document is the same as
+the one you gave it. If anything is off, you get your original bytes back. Forms, structure tags,
+bookmarks and attachments come through; signed and encrypted files are returned untouched; PDF/A-1
+files keep the classic layout their standard requires.
+
+**Give PDFsharp users an MIT home.** PDFsharp and MigraDoc 6.5.0, published on 14 October 2026,
+carry the license AGPL-3.0-only; 6.2.4 and earlier stay MIT. PdfNetStack draws, edits, merges,
+splits, fills forms and encrypts under MIT, with drawing calls that follow `XGraphics`. The
+[migration guide](https://www.jadev-corp.com/pdfnetstack/guides/migrate-from-pdfsharp/) maps the
+common calls, with before and after code.
+
+It also extracts text and images, converts HTML and CSS to PDF, signs to PAdES, writes PDF/A and
+makes scans searchable. See [Usage](#usage).
 
 ```csharp
 using PdfNetStack;
@@ -28,10 +43,12 @@ Console.WriteLine($"{result.Disposition}: saved {result.SavingPercent:F1}%");
 
 ## Purpose
 
-PdfNetStack gives .NET developers a PDF toolkit that is permissively licensed all the way down,
-safe to run on files from strangers, and honest about what it changes. It optimizes, creates,
-edits, merges, splits and protects PDFs, extracts their text and images, and converts HTML and CSS
-to PDF.
+PdfNetStack gives .NET developers a PDF toolkit that is permissively licensed all the way down
+and honest about what it changes. Its first job is shrinking PDFs on servers without breaking
+them; its second is an MIT path for teams that cannot take the AGPL that came with PDFsharp 6.5.0.
+Around those, it optimizes, creates, edits, merges, splits and protects PDFs, extracts their text
+and images, and converts HTML and CSS to PDF. For files from untrusted sources, the
+[safety model](#safety-model) says what it refuses and what is bounded today.
 
 PdfNetStack is a greenfield project. Its code is original and written from the published
 specifications: ISO 32000 for PDF, OpenType, Unicode, and the HTML and CSS standards. See
@@ -750,9 +767,11 @@ The optimizer refuses to rewrite, and returns the input unchanged, when the file
 PDF/A-1 files are detected from their XMP metadata and written with a classic xref table and
 no object streams, because PDF/A-1 predates both.
 
-Hostile input is bounded: nesting depth is capped, decoded stream size is capped
-(`MaxDecodedStreamBytes`, default 256 MiB) as a zip bomb defence, `/Prev` loops terminate,
+Limits on hostile input apply per object today: nesting depth is capped, each decoded stream is
+capped (`MaxDecodedStreamBytes`, default 256 MiB) as a zip bomb defence, `/Prev` loops terminate,
 wrong stream lengths are recovered from `endstream`, and unreadable objects never crash the run.
+There is no budget for a whole document yet. Resource limits for untrusted input are being added
+in 1.3; until then, run untrusted files in a worker with a memory limit and a timeout.
 
 The verifier walks the source and output graphs in lockstep from the trailer. Dictionaries
 must have the same keys and values, arrays the same items, references must line up, and every
@@ -940,12 +959,17 @@ doc.Pages[0].Dictionary.Set("Contents", doc.AddObject(content));  // replace pag
   run 64 bit and reference `Microsoft.ML.OnnxRuntime` itself, so its native runtime is copied next
   to the app.
 - Linearization is opt-in (`Linearize`); without it, the linearization of an input is dropped.
-- In memory, the default, the optimizer holds the whole document. Peak memory depends on decoded
-  image sizes and on parallelism: plan for about 10 times the file size, more for image heavy
-  files, or lower `MaxDegreeOfParallelism`. `Streaming` keeps memory bounded instead, at the
-  cost of a temporary file the size of the output and more reads of the source. Its output can
-  differ slightly from the in-memory rewrite, because duplicates are found before recompression:
-  two JPEG files that differ only in metadata stay two.
+- In memory, the default, the optimizer holds the whole document. Peak memory depends on the
+  number of objects, decoded image sizes and parallelism. Measured on 1.2.0 (17 November 2026,
+  .NET 10, macOS arm64, default options), the peak working set was 24 to 60 times the input:
+  323 to 350 MB for NIST SP 800-53 (5.8 MiB) and 821 MB for an arXiv paper of 34.5 MiB. NIST SP
+  800-53 needed a GC heap limit of 256 MB, and an image heavy arXiv paper of 16 MiB needed 512 MB,
+  in streaming mode too. Lower `MaxDegreeOfParallelism` to cut the peak, and see
+  [Memory and performance](https://www.jadev-corp.com/pdfnetstack/concepts/memory-and-performance/)
+  for container sizing and GC settings. Work for 1.3 is reducing these numbers. `Streaming`
+  keeps the file itself out of memory, at the cost of a temporary file the size of the output and
+  more reads of the source. Its output can differ slightly from the in-memory rewrite, because
+  duplicates are found before recompression: two JPEG files that differ only in metadata stay two.
 - A full save with the optimizer, the default, builds the file in memory; with `Optimize = false`
   it is written progressively. To read or edit a large file without loading it, open
   it with `PdfLoadMode.OnDemand`, then use `SaveIncremental` or a progressive save.
@@ -960,6 +984,7 @@ doc.Pages[0].Dictionary.Set("Contents", doc.AddObject(content));  // replace pag
 ## Documentation
 
 - [Documentation site](https://www.jadev-corp.com/pdfnetstack): guides, recipes and the API reference
+- [Migrating from PDFsharp 6](https://www.jadev-corp.com/pdfnetstack/guides/migrate-from-pdfsharp/): common calls mapped, with before and after code
 - [Architecture](docs/ARCHITECTURE.md)
 - [Fidelity and verification](docs/FIDELITY.md)
 - [Roadmap](docs/ROADMAP.md)
