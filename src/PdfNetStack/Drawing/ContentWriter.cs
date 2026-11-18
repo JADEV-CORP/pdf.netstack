@@ -17,6 +17,14 @@ internal sealed class ContentWriter
 
     public ReadOnlySpan<byte> Written => _buffer.AsSpan(0, _length);
 
+    /// <summary>Drops what was written after <paramref name="length"/>, which must be a position right after an operator.</summary>
+    public void Truncate(int length)
+    {
+        if (length < 0 || length > _length) throw new ArgumentOutOfRangeException(nameof(length));
+        _length = length;
+        _needsSpace = false;
+    }
+
     public ContentWriter Number(double value)
     {
         Separate();

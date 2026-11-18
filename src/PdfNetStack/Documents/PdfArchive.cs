@@ -57,6 +57,9 @@ internal static class PdfArchive
 {
     private const string Transparency = "Transparency (opacity, soft masks, images with an alpha channel, blend modes, transparency groups) is not allowed in PDF/A-1; use PDF/A-2 or later.";
 
+    /// <summary>The PDF/UA identification schema (ISO 14289-1, 5).</summary>
+    internal const string UniversalAccessNamespace = "http://www.aiim.org/pdfua/ns/id/";
+
     private static readonly Lazy<byte[]> Srgb = new(SrgbProfile.Create);
 
     /// <summary>Annotation types PDF/A-1 allows: those of PDF 1.4 except file attachments, sounds and movies (ISO 19005-1, 6.5.2).</summary>
@@ -111,7 +114,8 @@ internal static class PdfArchive
     private static string Name(PdfConformance conformance) =>
         "PDF/A-" + Part(conformance).ToString(CultureInfo.InvariantCulture) + (Level(conformance)?.ToLowerInvariant() ?? "");
 
-    public static void Prepare(PdfDocument doc, PdfConformance conformance)
+    /// <param name="accessible">Whether the file is also PDF/UA-1, which the metadata then declares.</param>
+    public static void Prepare(PdfDocument doc, PdfConformance conformance, bool accessible = false)
     {
         int part = Part(conformance);
         string? level = Level(conformance);
@@ -144,7 +148,7 @@ internal static class PdfArchive
         // The header carries the version the part fixes; a catalog entry must not claim another.
         if (part is 1 or 4) doc.Catalog.Remove("Version");
         AddOutputIntent(doc);
-        WriteMetadata(doc, part, level, invoice);
+        WriteMetadata(doc, part, level, invoice, accessible);
     }
 
     private static void CheckFonts(PdfDocument doc, List<PdfDictionary> fonts, List<string> problems, bool unicode, int part)
@@ -276,14 +280,14 @@ internal static class PdfArchive
     }
 
     /// <summary>What the resource dictionaries of pages, forms, patterns, soft masks, Type 3 fonts and annotation appearances use.</summary>
-    private sealed class Resources
+    internal sealed class Resources
     {
         public List<PdfDictionary> Fonts { get; } = [];
 
         public List<PdfDictionary> GraphicsStates { get; } = [];
     }
 
-    private static Resources Collect(PdfDocument doc)
+    internal static Resources Collect(PdfDocument doc)
     {
         var found = new Resources();
         var seen = new HashSet<PdfDictionary>();
@@ -798,10 +802,12 @@ internal static class PdfArchive
     }
 
     /// <summary>
-    /// XMP with the PDF/A identification and the same values as the information dictionary.
-    /// PDF/A-4 adds the revision year and names a conformance level only for 4e and 4f.
+    /// XMP with the PDF/A and PDF/UA identifications and the same values as the information
+    /// dictionary. PDF/A-4 adds the revision year and names a conformance level only for 4e and 4f.
     /// </summary>
-    private static void WriteMetadata(PdfDocument doc, int part, string? conformance, InvoiceMetadata? invoice)
+    /// <param name="part">The PDF/A part, or 0 for a file that is not PDF/A.</param>
+    /// <param name="accessible">Whether the file is PDF/UA-1 (ISO 14289-1, 5).</param>
+    internal static void WriteMetadata(PdfDocument doc, int part, string? conformance, InvoiceMetadata? invoice, bool accessible)
     {
         PdfDocumentInfo info = doc.Info;
         DateTimeOffset now = DateTimeOffset.UtcNow;
@@ -818,10 +824,17 @@ internal static class PdfArchive
         x.Append("<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\n<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n");
         x.Append("<rdf:Description rdf:about=\"\"");
         x.Append(" xmlns:pdfaid=\"http://www.aiim.org/pdfa/ns/id/\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\"");
-        x.Append(" xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\" xmlns:pdf=\"http://ns.adobe.com/pdf/1.3/\" xmlns:xmpMM=\"http://ns.adobe.com/xap/1.0/mm/\">\n");
-        x.Append("<pdfaid:part>").Append(part).Append("</pdfaid:part>\n");
-        if (part == 4) x.Append("<pdfaid:rev>2020</pdfaid:rev>\n");
-        if (conformance is not null) x.Append("<pdfaid:conformance>").Append(conformance).Append("</pdfaid:conformance>\n");
+        x.Append(" xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\" xmlns:pdf=\"http://ns.adobe.com/pdf/1.3/\" xmlns:xmpMM=\"http://ns.adobe.com/xap/1.0/mm/\"");
+        if (accessible) x.Append(" xmlns:pdfuaid=\"").Append(UniversalAccessNamespace).Append('"');
+        x.Append(">\n");
+        if (part != 0)
+        {
+            x.Append("<pdfaid:part>").Append(part).Append("</pdfaid:part>\n");
+            if (part == 4) x.Append("<pdfaid:rev>2020</pdfaid:rev>\n");
+            if (conformance is not null) x.Append("<pdfaid:conformance>").Append(conformance).Append("</pdfaid:conformance>\n");
+        }
+
+        if (accessible) x.Append("<pdfuaid:part>1</pdfuaid:part>\n");
         x.Append("<dc:format>application/pdf</dc:format>\n");
         if (info.Title is string title) x.Append("<dc:title><rdf:Alt><rdf:li xml:lang=\"x-default\">").Append(Escape(title)).Append("</rdf:li></rdf:Alt></dc:title>\n");
         if (info.Author is string author) x.Append("<dc:creator><rdf:Seq><rdf:li>").Append(Escape(author)).Append("</rdf:li></rdf:Seq></dc:creator>\n");
@@ -836,6 +849,10 @@ internal static class PdfArchive
         x.Append("<xmpMM:InstanceID>uuid:").Append(Guid.NewGuid()).Append("</xmpMM:InstanceID>\n");
         x.Append("</rdf:Description>\n");
         if (invoice is not null) AppendInvoice(x, invoice);
+
+        // PDF/A-1 to 3 accept only the schemas they predefine or that the file declares; PDF/A-4 dropped the rule.
+        bool fx = invoice is not null, ua = accessible && part is 1 or 2 or 3;
+        if (fx || ua) AppendExtensionSchemas(x, fx, ua);
         x.Append("</rdf:RDF>\n</x:xmpmeta>\n");
         x.Append(' ', 2000).Append("\n<?xpacket end=\"w\"?>");
 
@@ -846,10 +863,7 @@ internal static class PdfArchive
         doc.Catalog.Set("Metadata", doc.AddObject(stream));
     }
 
-    /// <summary>
-    /// The Factur-X properties and, as PDF/A requires for any schema outside its predefined list,
-    /// the extension schema that declares them (ISO 19005-3, 6.6.2.3; Factur-X 1.0, 6.2.2).
-    /// </summary>
+    /// <summary>The Factur-X properties (Factur-X 1.0, 6.2.2).</summary>
     private static void AppendInvoice(StringBuilder x, InvoiceMetadata invoice)
     {
         x.Append("<rdf:Description rdf:about=\"\" xmlns:fx=\"").Append(PdfInvoice.Namespace).Append("\">\n");
@@ -858,25 +872,52 @@ internal static class PdfArchive
         x.Append("<fx:Version>").Append(Escape(invoice.Version)).Append("</fx:Version>\n");
         x.Append("<fx:ConformanceLevel>").Append(Escape(invoice.ConformanceLevel)).Append("</fx:ConformanceLevel>\n");
         x.Append("</rdf:Description>\n");
+    }
+
+    /// <summary>
+    /// The extension schemas that declare the Factur-X and PDF/UA properties, as PDF/A requires for
+    /// any schema outside its predefined list (ISO 19005-3, 6.6.2.3). XMP allows one schemas
+    /// property per description, so both go in one bag.
+    /// </summary>
+    private static void AppendExtensionSchemas(StringBuilder x, bool invoice, bool accessible)
+    {
         x.Append("<rdf:Description rdf:about=\"\" xmlns:pdfaExtension=\"http://www.aiim.org/pdfa/ns/extension/\"");
         x.Append(" xmlns:pdfaSchema=\"http://www.aiim.org/pdfa/ns/schema#\" xmlns:pdfaProperty=\"http://www.aiim.org/pdfa/ns/property#\">\n");
-        x.Append("<pdfaExtension:schemas>\n<rdf:Bag>\n<rdf:li rdf:parseType=\"Resource\">\n");
-        x.Append("<pdfaSchema:schema>Factur-X PDFA Extension Schema</pdfaSchema:schema>\n");
-        x.Append("<pdfaSchema:namespaceURI>").Append(PdfInvoice.Namespace).Append("</pdfaSchema:namespaceURI>\n");
-        x.Append("<pdfaSchema:prefix>fx</pdfaSchema:prefix>\n");
-        x.Append("<pdfaSchema:property>\n<rdf:Seq>\n");
-        Property("DocumentFileName", "The name of the embedded XML document");
-        Property("DocumentType", "The type of the hybrid document in capital letters, such as INVOICE or ORDER");
-        Property("Version", "The version of the standard applying to the embedded XML document");
-        Property("ConformanceLevel", "The conformance level of the embedded XML document");
-        x.Append("</rdf:Seq>\n</pdfaSchema:property>\n</rdf:li>\n</rdf:Bag>\n</pdfaExtension:schemas>\n</rdf:Description>\n");
+        x.Append("<pdfaExtension:schemas>\n<rdf:Bag>\n");
+        if (invoice)
+        {
+            Schema("Factur-X PDFA Extension Schema", PdfInvoice.Namespace, "fx");
+            Property("DocumentFileName", "Text", "external", "The name of the embedded XML document");
+            Property("DocumentType", "Text", "external", "The type of the hybrid document in capital letters, such as INVOICE or ORDER");
+            Property("Version", "Text", "external", "The version of the standard applying to the embedded XML document");
+            Property("ConformanceLevel", "Text", "external", "The conformance level of the embedded XML document");
+            x.Append("</rdf:Seq>\n</pdfaSchema:property>\n</rdf:li>\n");
+        }
 
-        void Property(string name, string description)
+        if (accessible)
+        {
+            Schema("PDF/UA Universal Accessibility Schema", UniversalAccessNamespace, "pdfuaid");
+            Property("part", "Integer", "internal", "Indicates, which part of ISO 14289 standard is followed");
+            x.Append("</rdf:Seq>\n</pdfaSchema:property>\n</rdf:li>\n");
+        }
+
+        x.Append("</rdf:Bag>\n</pdfaExtension:schemas>\n</rdf:Description>\n");
+
+        void Schema(string name, string uri, string prefix)
+        {
+            x.Append("<rdf:li rdf:parseType=\"Resource\">\n");
+            x.Append("<pdfaSchema:schema>").Append(name).Append("</pdfaSchema:schema>\n");
+            x.Append("<pdfaSchema:namespaceURI>").Append(uri).Append("</pdfaSchema:namespaceURI>\n");
+            x.Append("<pdfaSchema:prefix>").Append(prefix).Append("</pdfaSchema:prefix>\n");
+            x.Append("<pdfaSchema:property>\n<rdf:Seq>\n");
+        }
+
+        void Property(string name, string type, string category, string description)
         {
             x.Append("<rdf:li rdf:parseType=\"Resource\">\n");
             x.Append("<pdfaProperty:name>").Append(name).Append("</pdfaProperty:name>\n");
-            x.Append("<pdfaProperty:valueType>Text</pdfaProperty:valueType>\n");
-            x.Append("<pdfaProperty:category>external</pdfaProperty:category>\n");
+            x.Append("<pdfaProperty:valueType>").Append(type).Append("</pdfaProperty:valueType>\n");
+            x.Append("<pdfaProperty:category>").Append(category).Append("</pdfaProperty:category>\n");
             x.Append("<pdfaProperty:description>").Append(description).Append("</pdfaProperty:description>\n");
             x.Append("</rdf:li>\n");
         }

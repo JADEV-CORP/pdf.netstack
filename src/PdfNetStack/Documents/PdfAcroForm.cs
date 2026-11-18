@@ -373,6 +373,9 @@ public sealed class PdfWidget
     /// <summary>The page the widget is on, or null when no page shows it.</summary>
     public PdfPage? Page { get; }
 
+    /// <summary>The widget as the page's /Annots holds it: a reference, or a direct dictionary.</summary>
+    internal PdfObject Entry => _entry;
+
     /// <summary>The widget rectangle in PDF user space.</summary>
     public PdfRectangle Rectangle
     {
