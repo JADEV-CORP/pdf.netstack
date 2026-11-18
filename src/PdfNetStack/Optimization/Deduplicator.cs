@@ -12,7 +12,8 @@ namespace PdfNetStack.Optimization;
 /// fixpoint, because merging two fonts can make the resource dictionaries that point at them
 /// identical too. Objects with identity semantics (pages,
 /// annotations, structure elements, outline items and anything reached through such keys)
-/// are never merged.
+/// are never merged. The /Name of an XObject, which only PDF 1.0 required and readers ignore, may
+/// be left out of the comparison; copies of an image or form that differ only by it then merge.
 /// </summary>
 internal static class Deduplicator
 {
@@ -45,8 +46,16 @@ internal static class Deduplicator
     /// Hashes of decoded stream content by object number. Such streams are keyed by content and
     /// by their dictionary without its encoding entries.
     /// </param>
-    /// <returns>Representative object number for every number in the graph, and the merge count.</returns>
-    public static (Dictionary<int, int> Representative, int Merged) Run(PdfFile file, ObjectGraph graph, IReadOnlyDictionary<int, byte[]> contentHashes, CancellationToken ct)
+    /// <param name="ignoreXObjectNames">
+    /// Merge XObjects that differ only by /Name. A merged XObject whose copies named it
+    /// differently loses the entry, so no copy is left with another copy's name. Only for output
+    /// later than PDF 1.0, where the entry is optional and obsolescent (ISO 32000-1, tables 89 and 95).
+    /// </param>
+    /// <returns>
+    /// Representative object number for every number in the graph, the merge count, and how many
+    /// XObjects lost their /Name.
+    /// </returns>
+    public static (Dictionary<int, int> Representative, int Merged, int NamesRemoved) Run(PdfFile file, ObjectGraph graph, IReadOnlyDictionary<int, byte[]> contentHashes, bool ignoreXObjectNames, CancellationToken ct)
     {
         var parent = new Dictionary<int, int>(graph.Order.Count);
         foreach (int n in graph.Order) parent[n] = n;
@@ -100,13 +109,14 @@ internal static class Deduplicator
                 {
                     sink.Write((byte)'C');
                     sink.Write(content);
-                    serializer.WriteDictionary(sink, WithoutEncoding(s.Dictionary), skipKey: null);
+                    serializer.WriteDictionary(sink, Without(s.Dictionary, EncodingKeys, ignoreXObjectNames), skipKey: null);
                 }
                 else if (obj is PdfStream raw)
                 {
                     sink.Write((byte)'S');
                     sink.Write(payloadHash[number]);
-                    serializer.WriteDictionary(sink, raw.Dictionary, skipKey: "Length");
+                    PdfDictionary dict = ignoreXObjectNames && IsXObject(raw.Dictionary) ? Without(raw.Dictionary, [], xObjectName: true) : raw.Dictionary;
+                    serializer.WriteDictionary(sink, dict, skipKey: "Length");
                 }
                 else
                 {
@@ -134,16 +144,50 @@ internal static class Deduplicator
 
         var representative = new Dictionary<int, int>(parent.Count);
         foreach (int n in graph.Order) representative[n] = Find(n);
-        return (representative, merged);
+        int namesRemoved = ignoreXObjectNames && merged > 0 ? RemoveConflictingNames(file, graph, representative) : 0;
+        return (representative, merged, namesRemoved);
     }
 
-    private static PdfDictionary WithoutEncoding(PdfDictionary d)
+    /// <summary>
+    /// True for an image, form or PostScript XObject: a stream whose /Type, when present, is
+    /// /XObject. Only these carry the obsolete /Name that <see cref="Run"/> may ignore.
+    /// </summary>
+    internal static bool IsXObject(PdfDictionary d) =>
+        d.GetName("Subtype") is "Image" or "Form" or "PS" && d.GetName("Type") is null or "XObject";
+
+    /// <summary>
+    /// Removes /Name from each representative whose merged XObjects did not all name it alike,
+    /// so the output never carries one copy's name for another. Returns how many lost it.
+    /// </summary>
+    private static int RemoveConflictingNames(PdfFile file, ObjectGraph graph, Dictionary<int, int> representative)
     {
+        var names = new Dictionary<int, PdfObject?>();
+        var conflicting = new HashSet<int>();
+        foreach (int number in graph.Order)
+        {
+            if (file.GetObject(number) is not PdfStream s || !IsXObject(s.Dictionary)) continue;
+            int rep = representative[number];
+            PdfObject? name = file.Resolve(s.Dictionary["Name"]);
+            if (!names.TryGetValue(rep, out PdfObject? first)) names[rep] = name;
+            else if (!SameName(first, name)) conflicting.Add(rep);
+        }
+
+        foreach (int rep in conflicting) ((PdfStream)file.GetObject(rep)).Dictionary.Remove("Name");
+        return conflicting.Count;
+
+        static bool SameName(PdfObject? a, PdfObject? b) =>
+            (a is null or PdfNull) ? b is null or PdfNull : a is PdfName x && b is PdfName y && x.Value == y.Value;
+    }
+
+    /// <summary>A copy of <paramref name="d"/> without <paramref name="keys"/> and, for an XObject when asked, its /Name.</summary>
+    private static PdfDictionary Without(PdfDictionary d, HashSet<string> keys, bool xObjectName)
+    {
+        xObjectName &= IsXObject(d);
         var copy = new PdfDictionary(d.Count);
         for (int i = 0; i < d.Count; i++)
         {
             (string key, PdfObject value) = d.EntryAt(i);
-            if (!EncodingKeys.Contains(key)) copy.Set(key, value);
+            if (!keys.Contains(key) && !(xObjectName && key == "Name")) copy.Set(key, value);
         }
 
         return copy;

@@ -3,13 +3,21 @@
 Development tool only. Nothing in src/ depends on it.
 Requires: pip install pypdfium2 numpy, the .NET 10 SDK, and whichever of qpdf, Ghostscript (gs)
 and MuPDF (mutool) are on the PATH. A tool that is not installed is skipped and the report says so.
+veraPDF (https://verapdf.org) is optional: with it, PDF/A conformance is checked by validation.
 
 Usage:
   python tools/fetch_corpus.py --cache artifacts/corpus/files
-  dotnet build src/PdfNetStack.Cli -c Release
+  dotnet publish src/PdfNetStack.Cli -c Release -f net10.0 -r <rid> -p:NativeAot=true -o artifacts/aot
   python tools/compare_optimizers.py [--cache artifacts/corpus/files] [--out artifacts/compare]
+                                     [--tool artifacts/aot/PdfNetStack.Tool] [--verapdf path]
                                      [--only id,id] [--tools name,name] [--dpi 100] [--pages 6]
                                      [--jobs 4] [--timeout 900]
+
+PdfNetStack runs with the library defaults, as an application that calls PdfOptimizer.Optimize
+without options gets them, plus one thread (--threads 1), since qpdf, MuPDF and Ghostscript use
+one. --tool takes the Native AOT command line tool (the default when artifacts/aot has one) or
+PdfNetStack.Tool.dll, run with dotnet. The JIT tool spends 0.4 to 0.5 s starting for every file,
+which the time column then counts; the report says which one ran.
 
 Bytes alone do not rank optimizers: a tool that downsamples every image or drops the tags, forms
 and signatures always wins on size. So every output is scored three ways against its original:
@@ -19,19 +27,26 @@ and signatures always wins on size. So every output is scored three ways against
   - structure: tagging, form fields, outlines, attachments, signatures and annotations, counted by
     PDFium before and after. Anything the original had and the output lost is listed. A signed
     original whose output is not its own bytes with more appended has lost its signatures too:
-    the signed byte ranges no longer hold what was signed, so they fail to verify.
+    the signed byte ranges no longer hold what was signed, so they fail to verify. The same goes
+    for usage rights (/Perms /UR3), the signature with which Adobe Reader enables features such
+    as saving filled forms. An original that declares PDF/A and conforms to it must still
+    conform: veraPDF validates both when it is installed. Without it, PDF/A-1 originals get a
+    structural check of what a rewrite can break: PDF/A-1 is based on PDF 1.4, so the output
+    must have no object streams or cross-reference streams, no encryption, and an unfiltered XMP
+    packet that still declares PDF/A-1.
 An output "keeps quality" when it opens, has the same pages, the same text, nothing lost and a
 lowest SSIM of at least --min-ssim (0.95, the gate the Balanced preset uses). The head-to-head
 table then compares two tools only on the files where both keep quality, so a tool cannot win the
 total by wrecking one large file.
 
+Files with incremental updates: PdfNetStack keeps them as they are unless AllowIncrementalUpdates
+is set, because flattening discards the earlier revisions. qpdf, MuPDF and Ghostscript merge the
+revisions without being asked. The main tables count these files at their original size for
+PdfNetStack; a separate table shows them again with --allow-incremental.
+
 SSIM is strict with scan grain and dithering: a scan reduced to 150 dpi can score 0.8 on a page
 that looks the same, because the grain itself changed. Read "Outputs below the bar" with the pages
 open before calling one a defect.
-
-qpdf, MuPDF and Ghostscript merge incremental updates into one revision without being asked;
-PdfNetStack keeps such a file unless told otherwise, so it runs here with --allow-incremental to
-do the same work. It still keeps signed files as they are, which this scoring credits.
 
 Each output is deleted once measured, so the run needs little disk.
 """
@@ -39,30 +54,33 @@ Each output is deleted once measured, so the run needs little disk.
 import argparse
 import datetime
 import json
-import math
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import xml.etree.ElementTree as ET
+import zlib
 from multiprocessing import Pool
 
 import fetch_corpus
 
 ROOT = fetch_corpus.ROOT
-DEFAULT_TOOL = os.path.join(ROOT, "src", "PdfNetStack.Cli", "bin", "Release", "net10.0", "PdfNetStack.Tool.dll")
+AOT_TOOL = os.path.join(ROOT, "artifacts", "aot", "PdfNetStack.Tool" + (".exe" if os.name == "nt" else ""))
+JIT_TOOL = os.path.join(ROOT, "src", "PdfNetStack.Cli", "bin", "Release", "net10.0", "PdfNetStack.Tool.dll")
 DEFAULT_OUT = os.path.join(ROOT, "artifacts", "compare")
 
 # name, family, lossy, command. {in} and {out} are replaced by paths; the first word is looked up
-# on the PATH, except "pdfnetstack", which runs the command line tool built from this repository.
+# on the PATH, except "pdfnetstack", which runs the command line tool built from this repository
+# with PDFNETSTACK_ARGS added. PdfNetStack runs with the library defaults: no option here changes
+# what it writes.
 TOOLS = [
-    ("pdfnetstack", "PdfNetStack", False, ["pdfnetstack", "optimize", "{in}", "{out}", "--min-saving", "0", "--allow-incremental"]),
-    ("pdfnetstack-balanced", "PdfNetStack", True, ["pdfnetstack", "optimize", "{in}", "{out}", "--min-saving", "0", "--allow-incremental",
-                                                   "--preset", "balanced"]),
-    ("pdfnetstack-smallest", "PdfNetStack", True, ["pdfnetstack", "optimize", "{in}", "{out}", "--min-saving", "0", "--allow-incremental",
-                                                   "--preset", "smallest"]),
+    ("pdfnetstack", "PdfNetStack", False, ["pdfnetstack", "optimize", "{in}", "{out}"]),
+    ("pdfnetstack-balanced", "PdfNetStack", True, ["pdfnetstack", "optimize", "{in}", "{out}", "--preset", "balanced"]),
+    ("pdfnetstack-smallest", "PdfNetStack", True, ["pdfnetstack", "optimize", "{in}", "{out}", "--preset", "smallest"]),
     ("qpdf", "qpdf", False, ["qpdf", "--object-streams=generate", "--compress-streams=y", "--recompress-flate",
                              "--compression-level=9", "--warning-exit-0", "{in}", "{out}"]),
     ("mutool", "MuPDF", False, ["mutool", "clean", "-gggg", "-z", "{in}", "{out}"]),
@@ -71,6 +89,12 @@ TOOLS = [
     ("gs-ebook", "Ghostscript", True, ["gs", "-q", "-dNOPAUSE", "-dBATCH", "-dSAFER", "-sDEVICE=pdfwrite",
                                        "-dPDFSETTINGS=/ebook", "-sOutputFile={out}", "{in}"]),
 ]
+
+# One thread, like the other tools, and the result as JSON, for the reason a file was kept.
+PDFNETSTACK_ARGS = ["--threads", "1", "--json"]
+
+# Runs only on the files the default run kept because of incremental updates, for their own table.
+INCREMENTAL = ("pdfnetstack-incremental", ["pdfnetstack", "optimize", "{in}", "{out}", "--allow-incremental"])
 
 # The pairs worth reading side by side: the same promise (lossless, or lossy at a similar setting).
 PAIRS = [
@@ -82,25 +106,51 @@ PAIRS = [
 
 FEATURES = ["tagged", "form", "outline", "attachments", "signatures", "annotations"]
 
+# The usage rights signature names its transform method; /UR is the form before PDF 1.6.
+USAGE_RIGHTS = re.compile(rb"/TransformMethod\s*/UR3?(?![A-Za-z0-9])|/UR3(?![A-Za-z0-9])")
+PDFAID_PART = re.compile(rb"pdfaid:part(?:\s*=\s*[\"']|>)\s*(\d)")
+PDFAID_CONFORMANCE = re.compile(rb"pdfaid:conformance(?:\s*=\s*[\"']|>)\s*([A-Za-z])")
+XML_STREAM = re.compile(rb"/Subtype\s*/XML(?![A-Za-z0-9])")
+NEW_IN_PDF15 = re.compile(rb"/Type\s*/(?:ObjStm|XRef)(?![A-Za-z0-9])")
+ENCRYPT = re.compile(rb"/Encrypt(?![A-Za-z0-9])")
 
-def resolve(command, tool_dll):
+
+def pdfnetstack_launcher(tool):
+    """How to start the PdfNetStack command line tool, or None when it is not built."""
+    if not os.path.isfile(tool):
+        return None
+    if tool.endswith(".dll"):
+        return ["dotnet", tool] if shutil.which("dotnet") else None
+    return [tool]
+
+
+def resolve(command, tool):
     """The command line to run, or None when the program is not installed."""
     if command[0] == "pdfnetstack":
-        return ["dotnet", tool_dll] + command[1:] if os.path.isfile(tool_dll) and shutil.which("dotnet") else None
+        launcher = pdfnetstack_launcher(tool)
+        return launcher + command[1:] + PDFNETSTACK_ARGS if launcher else None
     found = shutil.which(command[0])
     return [found] + command[1:] if found else None
 
 
-def version_of(name, tool_dll):
+def first_line(args):
+    try:
+        done = subprocess.run(args, capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    text = (done.stdout or done.stderr).strip().splitlines()
+    return text[0] if text else None
+
+
+def version_of(name):
     probes = {"qpdf": ["qpdf", "--version"], "mutool": ["mutool", "-v"], "gs": ["gs", "--version"]}
     if name == "pdfnetstack":
-        return "this repository"
+        commit = first_line(["git", "-C", ROOT, "rev-parse", "--short", "HEAD"])
+        return f"this repository ({commit})" if commit else "this repository"
     probe = probes.get(name)
     if not probe or not shutil.which(probe[0]):
         return None
-    done = subprocess.run(probe, capture_output=True, text=True)
-    text = (done.stdout or done.stderr).strip().splitlines()
-    return text[0] if text else "unknown"
+    return first_line(probe) or "unknown"
 
 
 def luma(image):
@@ -186,6 +236,73 @@ def appends_to(original, path):
                 return False
 
 
+def read_bytes(path):
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def pdfa_claim(data, raw_only=False):
+    """The PDF/A flavour the file's XMP declares, such as "1b", "2u" or "4", or None.
+
+    The packet is searched as the file stores it and, unless raw_only, in every Flate encoded XML
+    stream too (PDF/A-1 forbids a filter on it; later parts allow one).
+    """
+    texts = [data]
+    if not raw_only and b"pdfaid" not in data:
+        for m in XML_STREAM.finditer(data):
+            start = data.find(b"stream", m.end(), m.end() + 4096)
+            if start < 0:
+                continue
+            start += 6
+            start += 2 if data[start:start + 2] == b"\r\n" else 1
+            end = data.find(b"endstream", start)
+            if end < 0:
+                continue
+            try:
+                texts.append(zlib.decompressobj().decompress(data[start:end], 1 << 22))
+            except zlib.error:
+                pass
+    for text in texts:
+        part = PDFAID_PART.search(text)
+        if part:
+            conformance = PDFAID_CONFORMANCE.search(text)
+            return part.group(1).decode() + (conformance.group(1).decode().lower() if conformance else "")
+    return None
+
+
+def pdfa1_structure(data):
+    """What breaks PDF/A-1 in the bytes, of what a rewrite can break; empty when nothing does."""
+    problems = []
+    claim = pdfa_claim(data, raw_only=True)
+    if not claim or not claim.startswith("1"):
+        problems.append("no unfiltered PDF/A-1 identification")
+    if NEW_IN_PDF15.search(data):
+        problems.append("object or cross-reference streams")
+    if ENCRYPT.search(data):
+        problems.append("encryption")
+    return problems
+
+
+def verapdf_compliance(verapdf, flavour, paths, timeout):
+    """Whether veraPDF finds each file compliant with the flavour, by file name; None on failure."""
+    with tempfile.TemporaryDirectory(prefix="verapdf-") as tmp:
+        report = os.path.join(tmp, "report.xml")
+        try:
+            with open(report, "wb") as out:
+                subprocess.run([verapdf, "--flavour", flavour, "--format", "xml", *paths],
+                               stdout=out, stderr=subprocess.DEVNULL, timeout=timeout)
+            root = ET.parse(report).getroot()
+        except (OSError, subprocess.TimeoutExpired, ET.ParseError):
+            return None
+    compliant = {os.path.basename(p): False for p in paths}
+    for job in (e for e in root.iter() if e.tag.endswith("job")):
+        name = next((e.text for e in job.iter() if e.tag.endswith("name") and e.text), None)
+        reports = [e for e in job.iter() if e.tag.endswith("validationReport")]
+        if name and reports:
+            compliant[os.path.basename(name)] = all(r.get("isCompliant") == "true" for r in reports)
+    return compliant
+
+
 def score(ref, path, dpi, original):
     """Compares one output with its original's reference."""
     import pypdfium2 as pdfium
@@ -221,48 +338,111 @@ def score(ref, path, dpi, original):
         now = features(doc)
         r["lost"] = [f"{k} {ref['features'][k]} -> {now[k]}" for k in FEATURES if now[k] < ref["features"][k]]
         signed = ref["features"]["signatures"]
-        if signed and now["signatures"] >= signed and not appends_to(original, path):
-            r["lost"].append(f"signatures {signed} no longer verify (signed bytes rewritten)")
+        unchanged = None
+        if signed and now["signatures"] >= signed:
+            unchanged = appends_to(original, path)
+            if not unchanged:
+                r["lost"].append(f"signatures {signed} no longer verify (signed bytes rewritten)")
+        if ref["usage_rights"] and not (unchanged if unchanged is not None else appends_to(original, path)):
+            r["lost"].append("usage rights (/UR3) voided or removed")
         return r
     finally:
         doc.close()
 
 
+def run_tool(name, command, source, out, ref, dpi, timeout, min_ssim):
+    """Runs one tool on one file and scores what it wrote; the output stays for the caller."""
+    args = [a.replace("{in}", source).replace("{out}", out) for a in command]
+    t = {"seconds": None, "bytes": None}
+    started = time.perf_counter()
+    try:
+        done = subprocess.run(args, capture_output=True, timeout=timeout)
+        t["seconds"] = round(time.perf_counter() - started, 3)
+        if name.startswith("pdfnetstack"):
+            try:
+                outcome = json.loads(done.stdout.decode("utf-8", "replace"))
+                t["disposition"], t["reason"] = outcome.get("Disposition"), outcome.get("Reason")
+            except ValueError:
+                pass
+        if done.returncode != 0 or not os.path.isfile(out) or os.path.getsize(out) == 0:
+            tail = done.stderr.decode("utf-8", "replace").strip().splitlines()[-2:]
+            t["error"] = f"exit {done.returncode}: " + " | ".join(tail)
+    except subprocess.TimeoutExpired:
+        t["error"] = f"timed out after {timeout} s"
+    if "error" not in t:
+        t["bytes"] = os.path.getsize(out)
+        t.update(score(ref, out, dpi, source))
+    keeps(t, min_ssim)
+    return t
+
+
+def keeps(t, min_ssim):
+    t["keeps_quality"] = ("error" not in t and not t["problems"] and not t["lost"]
+                          and t["min_ssim"] is not None and t["min_ssim"] >= min_ssim)
+
+
+def check_pdfa(result, source, outputs, data, verapdf, timeout, min_ssim):
+    """Adds a lost PDF/A conformance to each output that broke it, for an original that has it."""
+    flavour = result["pdfa"]
+    if verapdf:
+        compliant = verapdf_compliance(verapdf, flavour, [source] + [path for _, path in outputs], timeout)
+        if compliant is None:
+            result["pdfa_check"] = "veraPDF failed"
+            return
+        if not compliant[os.path.basename(source)]:
+            result["pdfa_check"] = "the original does not conform"
+            return
+        result["pdfa_check"] = "veraPDF"
+        broken = {name for name, path in outputs if not compliant[os.path.basename(path)]}
+        detail = {name: "veraPDF" for name in broken}
+    else:
+        if not flavour.startswith("1"):
+            result["pdfa_check"] = "not checked (needs veraPDF)"
+            return
+        if pdfa1_structure(data):
+            result["pdfa_check"] = "the original does not pass the structural check"
+            return
+        result["pdfa_check"] = "structural"
+        detail = {}
+        for name, path in outputs:
+            problems = pdfa1_structure(read_bytes(path))
+            if problems:
+                detail[name] = ", ".join(problems)
+    for name, why in detail.items():
+        t = result["tools"][name]
+        t["lost"].append(f"PDF/A-{flavour} conformance ({why})")
+        keeps(t, min_ssim)
+
+
 def run_file(job):
-    entry, source, tools, dpi, limit, timeout, min_ssim = job
-    result = {"id": entry["id"], "bytes": os.path.getsize(source), "tools": {}}
+    entry, source, tools, incremental, dpi, limit, timeout, min_ssim, verapdf = job
+    data = read_bytes(source)
+    result = {"id": entry["id"], "bytes": len(data), "tools": {},
+              "pdfa": pdfa_claim(data), "usage_rights": bool(USAGE_RIGHTS.search(data))}
     try:
         ref = reference(source, dpi, limit)
     except Exception as ex:  # noqa: BLE001 - an original PDFium cannot read is skipped and listed
         result["error"] = f"PDFium cannot read the original: {ex}"
         return result
+    ref["usage_rights"] = result["usage_rights"]
     result["features"] = ref["features"]
     work = tempfile.mkdtemp(prefix="compare-")
+    kept = []
     try:
-        for name, command in tools:
+        runs = list(tools)
+        while runs:
+            name, command = runs.pop(0)
             out = os.path.join(work, name + ".pdf")
-            args = [a.replace("{in}", source).replace("{out}", out) for a in command]
-            t = {"seconds": None, "bytes": None}
-            started = time.perf_counter()
-            try:
-                done = subprocess.run(args, capture_output=True, timeout=timeout)
-                t["seconds"] = round(time.perf_counter() - started, 3)
-                failed = done.returncode != 0 or not os.path.isfile(out) or os.path.getsize(out) == 0
-                if failed:
-                    tail = done.stderr.decode("utf-8", "replace").strip().splitlines()[-2:]
-                    t["error"] = f"exit {done.returncode}: " + " | ".join(tail)
-            except subprocess.TimeoutExpired:
-                t["error"] = f"timed out after {timeout} s"
-            if "error" not in t:
-                t["bytes"] = os.path.getsize(out)
-                t.update(score(ref, out, dpi, source))
-                t["keeps_quality"] = (not t["problems"] and not t["lost"] and t["min_ssim"] is not None
-                                      and t["min_ssim"] >= min_ssim)
-            else:
-                t["keeps_quality"] = False
-            if os.path.exists(out):
-                os.remove(out)
+            t = run_tool(name, command, source, out, ref, dpi, timeout, min_ssim)
             result["tools"][name] = t
+            if name == "pdfnetstack" and incremental and "incremental updates" in (t.get("reason") or ""):
+                runs.insert(0, incremental)
+            if result["pdfa"] and "error" not in t:
+                kept.append((name, out))
+            elif os.path.exists(out):
+                os.remove(out)
+        if kept:
+            check_pdfa(result, source, kept, data, verapdf, timeout, min_ssim)
     finally:
         shutil.rmtree(work, ignore_errors=True)
     return result
@@ -276,7 +456,7 @@ def mib(n):
     return f"{n / (1024 * 1024):.1f} MiB" if n >= 1024 * 1024 else f"{n / 1024:.0f} KiB"
 
 
-def write_report(results, available, versions, args, out_dir):
+def write_report(results, available, versions, args, out_dir, cli_kind, pdfa_kind):
     names = [n for n, *_ in TOOLS if n in available]
     lossy = {n: l for n, _, l, _ in TOOLS}
     files = [r for r in results if "error" not in r]
@@ -285,9 +465,11 @@ def write_report(results, available, versions, args, out_dir):
         "",
         f"{len(files)} files from the public corpus (eng/corpus/manifest.json), "
         f"{datetime.date.today().isoformat()}, {platform.system()} {platform.machine()}.",
+        f"PdfNetStack: library defaults, {cli_kind}, one thread (`--threads 1`), like the other tools.",
         f"Rendering: PDFium at {args.dpi} dpi, up to {args.pages} pages per file. "
         f"An output keeps quality when it has the same pages and text, loses nothing below, "
-        f"and its lowest page SSIM is at least {args.min_ssim}.",
+        f"and its lowest page SSIM is at least {args.min_ssim}. "
+        f"Losing usage rights (`/UR3`) or PDF/A conformance counts as losing a feature; PDF/A: {pdfa_kind}.",
         "",
         "| Tool | Kind | Version | Total out | Saved | Keeps quality | Lost a feature | Failed | Time |",
         "|---|---|---|---:|---:|---:|---:|---:|---:|",
@@ -296,13 +478,14 @@ def write_report(results, available, versions, args, out_dir):
     for n in names:
         rows = [r["tools"][n] for r in files]
         out = sum(t["bytes"] if t["bytes"] is not None else r["bytes"] for r, t in zip(files, rows))
-        keeps = sum(1 for t in rows if t["keeps_quality"])
+        keeps_count = sum(1 for t in rows if t["keeps_quality"])
         lost = sum(1 for t in rows if t.get("lost"))
         failed = sum(1 for t in rows if "error" in t)
         seconds = sum(t["seconds"] or 0 for t in rows)
         lines.append(f"| {n} | {'lossy' if lossy[n] else 'lossless'} | {versions.get(n) or ''} | {mib(out)} | "
-                     f"{pct(total_in - out, total_in)} | {keeps}/{len(files)} | {lost} | {failed} | {seconds:.0f} s |")
-    lines += ["", f"Input: {mib(total_in)}. A failed output is counted at its original size.", ""]
+                     f"{pct(total_in - out, total_in)} | {keeps_count}/{len(files)} | {lost} | {failed} | {seconds:.0f} s |")
+    lines += ["", f"Input: {mib(total_in)}. A failed output is counted at its original size. "
+                  "Time is the wall clock of each run, one process per file, summed.", ""]
 
     lines += ["## Head to head at equal quality", "",
               "Only files where both outputs keep quality count, so neither side wins by damaging a file.", "",
@@ -317,6 +500,35 @@ def write_report(results, available, versions, args, out_dir):
         smaller = sum(1 for x, y in both if x["bytes"] < y["bytes"])
         larger = sum(1 for x, y in both if x["bytes"] > y["bytes"])
         lines.append(f"| {a} | {b} | {len(both)} | {mib(ta)} | {mib(tb)} | {smaller} | {larger} |")
+
+    incremental = [r for r in files if INCREMENTAL[0] in r["tools"]]
+    if incremental:
+        others = [n for n in ("qpdf", "mutool") if n in available]
+
+        def cell(r, n):
+            t = r["tools"][n]
+            if "error" in t:
+                return "failed"
+            if t.get("disposition") and t["disposition"] != "Optimized":
+                return "kept as is"
+            return mib(t["bytes"]) + ("" if t["keeps_quality"] else " (below the bar)")
+
+        lines += ["", "## Files with incremental updates", "",
+                  "PdfNetStack keeps these files as they are unless `AllowIncrementalUpdates` is set "
+                  "(`--allow-incremental`), because flattening discards the earlier revisions. The tables above "
+                  "count them at their original size for PdfNetStack. qpdf, MuPDF and Ghostscript merge the "
+                  "revisions without being asked.", "",
+                  "| File | Input | PdfNetStack default | PdfNetStack `--allow-incremental` | " + " | ".join(others) + " |",
+                  "|---|---:|---:|---:|" + "---:|" * len(others)]
+        for r in incremental:
+            lines.append(f"| {r['id']} | {mib(r['bytes'])} | {cell(r, 'pdfnetstack')} | {cell(r, INCREMENTAL[0])} | "
+                         + " | ".join(cell(r, n) for n in others) + " |")
+        flat = [r["tools"][INCREMENTAL[0]] for r in incremental]
+        total = sum(r["bytes"] for r in incremental)
+        flat_out = sum(t["bytes"] if t["bytes"] is not None else r["bytes"] for r, t in zip(incremental, flat))
+        lines += ["", f"With `--allow-incremental` these {len(incremental)} files go from {mib(total)} to "
+                      f"{mib(flat_out)} ({pct(total - flat_out, total)} saved); "
+                      f"{sum(1 for t in flat if t['keeps_quality'])} of them keep quality."]
 
     lost_lines = []
     for r in files:
@@ -343,6 +555,11 @@ def write_report(results, available, versions, args, out_dir):
     if problem_lines:
         lines += ["", "## Outputs below the bar", ""] + problem_lines
 
+    checked = [r for r in files if r.get("pdfa")]
+    if checked:
+        lines += ["", "## PDF/A originals", ""]
+        lines += [f"- {r['id']}: PDF/A-{r['pdfa']}, {r.get('pdfa_check', 'not checked')}" for r in checked]
+
     missing = [n for n, *_ in TOOLS if n not in available]
     if missing:
         lines += ["", "Not installed, so not compared: " + ", ".join(missing) + "."]
@@ -352,7 +569,8 @@ def write_report(results, available, versions, args, out_dir):
         f.write("\n".join(lines) + "\n")
     with open(os.path.join(out_dir, "compare.json"), "w", encoding="utf-8", newline="\n") as f:
         json.dump({"date": datetime.date.today().isoformat(), "dpi": args.dpi, "pages": args.pages,
-                   "min_ssim": args.min_ssim, "versions": versions, "files": results}, f, indent=1)
+                   "min_ssim": args.min_ssim, "pdfnetstack": cli_kind, "pdfa_check": pdfa_kind,
+                   "versions": versions, "files": results}, f, indent=1)
     return "\n".join(lines)
 
 
@@ -361,7 +579,9 @@ def main():
     p.add_argument("--cache", default=os.path.join(ROOT, "artifacts", "corpus", "files"))
     p.add_argument("--manifest", default=os.path.join(ROOT, "eng", "corpus", "manifest.json"))
     p.add_argument("--out", default=DEFAULT_OUT)
-    p.add_argument("--tool", default=DEFAULT_TOOL, help="PdfNetStack.Tool.dll to run")
+    p.add_argument("--tool", default=AOT_TOOL if os.path.isfile(AOT_TOOL) else JIT_TOOL,
+                   help="the Native AOT PdfNetStack.Tool, or PdfNetStack.Tool.dll to run with dotnet")
+    p.add_argument("--verapdf", default=shutil.which("verapdf"), help="the veraPDF command line launcher")
     p.add_argument("--only", help="comma-separated corpus ids")
     p.add_argument("--tools", help="comma-separated tool names, default all installed")
     p.add_argument("--dpi", type=int, default=100)
@@ -385,15 +605,29 @@ def main():
         resolved = resolve(command, args.tool)
         if resolved:
             tools.append((name, resolved))
-            versions[name] = version_of(command[0], args.tool)
+            versions[name] = version_of(command[0])
     if not tools:
         sys.exit("No optimizer found. Build src/PdfNetStack.Cli or install qpdf, gs or mutool.")
+    incremental = None
+    if any(n == "pdfnetstack" for n, _ in tools):
+        incremental = (INCREMENTAL[0], resolve(INCREMENTAL[1], args.tool))
+    cli_kind = ("the JIT command line tool, whose start up (0.4 to 0.5 s per file) the time includes"
+                if args.tool.endswith(".dll") else "the Native AOT command line tool")
+
+    verapdf = args.verapdf if args.verapdf and os.path.isfile(args.verapdf) else None
+    if verapdf:
+        pdfa_kind = "originals that conform to the PDF/A flavour they declare, validated with " + (
+            first_line([verapdf, "--version"]) or "veraPDF")
+    else:
+        pdfa_kind = ("veraPDF not installed, so PDF/A-1 originals get a structural check (no object or "
+                     "cross-reference streams, no encryption, an unfiltered PDF/A-1 identification) and later "
+                     "parts are not checked")
 
     jobs, missing = [], []
     for e in entries:
         path = fetch_corpus.cached_path(args.cache, e)
         if os.path.isfile(path):
-            jobs.append((e, path, tools, args.dpi, args.pages, args.timeout, args.min_ssim))
+            jobs.append((e, path, tools, incremental, args.dpi, args.pages, args.timeout, args.min_ssim, verapdf))
         else:
             missing.append(e["id"])
     if missing:
@@ -407,7 +641,7 @@ def main():
             results.append(r)
             print(f"[{len(results)}/{len(jobs)}] {r['id']}", file=sys.stderr, flush=True)
     results.sort(key=lambda r: r["id"])
-    print(write_report(results, {n for n, _ in tools}, versions, args, args.out))
+    print(write_report(results, {n for n, _ in tools}, versions, args, args.out, cli_kind, pdfa_kind))
 
 
 if __name__ == "__main__":

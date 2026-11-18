@@ -27,48 +27,118 @@ public static class HtmlConverter
     // whose stack has room for the deepest tree; the size is reserved, not committed.
     private const int StackSize = 64 << 20;
 
+    // Each conversion holds a thread, its document, styles and layout until it ends; without a
+    // bound a burst of requests starts as many conversions as arrive and runs out of memory. Past
+    // the bound conversions wait their turn, the asynchronous ones without holding a thread.
+    private static readonly object GateLock = new();
+    private static int _maxConcurrentConversions = Math.Max(1, Environment.ProcessorCount);
+    private static SemaphoreSlim _gate = new(_maxConcurrentConversions, _maxConcurrentConversions);
+
+    /// <summary>
+    /// The most conversions that run at once in the process; more wait for one to end, in the
+    /// order they arrive. Default <see cref="Environment.ProcessorCount"/>: conversions use one
+    /// core each, so more at once only use more memory. Raise it when a
+    /// <see cref="HtmlConverterOptions.ResourceLoaderAsync"/> spends much of a conversion waiting on
+    /// the network. A change applies to conversions that start waiting after it.
+    /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException">The value is less than 1.</exception>
+    public static int MaxConcurrentConversions
+    {
+        get => Volatile.Read(ref _maxConcurrentConversions);
+        set
+        {
+            if (value < 1) throw new ArgumentOutOfRangeException(nameof(value), value, "At least one conversion.");
+            lock (GateLock)
+            {
+                if (value == _maxConcurrentConversions) return;
+
+                // Conversions running or waiting on the old gate release it as they end; it is
+                // dropped, not disposed, as nothing uses its wait handle.
+                Volatile.Write(ref _gate, new SemaphoreSlim(value, value));
+                Volatile.Write(ref _maxConcurrentConversions, value);
+            }
+        }
+    }
+
     /// <summary>Converts an HTML string to a PDF document.</summary>
     /// <param name="html">The HTML. Malformed markup is repaired as browsers repair it.</param>
     /// <param name="options">Page size, fonts and how resources load; defaults when null.</param>
-    /// <exception cref="HtmlConversionException">The document needs more pages than <see cref="HtmlConverterOptions.MaxPages"/>.</exception>
-    public static PdfDocument ConvertToDocument(string html, HtmlConverterOptions? options = null)
+    /// <exception cref="HtmlConversionException">The document goes past a limit of <paramref name="options"/>, such as <see cref="HtmlConverterOptions.MaxPages"/>.</exception>
+    public static PdfDocument ConvertToDocument(string html, HtmlConverterOptions? options = null) => ConvertToDocument(html, options, CancellationToken.None);
+
+    /// <summary>Converts an HTML string to a PDF document, observing a cancellation token.</summary>
+    /// <param name="html">The HTML. Malformed markup is repaired as browsers repair it.</param>
+    /// <param name="options">Page size, fonts and how resources load; defaults when null.</param>
+    /// <param name="cancellationToken">
+    /// Observed while the call waits for a turn (<see cref="MaxConcurrentConversions"/>), and through
+    /// parsing, styling, layout, painting and resource loading.
+    /// </param>
+    /// <exception cref="HtmlConversionException">The document goes past a limit of <paramref name="options"/>, such as <see cref="HtmlConverterOptions.MaxPages"/>.</exception>
+    /// <exception cref="OperationCanceledException">The token fired.</exception>
+    public static PdfDocument ConvertToDocument(string html, HtmlConverterOptions? options, CancellationToken cancellationToken)
     {
         Compat.ThrowIfNull(html, nameof(html));
         options ??= new HtmlConverterOptions();
+        SemaphoreSlim gate = Volatile.Read(ref _gate);
+        gate.Wait(cancellationToken);
         PdfDocument? result = null;
         System.Runtime.ExceptionServices.ExceptionDispatchInfo? failure = null;
-        var worker = new Thread(
-            () =>
+        try
+        {
+            Thread worker = StartWorker(() =>
             {
                 try
                 {
-                    result = Convert(html, options);
+                    result = Convert(html, options, NewBudget(html, options, cancellationToken));
                 }
                 catch (Exception e)
                 {
                     // Rethrown on the caller's thread, with its original stack trace.
                     failure = System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(e);
                 }
-            },
-            StackSize)
+            });
+            worker.Join();
+        }
+        finally
         {
-            Name = "PdfNetStack.Html",
-            IsBackground = true,
-        };
-        worker.Start();
-        worker.Join();
+            gate.Release();
+        }
+
         failure?.Throw();
         return result!;
     }
 
-    private static PdfDocument Convert(string html, HtmlConverterOptions options)
+    /// <summary>
+    /// Converts an HTML string to a PDF document, asynchronously: no thread waits while the call
+    /// waits for its turn or while the document is laid out on a thread of its own.
+    /// </summary>
+    /// <param name="html">The HTML. Malformed markup is repaired as browsers repair it.</param>
+    /// <param name="options">Page size, fonts and how resources load; defaults when null.</param>
+    /// <param name="cancellationToken">
+    /// Observed while the call waits for a turn (<see cref="MaxConcurrentConversions"/>), and through
+    /// parsing, styling, layout, painting and resource loading.
+    /// </param>
+    /// <exception cref="HtmlConversionException">The document goes past a limit of <paramref name="options"/>, such as <see cref="HtmlConverterOptions.MaxPages"/>.</exception>
+    /// <exception cref="OperationCanceledException">The token fired.</exception>
+    public static async Task<PdfDocument> ConvertToDocumentAsync(string html, HtmlConverterOptions? options = null, CancellationToken cancellationToken = default)
     {
-        var resources = new Resources(options.BaseUri, options.ResourceLoader);
-        HtmlDocument doc = HtmlParser.Parse(html);
+        Compat.ThrowIfNull(html, nameof(html));
+        SemaphoreSlim gate = Volatile.Read(ref _gate);
+        await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        return await ConvertOnWorkerAsync(html, options ?? new HtmlConverterOptions(), gate, cancellationToken).ConfigureAwait(false);
+    }
 
-        // Media queries see the default page; @page rules may change it later.
-        (double probeWidth, double probeHeight) = PageMaster.PageSize(CssParser.ParseDeclarations(options.PageStyle).LastOrDefault(d => d.Property == "size")?.Value, 16);
-        var resolver = new StyleResolver(new CssMedia(probeWidth, probeHeight));
+    /// <summary>The conversion itself, on the calling thread, counting its work in <paramref name="budget"/> and observing the budget's token.</summary>
+    internal static PdfDocument Convert(string html, HtmlConverterOptions options, WorkBudget budget)
+    {
+        CancellationToken cancellationToken = budget.Token;
+        var resources = new Resources(options.BaseUri, options.ResourceLoader, options.ResourceLoaderAsync, cancellationToken);
+        HtmlDocument doc = HtmlParser.Parse(html, cancellationToken);
+
+        // Media queries and viewport units see the page area of the default page, as browsers
+        // printing a document do: a 768px breakpoint does not apply on A4 with 2cm margins. The
+        // document's @page rules, read later, do not change it.
+        var resolver = new StyleResolver(PageMaster.DefaultPageArea(options.PageStyle), budget) { ResolveUrl = resources.Resolve };
         if (options.StyleSheet is string sheet) resolver.AddStyleSheet(sheet, CssOrigin.Author, resources.LoadText);
         resolver.AddDocument(doc, resources.LoadText);
 
@@ -79,10 +149,9 @@ public static class HtmlConverter
         fonts.AddFontFaces(resolver.FontFaces, resources.Load);
         var builder = new BoxBuilder(resolver, resources.LoadImage);
         BlockBox root = builder.Build(doc);
-        var running = new RunningElements(builder.Running, builder.PageCounters, resolver, fonts, resources.LoadImage);
+        var running = new RunningElements(builder.Running, builder.PageCounters, resolver, fonts, resources.LoadImage, budget);
         var master = new PageMaster(resolver, root.Style, options.PageStyle);
-        List<PageRun> runs = LayoutRuns(root, master, fonts, options.MaxPages);
-        int pageCount = runs.Sum(r => r.Slices.Count);
+        List<PageRun> runs = LayoutRuns(root, master, fonts, options.MaxPages, budget);
 
         var pdf = PdfDocument.Create();
         Metadata(pdf, doc);
@@ -117,6 +186,7 @@ public static class HtmlConverter
         var indexes = new Dictionary<PageRun, PaintIndex>();
         for (int i = 0; i < pages.Count; i++)
         {
+            budget.ThrowIfCancellationRequested();
             (PageRun run, Paginator.Slice slice) = pageRuns[i];
             BoxFragment layout = run.Layout;
             if (!indexes.TryGetValue(run, out PaintIndex? index)) indexes[run] = index = new PaintIndex(layout);
@@ -134,6 +204,9 @@ public static class HtmlConverter
             {
                 foreach (BoxFragment fixedBox in boxes)
                 {
+                    // A fixed box paints again on every page: thousands of them on thousands of
+                    // pages multiply, so each repeat counts as layout work.
+                    budget.Layout(1);
                     using (graphics.Save())
                     {
                         graphics.TranslateTransform(g.Margin.Left * PointsPerPixel, g.Margin.Top * PointsPerPixel);
@@ -165,6 +238,7 @@ public static class HtmlConverter
                 double offset = 0;
                 foreach (Paginator.RepeatedHeader header in slice.Headers)
                 {
+                    budget.Layout(1);
                     using (graphics.Save())
                     {
                         graphics.TranslateTransform(0, offset - header.Header.Y);
@@ -212,7 +286,7 @@ public static class HtmlConverter
     /// the run after the break is laid out at its page type's width, so a landscape section gets
     /// the landscape width.
     /// </summary>
-    private static List<PageRun> LayoutRuns(BlockBox root, PageMaster master, FontResolver fonts, int maxPages)
+    private static List<PageRun> LayoutRuns(BlockBox root, PageMaster master, FontResolver fonts, int maxPages, WorkBudget budget)
     {
         var named = new NamedPages(root);
         var runs = new List<PageRun>();
@@ -221,7 +295,7 @@ public static class HtmlConverter
         {
             using (named.Keep(i))
             {
-                PageRun run = LayoutRun(root, master, fonts, first, maxPages - first, named.Name(i), named.First(i), named.Last(i));
+                PageRun run = LayoutRun(root, master, fonts, first, maxPages - first, named.Name(i), named.First(i), named.Last(i), budget);
                 runs.Add(run);
                 first += run.Slices.Count;
             }
@@ -232,10 +306,10 @@ public static class HtmlConverter
 
     /// <param name="start">The box after the break the run starts at, or null for the first run.</param>
     /// <param name="end">The box before the break the run ends at, or null for the last run.</param>
-    private static PageRun LayoutRun(BlockBox root, PageMaster master, FontResolver fonts, int first, int maxPages, string? name, Box? start, Box? end)
+    private static PageRun LayoutRun(BlockBox root, PageMaster master, FontResolver fonts, int first, int maxPages, string? name, Box? start, Box? end, WorkBudget budget)
     {
         PageGeometry g = master.Geometry(first, name);
-        var engine = new LayoutEngine(fonts);
+        var engine = new LayoutEngine(fonts, budget);
         BoxFragment layout = engine.Layout(root, g.ContentWidth, g.ContentHeight);
         BoxFragment? startFragment = start is null ? null : NamedPages.Find(layout, start);
         BoxFragment? endFragment = end is null ? null : NamedPages.Find(layout, end);
@@ -247,8 +321,17 @@ public static class HtmlConverter
     /// <summary>Converts an HTML string to PDF bytes.</summary>
     /// <param name="html">The HTML.</param>
     /// <param name="options">Page size, fonts and how resources load; defaults when null.</param>
-    /// <exception cref="HtmlConversionException">The document needs more pages than <see cref="HtmlConverterOptions.MaxPages"/>.</exception>
+    /// <exception cref="HtmlConversionException">The document goes past a limit of <paramref name="options"/>, such as <see cref="HtmlConverterOptions.MaxPages"/>.</exception>
     public static byte[] ConvertToPdf(string html, HtmlConverterOptions? options = null) => ConvertToDocument(html, options).ToArray(SaveOptions(options));
+
+    /// <summary>Converts an HTML string to PDF bytes, observing a cancellation token until the document is drawn.</summary>
+    /// <param name="html">The HTML.</param>
+    /// <param name="options">Page size, fonts and how resources load; defaults when null.</param>
+    /// <param name="cancellationToken">Observed as by <see cref="ConvertToDocument(string, HtmlConverterOptions?, CancellationToken)"/>; saving the drawn document is not interrupted.</param>
+    /// <exception cref="HtmlConversionException">The document goes past a limit of <paramref name="options"/>, such as <see cref="HtmlConverterOptions.MaxPages"/>.</exception>
+    /// <exception cref="OperationCanceledException">The token fired.</exception>
+    public static byte[] ConvertToPdf(string html, HtmlConverterOptions? options, CancellationToken cancellationToken) =>
+        ConvertToDocument(html, options, cancellationToken).ToArray(SaveOptions(options), CancellationToken.None);
 
     /// <summary>Converts an HTML string and writes the PDF to a stream.</summary>
     /// <param name="html">The HTML.</param>
@@ -267,7 +350,7 @@ public static class HtmlConverter
     /// asynchronous calls, as response bodies in ASP.NET Core and Azure Functions require.
     /// </summary>
     /// <remarks>
-    /// Layout runs on a thread of its own, as <see cref="ConvertToDocument"/> does, and the PDF is
+    /// Layout runs on a thread of its own, as <see cref="ConvertToDocumentAsync"/> does, and the PDF is
     /// then saved with <see cref="PdfDocument.SaveAsync(Stream, PdfSaveOptions?, CancellationToken)"/>,
     /// with <see cref="HtmlConverterOptions.SaveOptions"/>.
     /// </remarks>
@@ -275,45 +358,74 @@ public static class HtmlConverter
     /// <param name="output">Where the PDF is written, from its current position. It is flushed, not closed.</param>
     /// <param name="options">Page size, fonts and how resources load; defaults when null.</param>
     /// <param name="cancellationToken">
-    /// Observed before layout starts and while the PDF is saved; layout itself, bounded by
-    /// <see cref="HtmlConverterOptions.MaxPages"/>, runs to its end. When it fires, the call ends
-    /// with <see cref="OperationCanceledException"/> and what reached the stream is not a complete file.
+    /// Observed while the call waits for a turn (<see cref="MaxConcurrentConversions"/>), through
+    /// parsing, styling, layout, painting and resource loading, and while the PDF is saved. When it
+    /// fires, the call ends with <see cref="OperationCanceledException"/> and what reached the
+    /// stream is not a complete file.
     /// </param>
-    /// <exception cref="HtmlConversionException">The document needs more pages than <see cref="HtmlConverterOptions.MaxPages"/>.</exception>
+    /// <exception cref="HtmlConversionException">The document goes past a limit of <paramref name="options"/>, such as <see cref="HtmlConverterOptions.MaxPages"/>.</exception>
     public static async Task ConvertToPdfAsync(string html, Stream output, HtmlConverterOptions? options = null, CancellationToken cancellationToken = default)
     {
         Compat.ThrowIfNull(html, nameof(html));
         Compat.ThrowIfNull(output, nameof(output));
-        cancellationToken.ThrowIfCancellationRequested();
-        HtmlConverterOptions effective = options ?? new HtmlConverterOptions();
-        PdfDocument doc = await ConvertOnWorkerAsync(html, effective).ConfigureAwait(false);
+        PdfDocument doc = await ConvertToDocumentAsync(html, options, cancellationToken).ConfigureAwait(false);
         await doc.SaveAsync(output, SaveOptions(options), cancellationToken).ConfigureAwait(false);
     }
 
-    /// <summary>Lays out on a thread with a deep stack, completing the task there, so the caller's thread is free meanwhile.</summary>
-    private static Task<PdfDocument> ConvertOnWorkerAsync(string html, HtmlConverterOptions options)
+    /// <summary>
+    /// Converts on a thread with a deep stack, which completes the task and releases the gate the
+    /// caller entered, so the caller's thread is free meanwhile.
+    /// </summary>
+    private static Task<PdfDocument> ConvertOnWorkerAsync(string html, HtmlConverterOptions options, SemaphoreSlim gate, CancellationToken cancellationToken)
     {
         var done = new TaskCompletionSource<PdfDocument>(TaskCreationOptions.RunContinuationsAsynchronously);
-        var worker = new Thread(
-            () =>
+        try
+        {
+            StartWorker(() =>
             {
+                PdfDocument? result = null;
+                Exception? failure = null;
                 try
                 {
-                    done.SetResult(Convert(html, options));
+                    result = Convert(html, options, NewBudget(html, options, cancellationToken));
                 }
                 catch (Exception e)
                 {
-                    done.SetException(e);
+                    failure = e;
                 }
-            },
-            StackSize)
+                finally
+                {
+                    gate.Release();
+                }
+
+                if (failure is null) done.SetResult(result!);
+                else if (failure is OperationCanceledException && cancellationToken.IsCancellationRequested) done.TrySetCanceled(cancellationToken);
+                else done.SetException(failure);
+            });
+        }
+        catch
+        {
+            gate.Release();
+            throw;
+        }
+
+        return done.Task;
+    }
+
+    /// <summary>Starts a conversion thread: a deep stack for deep trees, and a background thread, so it never keeps the process alive.</summary>
+    private static Thread StartWorker(ThreadStart body)
+    {
+        var worker = new Thread(body, StackSize)
         {
             Name = "PdfNetStack.Html",
             IsBackground = true,
         };
         worker.Start();
-        return done.Task;
+        return worker;
     }
+
+    private static WorkBudget NewBudget(string html, HtmlConverterOptions options, CancellationToken cancellationToken) =>
+        new(options.StyleWorkFor(html), options.LayoutWorkFor(html), cancellationToken);
 
     // The converter draws every page itself, so the optimizer's rewrite of it needs no proof.
     private static readonly PdfSaveOptions Unverified = new() { VerifyOptimization = false };
@@ -348,6 +460,9 @@ public static class HtmlConverter
                 SaveOptions = options.SaveOptions,
                 Hyphenators = options.Hyphenators,
                 MaxPages = options.MaxPages,
+                MaxStyleWork = options.MaxStyleWork,
+                MaxLayoutWork = options.MaxLayoutWork,
+                ResourceLoaderAsync = options.ResourceLoaderAsync,
             };
         }
 
@@ -510,7 +625,7 @@ public static class HtmlConverter
     /// block-level element shows from the page its anchor falls on; element() picks among those of
     /// a page as string() does. An inline one, which has no anchor, shows on every page.
     /// </summary>
-    private sealed class RunningElements(Dictionary<string, Box> unanchored, List<(TextBox Box, string Counter, string Style)> pageCounters, StyleResolver resolver, FontResolver fonts, Func<string, HtmlImage?> images)
+    private sealed class RunningElements(Dictionary<string, Box> unanchored, List<(TextBox Box, string Counter, string Style)> pageCounters, StyleResolver resolver, FontResolver fonts, Func<string, HtmlImage?> images, WorkBudget budget)
     {
         private readonly Dictionary<(Box, double, int), BoxFragment> _laidOut = [];
         private readonly Dictionary<Box, List<(TextBox Box, string Counter, string Style)>> _counters = [];
@@ -546,7 +661,7 @@ public static class HtmlConverter
                 // its own engine, since the page's keeps the state of the page's layout.
                 var holder = new BlockBox(resolver.Anonymous(style, "block"), null) { IsAnonymous = true };
                 holder.SetChildren([box]);
-                fragment = new LayoutEngine(fonts).Layout(holder, width);
+                fragment = new LayoutEngine(fonts, budget).Layout(holder, width);
                 _laidOut[key] = fragment;
             }
 

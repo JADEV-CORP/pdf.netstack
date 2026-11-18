@@ -99,8 +99,9 @@ internal static class CcittDecoder
     /// <param name="data">The encoded data.</param>
     /// <param name="p">The decode parameters.</param>
     /// <param name="height">Rows to produce when <see cref="CcittParameters.Rows"/> is 0: the image's height.</param>
+    /// <param name="ct">Observed every 256 rows.</param>
     /// <exception cref="ArgumentOutOfRangeException">Columns or rows are out of range.</exception>
-    public static byte[] Decode(ReadOnlySpan<byte> data, CcittParameters p, int height) => Decode(data, p, height, strict: false)!;
+    public static byte[] Decode(ReadOnlySpan<byte> data, CcittParameters p, int height, CancellationToken ct = default) => Decode(data, p, height, strict: false, ct)!;
 
     /// <summary>
     /// Decodes data that holds every row without a flaw, or returns null: a code that does not
@@ -109,9 +110,9 @@ internal static class CcittDecoder
     /// decoded this way is known to show the same pixels in every reader.
     /// </summary>
     /// <exception cref="ArgumentOutOfRangeException">Columns or rows are out of range.</exception>
-    public static byte[]? DecodeExact(ReadOnlySpan<byte> data, CcittParameters p, int height) => Decode(data, p, height, strict: true);
+    public static byte[]? DecodeExact(ReadOnlySpan<byte> data, CcittParameters p, int height) => Decode(data, p, height, strict: true, CancellationToken.None);
 
-    private static byte[]? Decode(ReadOnlySpan<byte> data, CcittParameters p, int height, bool strict)
+    private static byte[]? Decode(ReadOnlySpan<byte> data, CcittParameters p, int height, bool strict, CancellationToken ct)
     {
         int columns = p.Columns, rows = p.Rows > 0 ? p.Rows : height;
         if (columns is <= 0 or > MaxColumns) throw new ArgumentOutOfRangeException(nameof(p), "Columns are out of range.");
@@ -131,6 +132,7 @@ internal static class CcittDecoder
         int referenceCount = 0, decoded = 0;
         for (int row = 0; row < rows; row++)
         {
+            if ((row & 255) == 0) ct.ThrowIfCancellationRequested();
             if (p.EncodedByteAlign && !(p.K >= 0 && p.EndOfLine)) bits.Align();
 
             // Group 3 rows may start with EOL, after fill bits; two in a row end the data (RTC).

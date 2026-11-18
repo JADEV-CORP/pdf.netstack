@@ -212,11 +212,11 @@ public sealed class PdfOcr
         PdfOcrPage Skip(PdfOcrPageStatus status, string? reason) => new(index, status, reason, []);
         try
         {
-            if (_options.SkipPagesWithText && TextFinder.HasText(page)) return (null, Skip(PdfOcrPageStatus.SkippedHasText, null));
+            if (_options.SkipPagesWithText && TextFinder.HasText(page, cancellationToken)) return (null, Skip(PdfOcrPageStatus.SkippedHasText, null));
 
             PdfRectangle crop = page.CropBox;
             double pageArea = Math.Max(1e-9, crop.Width * crop.Height);
-            List<PdfPageImage> images = [.. page.GetImages().Where(i => Overlap(i.Bounds, crop) > 0)];
+            List<PdfPageImage> images = [.. page.GetImages(cancellationToken).Where(i => Overlap(i.Bounds, crop) > 0)];
             if (images.Count > MaxPieces) return (null, Skip(PdfOcrPageStatus.SkippedUnsupported, $"The page draws {images.Count} images, over the limit of {MaxPieces}."));
 
             // A scan stored in pieces (strips, tiles, a text mask over a background) is put back together.
@@ -241,7 +241,7 @@ public sealed class PdfOcr
 
             PdfMatrix m = image.Transform;
             if ((m.A * m.D) - (m.B * m.C) < 0) return (null, Skip(PdfOcrPageStatus.SkippedUnsupported, "The scan is drawn mirrored."));
-            PdfBitmap? decoded = image.Decode();
+            PdfBitmap? decoded = image.Decode(cancellationToken);
             if (decoded is null) return (null, Skip(PdfOcrPageStatus.SkippedUnsupported, $"Images encoded with {image.Encoding} are not decoded."));
             return (Upright(index, OcrBitmap.FromPdfBitmap(decoded), image, page.Rotation), null);
         }
@@ -277,7 +277,7 @@ public sealed class PdfOcr
         foreach (PdfPageImage piece in pieces)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            PdfBitmap? decoded = piece.Decode();
+            PdfBitmap? decoded = piece.Decode(cancellationToken);
             if (decoded is null) return Skip($"Images encoded with {piece.Encoding} are not decoded.");
             Mosaic.Paint(canvas, width, height, area, OcrBitmap.FromPdfBitmap(decoded), piece.Transform, piece.IsMask);
         }
@@ -563,9 +563,9 @@ public sealed class PdfOcr
 
         private bool Found { get; set; }
 
-        public static bool HasText(PdfPage page)
+        public static bool HasText(PdfPage page, CancellationToken cancellationToken)
         {
-            var finder = new TextFinder(page.Document);
+            var finder = new TextFinder(page.Document) { Cancellation = cancellationToken };
             finder.Run(page);
             return finder.Found;
         }

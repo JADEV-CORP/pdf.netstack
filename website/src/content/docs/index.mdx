@@ -1,10 +1,10 @@
 ---
 title: 'PdfNetStack: PDF library for .NET in pure C#'
-description: Free MIT PDF library for .NET in pure C#. Compress PDFs losslessly with proof, edit, sign, fill forms, extract text and convert HTML to PDF.
+description: MIT PDF library for .NET in pure C#. Shrink PDFs on a server without breaking them, with proof, and leave PDFsharp after its 6.5 AGPL switch.
 template: splash
 hero:
   title: PDF library for .NET, in pure C#
-  tagline: Compress PDFs and prove nothing changed. Edit, create, sign, fill forms, extract text and convert HTML to PDF. MIT licensed, no native binaries, no dependencies on .NET 8 and later.
+  tagline: Shrink PDFs on a server without breaking them. Forms, tags, signatures and PDF/A survive, and every output is proved equivalent to its input. It is also an MIT home for code leaving PDFsharp, now that 6.5.0 is AGPL-3.0. Pure C#, no native binaries.
   image:
     file: ../../assets/logo.svg
   actions:
@@ -12,7 +12,7 @@ hero:
       link: /getting-started/
       icon: right-arrow
     - text: Star on GitHub
-      link: https://github.com/jams4code/pdf.netstack
+      link: https://github.com/JADEV-CORP/pdf.netstack
       icon: github
       variant: minimal
     - text: NuGet package
@@ -28,6 +28,8 @@ faq:
     a: No. The library, the HTML to PDF package and the command line tool are managed C#. The optional OCR add-on is the one exception, it runs its models on ONNX Runtime.
   - q: Which .NET versions does it support?
     a: .NET 8, 9, 10 and later, with trimming and Native AOT, and .NET Framework 4.6.2 to 4.8.1, Mono and Unity through netstandard2.0.
+  - q: Can PdfNetStack replace PDFsharp?
+    a: For drawing, editing, merging, splitting, forms and encryption, PdfNetStack has MIT licensed equivalents, and the migration guide maps the common calls and lists the gaps. MigraDoc's document model has no equivalent; for documents laid out from content, PdfNetStack.Html converts HTML and CSS to PDF.
   - q: Is PdfNetStack related to the PDFNet SDK of Apryse?
     a: No. PDFNet is a commercial SDK from Apryse. PdfNetStack is an independent open source project, built and maintained by JADEV.
 ---
@@ -63,21 +65,23 @@ and edits files of any size page by page.
 ## Why PdfNetStack
 
 <CardGrid>
-<Card title="Lossless, with proof" icon="approve-check">
-Every compressed file is read back and compared with its source, object by object. If anything
-differs, you get your original bytes back. [Fidelity](/concepts/fidelity/)
+<Card title="Shrink PDFs without breaking them" icon="approve-check">
+Forms, structure tags, bookmarks and attachments come through. Every rewrite is read back and
+compared with its source, object by object; if anything differs, you get your original bytes
+back. [Compress PDF](/guides/compress-pdf/)
+</Card>
+<Card title="An MIT home after PDFsharp 6.5" icon="open-book">
+PDFsharp 6.5.0, published on 14 October 2026, is AGPL-3.0-only. PdfNetStack is MIT licensed,
+with no license key, and its drawing calls follow `XGraphics`. [Migrate from PDFsharp](/guides/migrate-from-pdfsharp/)
 </Card>
 <Card title="Pure C#, nothing native" icon="rocket">
 No Ghostscript, no browser, no native binaries. It runs anywhere .NET runs, Native AOT and
 serverless included. [Architecture](/concepts/architecture/)
 </Card>
-<Card title="MIT, no license keys" icon="open-book">
-Free for commercial use, with no fee per developer, server or deployment. CI blocks any
-dependency outside a reviewed license allowlist. [About](/about/)
-</Card>
-<Card title="Safe on untrusted files" icon="seti:lock">
-Parsing is bounded in depth and size. The optimizer never rewrites signed, encrypted or damaged
-files. [Safety model](/concepts/safety-model/)
+<Card title="Fails safe" icon="seti:lock">
+Signed, encrypted and damaged files come back as they are. From 1.3, `PdfLimits.Untrusted` bounds
+what a whole file from a user may cost, and long calls take a cancellation token.
+[Resource limits](/concepts/resource-limits/)
 </Card>
 </CardGrid>
 
@@ -85,8 +89,8 @@ files. [Safety model](/concepts/safety-model/)
 
 <Steps>
 
-1. **Read.** The file is parsed with limits on nesting, stream sizes and image sizes. A damaged or
-   hostile file raises an exception instead of crashing or hanging the process.
+1. **Read.** The file is parsed with limits on nesting, stream sizes and image sizes. Encrypted,
+   signed and damaged files stop here and come back unchanged, with the reason.
 
 2. **Rewrite.** Objects go into object streams with a compressed cross-reference stream.
    Unreachable objects are dropped, Flate streams recompressed, raw images get PNG prediction,
@@ -105,24 +109,26 @@ change that goes too far. [Compress PDF](/guides/compress-pdf/)
 
 ## Performance
 
-### Public corpus, measured on every release
+### Public corpus, against qpdf and Ghostscript
 
 CI downloads 77 openly licensed and public domain PDFs (NIST and NASA publications, arXiv papers,
-government gazettes, test files) and optimizes each one with three profiles. Results for 1.1.0 on
-a 4 core Linux runner:
+government gazettes, test files) and runs PdfNetStack with its defaults next to qpdf, MuPDF and
+Ghostscript. Each output is scored on size, on rendering in PDFium and on what it kept: tags,
+forms, outlines, signatures, usage rights and PDF/A conformance. On the 76 files PDFium can open,
+18 November 2026:
 
-| Profile | Saved | Failures | Rendering |
-|---|---:|---:|---|
-| Lossless, the default | 12.1% | 0 | Checked pages identical in PDFium |
-| Balanced preset | 23.4% | 0 | Image changes gated at SSIM 0.95 |
-| Lossy profile | 29.5% | 0 | Image changes gated at SSIM 0.95 |
+| Tool | Saved | Outputs that keep quality |
+|---|---:|---:|
+| PdfNetStack, lossless (defaults) | 11.2% | 76 of 76 |
+| qpdf 12.4.2, lossless | 5.7% | 64 of 76 |
+| PdfNetStack, balanced preset | 21.8% | 76 of 76 |
+| Ghostscript 10.05, `/ebook` | 32.1% | 23 of 76 |
 
-Signed and encrypted files are kept as they are, by design. The lossless run took 44 seconds for
-196.6 MiB, proof included. The full report is attached to the
-[1.1.0 release](https://github.com/jams4code/pdf.netstack/releases/tag/v1.1.0), and you can run
-the same benchmark yourself.
+On the 64 files where both keep quality, PdfNetStack's output is 8% smaller than qpdf's, in about
+the same time on one thread, its proof of every output included. Signed and encrypted files are
+kept as they are, by design. Method and how to run it yourself on [Benchmarks](/benchmarks/).
 
-### Real world corpus
+### Private corpus
 
 <div class="proof">
   <div><strong>1,296</strong> <span>invoices, reports, manuals, scans and slides, 569 MiB</span></div>
@@ -131,9 +137,9 @@ the same benchmark yourself.
   <div><strong>0</strong> <span>differing pixels at 150 DPI, 2,161 pages</span></div>
 </div>
 
-Measured for 1.0 with default options, in about 65 seconds on 8 cores. Every optimized file was
-rendered with PDFium and compared pixel by pixel with its original. Method and details on
-[Benchmarks](/benchmarks/).
+Measured for 1.0 with default options, in about 65 seconds on 8 cores, on a corpus that is not
+public. Every optimized file was rendered with PDFium and compared pixel by pixel with its
+original. Method and details on [Benchmarks](/benchmarks/).
 
 ## See it in code
 
@@ -183,6 +189,7 @@ A layout engine in C#, no browser: flex, grid, tables, paged media and web fonts
 
 <CardGrid>
 <LinkCard title="Edit pages" href="/guides/edit-pages/" description="Merge, split, import, reorder, rotate and remove pages. Metadata and bookmarks." />
+<LinkCard title="Migrate from PDFsharp" href="/guides/migrate-from-pdfsharp/" description="Common PDFsharp 6 calls mapped to PdfNetStack, with before and after code." />
 <LinkCard title="HTML to PDF" href="/guides/html-to-pdf/" description="CSS cascade, flex, grid, tables, paged media, web fonts, tagged output." />
 <LinkCard title="Drawing" href="/guides/drawing/" description="Paths, colors, gradients, transforms and clipping on new and existing pages." />
 <LinkCard title="Fonts and text" href="/guides/fonts-and-text/" description="OpenType, WOFF2 and variable fonts, paragraphs, Arabic, Indic and right to left." />
@@ -252,5 +259,5 @@ library. JADEV now maintains it as open source for every .NET team. Read
 
 Need PDF processing, document workflows or other .NET work?
 [Tell JADEV what you need](https://www.jadev-corp.com/en/#contact). Using PdfNetStack?
-[Star it on GitHub](https://github.com/jams4code/pdf.netstack) so other teams find it, and
+[Star it on GitHub](https://github.com/JADEV-CORP/pdf.netstack) so other teams find it, and
 report issues there.

@@ -34,7 +34,7 @@ invisible text. Save the document as usual.
 
 The add-on needs the PdfNetStack source and four model files.
 
-1. Clone the repository: `git clone https://github.com/jams4code/pdf.netstack`.
+1. Clone the repository: `git clone https://github.com/JADEV-CORP/pdf.netstack`.
 2. Reference the project from your application:
 
    ```xml

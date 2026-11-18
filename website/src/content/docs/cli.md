@@ -60,7 +60,8 @@ pdfnetstack optimize in.pdf out.pdf --json              # the full result as JSO
 
 The lossy image options (`--max-dpi`, `--to-jpeg`, `--quantize`, `--min-ssim`), `--preset`, `--progressive`,
 `--exhaustive`, `--linearize`, `--streaming` and the structural passes with their `--no-prune`, `--no-compact`
-and `--no-font-merge` switches arrived in 1.1; the 1.0.0 tool does not have them. The reason line names every lossy change.
+and `--no-font-merge` switches arrived in 1.1; the 1.0.0 tool does not have them. `--sequential` and
+`--remove-usage-rights` arrive in 1.3. The reason line names every lossy change.
 
 Prints the disposition, the sizes, the saving and the time, the reason, and for an optimized file
 the object counts and the time per phase. The output file is always written: the verified
@@ -80,9 +81,10 @@ relative path under the output folder. Without an output folder nothing is writt
 measures what the optimizer would save. Documents run in parallel (`--jobs`, default all cores),
 each on one thread unless `--threads` is given.
 
-The summary lists documents optimized, retained and unsupported (grouped by reason), errors, the
-total size before and after, throughput and peak memory, and any verification failures, for which
-the original was kept. `--report <file.csv>` writes one row per document with the columns `file`,
+The summary lists documents optimized, retained and unsupported (grouped by reason), from 1.3 those
+over a limit (input kept because a resource limit was reached), errors, the total size before and
+after, throughput and peak memory, and any verification failures, for which the original was
+kept. `--report <file.csv>` writes one row per document with the columns `file`,
 `disposition`, `original_bytes`, `output_bytes`, `pages`, `milliseconds` and `reason`. A value that
 starts with a formula character is prefixed with a quote, so spreadsheet applications never
 evaluate it. `--json` prints the summary as JSON.
@@ -243,14 +245,16 @@ Optimizer options apply to `optimize`, `batch` and, where they make sense, to `v
 | `--quantize` | 1.1. Reduce raw RGB images to a palette when that stays faithful (lossy) | `QuantizeImages` |
 | `--preset <balanced\|smallest>` | 1.1. A ready set of lossy options; options after it change it | `PdfOptimizerOptions.Balanced`, `Smallest` |
 | `--min-ssim <0-1>` | 1.1. Keep any image whose lossy change falls below this SSIM | `MinImageSsim` |
-| `--progressive` | 1.1. Write JPEG progressively when that is smaller (lossless) | `ProgressiveJpeg` |
+| `--sequential` | 1.3. Write JPEG sequentially only. By default a JPEG is written progressively when that is smaller | `ProgressiveJpeg = false` |
+| `--progressive` | 1.1. Turned progressive JPEG on; from 1.3 that is the default, and the flag is accepted and does nothing | `ProgressiveJpeg` |
 | `--no-verify` | Skip the equivalence proof (not recommended) | `Verify = false` |
 | `--allow-incremental` | Flatten files with incremental updates | `AllowIncrementalUpdates` |
 | `--allow-repaired` | Rewrite damaged files that needed repair | `AllowRepairedFiles` |
 | `--strip-thumbnails` | Remove page thumbnails (not lossless) | `RemovePageThumbnails` |
 | `--strip-pieceinfo` | Remove application private data (not lossless) | `RemovePieceInfo` |
+| `--remove-usage-rights` | 1.3. Rewrite files whose only signature is Adobe Reader usage rights (`/UR3`), removing them | `RemoveUsageRights` |
 | `--min-saving <percent>` | Minimum saving to keep a rewrite (default 1) | `MinSavingPercent` |
-| `--threads <n>` | Threads per document (default: all cores) | `MaxDegreeOfParallelism` |
+| `--threads <n>` | Threads per document (default: all cores; from 1.3, fewer when the memory the runtime reports is short) | `MaxDegreeOfParallelism` |
 | `--jobs <n>` | Documents in parallel for `batch` (default: all cores) | |
 | `--report <file.csv>` | `batch`: one row per document | |
 | `--json` | Machine readable output | |
@@ -277,6 +281,9 @@ page:
 
 An `optimize` or `batch` run that keeps the original, because the saving is too small or the file
 is refused by the [safety model](/concepts/safety-model/), is a success: the output is a valid PDF.
+From 1.3 the same holds for a file that reaches the default
+[resource limits](/concepts/resource-limits/): the disposition is `LimitExceeded` and the output
+is the input.
 
 ## Limits
 

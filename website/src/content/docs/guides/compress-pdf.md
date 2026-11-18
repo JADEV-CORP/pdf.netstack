@@ -8,7 +8,7 @@ faq:
   - q: Is PdfNetStack compression lossless?
     a: Yes, by default. Text, vectors, fonts, images, forms, tags and metadata are carried over, and every output is compared to its source before it is returned. The lossy image options (JPEG requantization, downsampling, JPEG conversion) are opt-in.
   - q: How much smaller do PDFs get?
-    a: On a mixed corpus of 1,296 real world files the optimized ones went from 568.9 MiB to 469.0 MiB, 17.6% saved, losslessly. Image heavy files often gain 20 to 40%. Files from producers that already use object streams gain little.
+    a: On a public corpus of 77 openly licensed PDFs, with default options, PdfNetStack saved 11.2% losslessly, against 5.7% for qpdf, and every output kept quality. On a private corpus of 1,296 real world files the optimized ones went from 568.9 MiB to 469.0 MiB, 17.6% saved. Image heavy files often gain 20 to 40%. Files from producers that already use object streams gain little.
   - q: Can it downsample images?
     a: Yes, from version 1.1, with MaxImageDpi. Images drawn above 1.5 times the target resolution are resampled with a Lanczos filter, and MinImageSsim keeps any image the change would visibly hurt.
   - q: Can PdfNetStack write linearized PDFs for fast web view?
@@ -89,7 +89,7 @@ Pass a `PdfOptimizerOptions` to change the defaults.
 | `RecompressStreams` | true | Recompresses Flate at zlib level 9, turns LZW and RunLength into Flate |
 | `UseImagePredictors` | true | Tries PNG predictors on raw images |
 | `OptimizeJpegImages` | true | Lossless JPEG re-encoding |
-| `ProgressiveJpeg` | false | 1.1. Also tries progressive coding for every JPEG written, kept when smaller. Lossless |
+| `ProgressiveJpeg` | true | 1.1, on by default from 1.3. Also tries progressive coding for every JPEG written, kept when smaller. Lossless; `--sequential` turns it off |
 | `JpegQuality` | null | 1 to 100, libjpeg scale. Lossy: requantizes JPEG images, and sets the quality of new JPEGs |
 | `MaxImageDpi` | null | 1.1. Downsamples images drawn above 1.5 times this resolution. Lossy |
 | `MaxBilevelImageDpi` | null | 1.2. The same for bilevel images, in place of `MaxImageDpi`; null uses `MaxImageDpi`. Lossy |
@@ -98,11 +98,13 @@ Pass a `PdfOptimizerOptions` to change the defaults.
 | `Verify` | true | Disable only for inputs you already trust |
 | `AllowIncrementalUpdates` | false | Flattens edit history into one revision |
 | `AllowRepairedFiles` | false | Rewrites damaged files into clean ones |
+| `RemoveUsageRights` | false | 1.3. Rewrites a form whose only signature is Adobe Reader usage rights (`/UR3`), removing them |
+| `Limits` | `PdfLimits.Default` | 1.3. What one run may cost in total; a run that reaches a limit returns the input with `LimitExceeded`. See [Resource limits](/concepts/resource-limits/) |
 | `RemovePageThumbnails` | false | Not lossless |
 | `RemovePieceInfo` | false | Not lossless for the authoring application, invisible to viewers |
 | `MaxInputBytes` | 1 GiB | Larger inputs are returned unchanged |
 | `MaxDecodedStreamBytes` | 256 MiB | Per stream decode ceiling, a zip bomb defence |
-| `MaxDegreeOfParallelism` | CPU count | Lower it to cap memory on image heavy files |
+| `MaxDegreeOfParallelism` | CPU count | From 1.3 also capped by the memory the runtime reports. Lower it to cap memory on image heavy files |
 
 ## What the optimizer does
 
@@ -113,14 +115,14 @@ Pass a `PdfOptimizerOptions` to change the defaults.
 | Xref stream | Replaces the text xref table with a predictor encoded, compressed stream | Yes |
 | Stream recompression | Removes ASCIIHex and ASCII85 layers, turns LZW and RunLength into Flate, recompresses Flate at level 9, keeps a result only when smaller | Yes |
 | Image prediction | Tries PNG predictors on raw images of 8 bits or less per component | Yes |
-| JPEG re-encoding | Rebuilds Huffman tables per image, writes progressive and restart marked JPEGs as baseline, drops segments PDF readers ignore. The DCT coefficients stay identical | Yes |
+| JPEG re-encoding | Rebuilds Huffman tables per image, writes progressive and restart marked JPEGs as baseline unless progressive coding is smaller (see below), drops segments PDF readers ignore. The DCT coefficients stay identical | Yes |
 | Deduplication | Merges identical objects, iterating until merges stop. From 1.1, streams compare by what they decode to, so differently encoded copies merge | Yes |
 | Unused resources | `PruneUnusedResources` (1.1): fonts, XObjects, graphics states, patterns, shadings, color spaces and property lists that no content names are removed. Anything that cannot be read for certain is kept | Yes |
 | Content streams | `CompactContentStreams` (1.1): page, form, pattern and appearance content rewritten with minimal white space, canonical numbers, shortest strings and no comments; inline image data copied exactly | Yes |
 | Font subsets | `MergeFontSubsets` (1.1): separate subsets of one TrueType font, as merged documents carry them, become one program when no glyph any page shows changes | Yes |
 | Linearization | `Linearize` (1.1): first page first, two cross-reference sections and hint tables (Annex F), for fast web view | Yes, opt-in |
 | Compact syntax | Minimal separators, canonical numbers, null entries dropped | Yes |
-| Progressive JPEG | `ProgressiveJpeg`: every JPEG written is also tried progressive, kept when smaller | Yes, opt-in |
+| Progressive JPEG | `ProgressiveJpeg`: every JPEG written is also tried progressive, kept when smaller | Yes, on by default from 1.3 |
 | Exhaustive Flate | `Compression = Exhaustive`: optimal parsing and block splitting in the manner of Zopfli, zlib kept when smaller | Yes, opt-in |
 | Thumbnails, PieceInfo | Optional removal of page thumbnails and application private data | No, opt-in |
 | JPEG requantization | `JpegQuality`: coarser quantization, never finer than the image's own. Soft masks stay lossless | No, opt-in |
@@ -278,8 +280,24 @@ method and its limits are on the [fidelity](/concepts/fidelity/) page.
 
 ## Results
 
-Measured on a mixed real world corpus of 1,296 files (569 MiB) with default options, lossless, on
-an 8 core Windows machine:
+On the public corpus of 77 openly licensed PDFs, with the library defaults, next to qpdf 12.4.2 and
+Ghostscript 10.05, on the 76 files PDFium can open (18 November 2026):
+
+| Tool | Saved | Outputs that keep quality |
+|---|---:|---:|
+| PdfNetStack, lossless (defaults) | 11.2% | 76 of 76 |
+| qpdf, lossless | 5.7% | 64 of 76 |
+| PdfNetStack, `Balanced` preset | 21.8% | 76 of 76 |
+| PdfNetStack, `Smallest` preset | 33.3% | 73 of 76 |
+| Ghostscript, `/ebook` | 32.1% | 23 of 76 |
+
+An output keeps quality when PDFium renders the same pages and text at an SSIM of at least 0.95,
+and it keeps its tags, forms, outlines, attachments, signatures, usage rights and PDF/A
+conformance. On the 64 files where both keep quality, PdfNetStack's output is 8% smaller than
+qpdf's. Method, head to head tables and how to run it: [Benchmarks](/benchmarks/).
+
+On a mixed private corpus of 1,296 files (569 MiB), with default options, lossless, on an 8 core
+Windows machine:
 
 | | |
 |---|---|
@@ -290,9 +308,9 @@ an 8 core Windows machine:
 | With `AllowIncrementalUpdates` and `AllowRepairedFiles` | 1,118 files optimized, 20.1% saved |
 
 Every optimized file was rendered with PDFium at 150 DPI and compared with its original: 2,161
-pages, zero differing pixels. See [Benchmarks](/benchmarks/) for the method. These figures were
-measured with version 1.0, before the structural passes of 1.1, which have so far been measured
-on synthetic files (`tools/make_optimizer_samples.py` and `tools/measure_optimizer.py`).
+pages, zero differing pixels. These figures were measured with version 1.0, before the
+structural passes of 1.1. The corpus is not public, so they cannot be reproduced; the public
+corpus above can.
 
 ## Limits
 
@@ -304,7 +322,8 @@ on synthetic files (`tools/make_optimizer_samples.py` and `tools/measure_optimiz
 - The optimizer does not subset fonts. It merges subsets of one font only when they keep the
   original glyph ids.
 - Linearization is opt-in. Without `Linearize`, the linearization of an input is dropped.
-- The optimizer holds the whole document in memory: plan for about 10 times the file size, see
+- The optimizer holds the whole document in memory, and each worker about three times the largest
+  decoded stream it works on: plan from the decoded size of the images, not the file size, see
   [Memory and performance](/concepts/memory-and-performance/). To read or edit a large file
   without loading it, see [Large files](/guides/large-files/).
 

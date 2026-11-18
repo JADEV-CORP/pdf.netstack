@@ -3,6 +3,13 @@
 HTML and CSS to PDF for .NET, in pure C#: no browser, no native binaries, no JavaScript, MIT
 licensed. Built on [PdfNetStack](https://www.nuget.org/packages/PdfNetStack).
 
+It converts the HTML and CSS of typical business documents (invoices, receipts, statements,
+letters, certificates and printable reports). In a test of 20 public invoice and report templates
+from wkhtmltopdf and DinkToPdf projects, compared page by page with Chrome, 10 render the same, 7
+render with small differences (spacing, font weight, where a page breaks) and 3 cut off content:
+reports with tables wider than the page, which Chrome and wkhtmltopdf shrink to fit and
+PdfNetStack does not yet. Check your own templates before switching.
+
 ```csharp
 using PdfNetStack.Html;
 
@@ -148,8 +155,14 @@ var options = new HtmlConverterOptions
 ```
 
 Parsing, styling and layout are bounded: nesting depth, selector complexity, `var()`
-expansion, table spans and background tiling all have limits, so hostile markup ends in a
-finite document rather than a hang or a crash.
+expansion, table spans and background tiling all have limits. A whole conversion is bounded too:
+`MaxStyleWork` and `MaxLayoutWork` cap style and layout work, scaled with the length of the input
+by default, and end a conversion past them with `HtmlConversionException` naming the option.
+`HtmlConverter.MaxConcurrentConversions` (default: the processor count) caps the conversions
+running at once; async callers wait without holding a thread. Every entry point takes a
+`CancellationToken`, observed while waiting for a turn and through parsing, styling, layout,
+painting and resource loading, and `ResourceLoaderAsync` fetches resources with it. Run
+conversions of HTML from users with a timeout and in a process with a memory limit.
 
 Sizes are bounded too. Computed lengths (margins, padding, borders, widths, line heights, letter
 and word spacing) are clamped to a million px either way, percentages to a million percent,
@@ -186,6 +199,8 @@ so no style value stops a conversion.
 ## Limits
 
 - No JavaScript: pages must be rendered HTML, not built in the browser.
+- Content wider than the page is cut, not shrunk to fit, and floats and table rows are not split
+  across pages.
 - No multi-column layout or vertical writing modes yet.
 - Images: JPEG, PNG, GIF (the first frame), BMP, TIFF (the first page), WebP (the first frame)
   and SVG (drawn as vectors, without filters, masks or patterns).
@@ -197,8 +212,8 @@ so no style value stops a conversion.
 
 ## Links
 
-- Project and documentation: https://github.com/jams4code/pdf.netstack
-- Roadmap: https://github.com/jams4code/pdf.netstack/blob/main/docs/ROADMAP.md
-- Changelog: https://github.com/jams4code/pdf.netstack/blob/main/CHANGELOG.md
+- Project and documentation: https://github.com/JADEV-CORP/pdf.netstack
+- Roadmap: https://github.com/JADEV-CORP/pdf.netstack/blob/main/docs/ROADMAP.md
+- Changelog: https://github.com/JADEV-CORP/pdf.netstack/blob/main/CHANGELOG.md
 
 By Jamal Abdelkhalek, [JADEV](https://jadev-corp.com). MIT license.

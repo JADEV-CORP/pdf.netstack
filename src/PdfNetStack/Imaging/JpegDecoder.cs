@@ -22,17 +22,18 @@ internal static class JpegDecoder
     /// <param name="colorTransform">The DCTDecode /ColorTransform, or null outside a PDF.</param>
     /// <param name="byteLimit">Ceiling for coefficient and sample buffers.</param>
     /// <param name="maxPixels">Ceiling for the image area.</param>
+    /// <param name="ct">Observed while the scans are read and between rows of blocks.</param>
     /// <exception cref="JpegFormatException">The data is damaged, too large or uses an unsupported coding process.</exception>
-    public static Raster Decode(ReadOnlySpan<byte> data, int? colorTransform, long byteLimit, long maxPixels = long.MaxValue)
+    public static Raster Decode(ReadOnlySpan<byte> data, int? colorTransform, long byteLimit, long maxPixels = long.MaxValue, CancellationToken ct = default)
     {
-        using JpegImage image = JpegReader.Read(data, byteLimit, maxPixels);
+        using JpegImage image = JpegReader.Read(data, byteLimit, maxPixels, ct);
         int width = image.Width, height = image.Height, n = image.Components.Length;
         if (n is not (1 or 3 or 4)) throw new JpegFormatException($"JPEG with {n} components is not supported.");
         long samples = (long)width * height * n;
         if (samples > byteLimit || samples > Compat.MaxArrayLength) throw new JpegFormatException("JPEG exceeds the decode limit.");
 
         var planes = new byte[n][];
-        for (int c = 0; c < n; c++) planes[c] = Upsample(image, image.Components[c], Samples(image.Components[c]));
+        for (int c = 0; c < n; c++) planes[c] = Upsample(image, image.Components[c], Samples(image.Components[c], ct));
 
         var output = new byte[samples];
         bool[] chroma = image.ChromaComponents(colorTransform);
@@ -42,7 +43,7 @@ internal static class JpegDecoder
     }
 
     /// <summary>The component's samples at its own resolution, BlocksPerLine * 8 wide.</summary>
-    private static byte[] Samples(JpegComponent component)
+    private static byte[] Samples(JpegComponent component, CancellationToken ct)
     {
         int stride = component.BlocksPerLine * 8;
         var plane = new byte[stride * component.BlocksPerColumn * 8];
@@ -52,6 +53,7 @@ internal static class JpegDecoder
         ushort[] q = component.Quantization;
         for (int by = 0; by < component.BlocksPerColumn; by++)
         {
+            ct.ThrowIfCancellationRequested();
             for (int bx = 0; bx < component.BlocksPerLine; bx++)
             {
                 Span<short> coefficients = component.Block(by, bx);

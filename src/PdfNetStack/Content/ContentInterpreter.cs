@@ -12,7 +12,10 @@ namespace PdfNetStack.Content;
 /// <remarks>
 /// Content comes from untrusted files, so the walk is bounded: forms nest at most
 /// <see cref="MaxFormDepth"/> deep, a form never draws itself, and every page gets a budget of
-/// operators shared by everything it draws.
+/// decoded bytes, tokens and operators shared by everything it draws. Operators also count
+/// against the document's <see cref="PdfLimits.MaxOperationsPerDocument"/>, and a run ends at
+/// <see cref="PdfLimits.Timeout"/>. A budget that runs out ends the page's content there and is
+/// reported to <see cref="PdfDocument.Diagnostics"/>.
 /// </remarks>
 internal abstract class ContentInterpreter
 {
@@ -21,10 +24,25 @@ internal abstract class ContentInterpreter
     public const long MaxOperations = 10_000_000;
 
     /// <summary>
-    /// Bytes a page may decode and parse, together. A form drawn again is parsed again, so a
-    /// small form holding one huge operand would otherwise cost far more than its operators.
+    /// Tokens a page may read, re-reads of damaged operands included: a few per operator, so
+    /// ordinary pages stay far below it while a page of damaged operands stays linear.
     /// </summary>
-    public const long MaxBytes = 256L << 20;
+    public const long MaxTokens = 50_000_000;
+
+    /// <summary>
+    /// Bytes a page may parse. A form drawn again is parsed again, so a small form holding one
+    /// huge operand would otherwise cost far more than its operators or tokens. Counted apart
+    /// from the bytes decoded, which the decode ceiling bounds: one page read once counts once
+    /// against each.
+    /// </summary>
+    public const long MaxParsedBytes = 1L << 30;
+
+    // Operators are charged to the document's budget in batches, and the deadline read as often.
+    private const int Batch = 1024;
+
+    // Operators read between two looks at the cancellation token: often enough to stop within a
+    // millisecond or so, rarely enough that the check never shows next to parsing.
+    private const int CancellationInterval = 256;
 
     private readonly Stack<(PdfMatrix Ctm, TextState Text, PdfMatrix TextMatrix, PdfMatrix LineMatrix)> _saved = new();
     private readonly HashSet<PdfStream> _activeForms = [];
@@ -35,12 +53,18 @@ internal abstract class ContentInterpreter
     // The one string of Tj, ' and ", passed on without a list for each.
     private readonly List<PdfObject> _single = [];
 
+    private readonly ContentBudget _tokens = new(MaxTokens);
+
     // The text line matrix Tlm: the text matrix at the start of the current line.
     private PdfMatrix _lineMatrix = PdfMatrix.Identity;
     private long _operations;
+    private bool _stopped;
     private long _bytes;
+    private long _parsed;
     private int _marked;
     private int _markedOverflow;
+    private Deadline _deadline;
+    private PdfPage? _page;
 
     protected ContentInterpreter(PdfDocument document) => Document = document;
 
@@ -58,11 +82,19 @@ internal abstract class ContentInterpreter
     /// </summary>
     protected PdfMatrix TextMatrix { get; private set; } = PdfMatrix.Identity;
 
+    /// <summary>
+    /// Stops the walk with <see cref="OperationCanceledException"/> once cancelled: looked at
+    /// before each stream is decoded and every few hundred operators.
+    /// </summary>
+    public CancellationToken Cancellation { get; set; }
 
     /// <summary>Walks a page's content streams, in order, with the page's resources.</summary>
+    /// <exception cref="PdfLimitExceededException">The walk ran past <see cref="PdfLimits.Timeout"/>.</exception>
     public void Run(PdfPage page)
     {
         Compat.ThrowIfNull(page, nameof(page));
+        _page = page;
+        _deadline = Deadline.Start(Document.Limits);
         PdfDictionary? resources = Document.Resolve(page.Dictionary["Resources"]) as PdfDictionary;
         PdfObject? contents = Document.Resolve(page.Dictionary["Contents"]);
         IEnumerable<PdfObject> parts = contents switch
@@ -72,19 +104,50 @@ internal abstract class ContentInterpreter
             _ => [],
         };
 
-        // Content split across streams is one stream (ISO 32000-1, 7.8.2): concatenate before reading.
-        using var joined = new MemoryStream();
+        if (Joined(parts) is { } content) Execute(content, resources, 0);
+        Document.Budget.TryChargeOperations(_operations % Batch);
+    }
+
+    /// <summary>
+    /// Reports a bound that ended the page's content early, with the page, so each page that
+    /// reaches one is named.
+    /// </summary>
+    protected void ReportPageLimit(PdfLimitKind limit, string message) =>
+        Document.Budget.Diagnostics.LimitReached(limit, message, _page?.Index);
+
+    /// <summary>
+    /// The page's content: split across streams it is one stream (ISO 32000-1, 7.8.2), so the
+    /// parts are joined, in one array of the final size; a single part is used as decoded.
+    /// </summary>
+    private byte[]? Joined(IEnumerable<PdfObject> parts)
+    {
+        List<byte[]> pieces = [];
+        long total = 0;
         foreach (PdfObject part in parts)
         {
             if (Document.Resolve(part) is not PdfStream stream) continue;
-            byte[]? data = Data(stream);
-            if (data is null) continue;
-            if (_bytes > MaxBytes) break;
-            joined.Write(data, 0, data.Length);
-            joined.WriteByte((byte)'\n');
+            if (Data(stream, (part as PdfReference)?.Number) is not { } data) continue;
+            if (total + data.Length + 1 > Compat.MaxArrayLength)
+            {
+                ReportPageLimit(PdfLimitKind.PageContent, "The page's content is longer than one array holds; the rest is not read.");
+                break;
+            }
+
+            pieces.Add(data);
+            total += data.Length + 1;
         }
 
-        Execute(joined.ToArray(), resources, 0);
+        if (pieces.Count <= 1) return pieces.Count == 0 ? null : pieces[0];
+        var joined = new byte[total];
+        int at = 0;
+        foreach (byte[] piece in pieces)
+        {
+            Buffer.BlockCopy(piece, 0, joined, at, piece.Length);
+            at += piece.Length;
+            joined[at++] = (byte)'\n';
+        }
+
+        return joined;
     }
 
     /// <summary>An image XObject was drawn; the unit square maps to the page through <see cref="Ctm"/>.</summary>
@@ -118,33 +181,58 @@ internal abstract class ContentInterpreter
     {
     }
 
-    private byte[]? Data(PdfStream stream)
+    /// <summary>
+    /// A stream's decoded data, or null when it cannot be decoded. What the page has left of its
+    /// byte budget is the ceiling given to the decoder, so a page over it stops before allocating.
+    /// </summary>
+    /// <param name="number">The stream's object number, for the diagnostics, when known.</param>
+    private byte[]? Data(PdfStream stream, int? number)
     {
-        if (_bytes > MaxBytes) return null;
+        long left = Document.DecodeLimit - _bytes;
+        if (left <= 0 || _stopped) return null;
+        Cancellation.ThrowIfCancellationRequested();
         try
         {
-            byte[] data = Document.GetStreamData(stream);
+            byte[] data = Document.GetStreamData(stream, left);
             _bytes += data.Length;
             return data;
         }
-        catch (PdfFormatException)
+        catch (PdfLimitExceededException e) when (e.Limit == PdfLimitKind.PageContent)
+        {
+            _bytes = Document.DecodeLimit;
+            ReportPageLimit(PdfLimitKind.PageContent, e.Message);
+            return null;
+        }
+        catch (PdfLimitExceededException)
+        {
+            // A document budget, reported where it ran out; what needs it draws nothing.
+            return null;
+        }
+        catch (PdfFormatException e)
         {
             // A damaged stream draws nothing, as in viewers; the rest of the page still counts.
+            Document.Budget.Diagnostics.Skipped("A content stream could not be decoded and draws nothing: " + e.Message, number, _page?.Index);
             return null;
         }
     }
 
     private void Execute(byte[] content, PdfDictionary? resources, int depth)
     {
-        _bytes += content.Length;
-        if (_bytes > MaxBytes) return;
-        var reader = new ContentReader(content);
+        if ((_parsed += content.Length) > MaxParsedBytes && !_stopped)
+        {
+            _stopped = true;
+            ReportPageLimit(PdfLimitKind.PageContent, Compat.Format("The page's content and the forms it draws come to more than {0} bytes to read; the rest is not read.", MaxParsedBytes));
+        }
+
+        if (_stopped) return;
+        var reader = new ContentReader(content, _tokens);
         var op = new ContentOperation();
         int baseDepth = _saved.Count;
         int markedDepth = _marked;
-        while (reader.Next(op))
+        while (!_stopped && reader.Next(op))
         {
-            if (++_operations > MaxOperations) break;
+            if (!Count()) break;
+            if (_operations % CancellationInterval == 0) Cancellation.ThrowIfCancellationRequested();
             List<PdfObject> o = op.Operands;
             switch (op.Operator)
             {
@@ -186,10 +274,36 @@ internal abstract class ContentInterpreter
             }
         }
 
+        if (reader.BudgetExhausted && !_stopped)
+        {
+            _stopped = true;
+            ReportPageLimit(PdfLimitKind.PageContent, Compat.Format("The page's content takes more than {0} tokens to read; the rest is not read.", MaxTokens));
+        }
+
         // Unbalanced q and marked content inside a form or page are closed at its end.
         while (_saved.Count > baseDepth) (Ctm, Text, TextMatrix, _lineMatrix) = _saved.Pop();
         while (_marked > markedDepth) EndMarked();
         if (depth == 0) _markedOverflow = 0;
+    }
+
+    /// <summary>
+    /// Counts one operator against the page's and the document's budgets, and reads the clock
+    /// every batch. False when a budget has run out, which ends the page's content.
+    /// </summary>
+    private bool Count()
+    {
+        if (++_operations > MaxOperations)
+        {
+            _stopped = true;
+            ReportPageLimit(PdfLimitKind.PageContent, Compat.Format("The page runs more than {0} content operators; the rest is not read.", MaxOperations));
+            return false;
+        }
+
+        if (_operations % Batch != 0) return true;
+        _deadline.ThrowIfPassed(Document.Budget);
+        if (Document.Budget.TryChargeOperations(Batch)) return true;
+        _stopped = true;
+        return false;
     }
 
     private void BeginMarked(string tag, PdfDictionary? properties)
@@ -232,7 +346,7 @@ internal abstract class ContentInterpreter
 
                     // A form without resources uses its parent's (ISO 32000-1, 7.8.3, for old files).
                     PdfDictionary? own = Document.Resolve(xobject.Dictionary["Resources"]) as PdfDictionary;
-                    if (!_forms.TryGetValue(xobject, out byte[]? data)) _forms[xobject] = data = Data(xobject);
+                    if (!_forms.TryGetValue(xobject, out byte[]? data)) _forms[xobject] = data = Data(xobject, (xobjects[name] as PdfReference)?.Number);
                     if (data is not null) Execute(data, own ?? resources, depth + 1);
                     Ctm = saved;
                     Text = text;

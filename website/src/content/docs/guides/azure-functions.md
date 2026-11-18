@@ -23,7 +23,7 @@ Publish ready to run.
 ```
 
 A complete app with an HTTP trigger for HTML and an Event Grid blob trigger for optimization is
-in [samples/serverless/azure-functions](https://github.com/jams4code/pdf.netstack/tree/main/samples/serverless/azure-functions).
+in [samples/serverless/azure-functions](https://github.com/JADEV-CORP/pdf.netstack/tree/main/samples/serverless/azure-functions).
 
 ## Fonts
 
@@ -51,8 +51,12 @@ the input size. The library itself writes nothing to disk unless you give it a p
 
 - Flex Consumption runs instances of 512 MB, 2,048 MB or 4,096 MB, and runs several invocations
   on one instance. Size memory for the concurrent work. With `Streaming`, each document being
-  optimized takes a few hundred MB whatever its size, and about three times its size in the
-  temporary directory; without it, about ten times the file size in memory.
+  optimized keeps the file itself out of memory and takes a few hundred MB, more for image heavy
+  files, and about three times its size in the temporary directory. Without it, size instances
+  for each document plus about three times the largest decoded stream per worker, see
+  [Memory and performance](/concepts/memory-and-performance/#workers-and-the-decoded-size). From
+  1.3 the optimizer runs fewer workers when memory is short, and `PdfLimits.Untrusted` bounds what
+  a file from a user may cost.
 - The Consumption plan caps an instance at 1.5 GB for all its concurrent invocations.
 - `maxDegreeOfParallelism` under `extensions.blobs` in `host.json` bounds concurrent blobs per
   instance; `MaxDegreeOfParallelism` in `PdfOptimizerOptions` bounds the threads of one

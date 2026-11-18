@@ -46,12 +46,12 @@ internal sealed class CssCompound
     public CssSpecificity Specificity =>
         Conditions.Aggregate(new CssSpecificity(0, 0, Tag is null ? 0 : 1), (s, c) => s + c.Specificity);
 
-    public bool Matches(HtmlElement e)
+    public bool Matches(HtmlElement e, WorkBudget budget)
     {
         if (Tag is not null && Tag != e.Name) return false;
         foreach (CssCondition c in Conditions)
         {
-            if (!c.Matches(e)) return false;
+            if (!c.Matches(e, budget)) return false;
         }
 
         return true;
@@ -76,6 +76,7 @@ internal sealed class CssSelector
         PseudoElement = pseudoElement;
         Text = text;
         Specificity = compounds.Aggregate(new CssSpecificity(0, 0, pseudoElement is null ? 0 : 1), (s, c) => s + c.Specificity);
+        AncestorKeys = AncestorKeysOf(compounds);
     }
 
     private enum Result
@@ -96,10 +97,20 @@ internal sealed class CssSelector
 
     public string Text { get; }
 
+    /// <summary>
+    /// <see cref="AncestorFilter"/> keys of ids, classes and types the element's ancestors must
+    /// have for the selector to match, at most <see cref="AncestorFilter.MaxSelectorKeys"/>, the
+    /// most selective first. Empty when the selector names no ancestor.
+    /// </summary>
+    public int[] AncestorKeys { get; }
+
     public override string ToString() => Text;
 
     /// <summary>Whether the element matches, ignoring any pseudo-element.</summary>
-    public bool Matches(HtmlElement element) => Match(0, element) == Result.Matched;
+    public bool Matches(HtmlElement element) => Matches(element, WorkBudget.Unlimited());
+
+    /// <summary>Whether the element matches, ignoring any pseudo-element; each compound tested counts as style work.</summary>
+    public bool Matches(HtmlElement element, WorkBudget budget) => Match(0, element, budget) == Result.Matched;
 
     /// <summary>Parses a selector list as text, for tests and the API.</summary>
     public static List<CssSelector>? Parse(string text) =>
@@ -110,10 +121,11 @@ internal sealed class CssSelector
 
     // Matching from right to left. On failure the result says where a retry could still succeed, so
     // a selector like "a b c d" against a deep tree does not retry every combination of ancestors.
-    private Result Match(int index, HtmlElement element)
+    private Result Match(int index, HtmlElement element, WorkBudget budget)
     {
+        budget.Style(1);
         CssCompound compound = Compounds[index];
-        if (!compound.Matches(element)) return Result.RestartFromLaterSibling;
+        if (!compound.Matches(element, budget)) return Result.RestartFromLaterSibling;
         if (index == Compounds.Length - 1) return Result.Matched;
 
         CssCombinator combinator = compound.Combinator;
@@ -123,11 +135,34 @@ internal sealed class CssSelector
         {
             next = sibling ? next.PreviousElementSibling : next.ParentElement;
             if (next is null) return sibling ? Result.RestartFromDescendant : Result.NotMatchedGlobally;
-            Result result = Match(index + 1, next);
+            Result result = Match(index + 1, next, budget);
             if (result is Result.Matched or Result.NotMatchedGlobally || combinator == CssCombinator.NextSibling) return result;
             if (combinator == CssCombinator.Child) return Result.RestartFromDescendant;
             if (result == Result.RestartFromDescendant && combinator == CssCombinator.SubsequentSibling) return result;
         }
+    }
+
+    // Only compounds reached through a descendant or child combinator are ancestors of the subject;
+    // one reached through a sibling combinator is the sibling of an ancestor, and its keys say nothing
+    // about the ancestors. Ids and classes reject more often than element names, so they come first.
+    private static int[] AncestorKeysOf(CssCompound[] compounds)
+    {
+        var ids = new List<int>();
+        var classes = new List<int>();
+        var tags = new List<int>();
+        for (int i = 1; i < compounds.Length; i++)
+        {
+            if (compounds[i - 1].Combinator is not (CssCombinator.Descendant or CssCombinator.Child)) continue;
+            foreach (CssCondition condition in compounds[i].Conditions)
+            {
+                if (condition is IdCondition id) ids.Add(AncestorFilter.IdKey(id.Id));
+                else if (condition is ClassCondition c) classes.Add(AncestorFilter.ClassKey(c.Name));
+            }
+
+            if (compounds[i].Tag is string tag) tags.Add(AncestorFilter.TagKey(tag));
+        }
+
+        return [.. ids.Concat(classes).Concat(tags).Distinct().Take(AncestorFilter.MaxSelectorKeys)];
     }
 
     private static List<CssSelector>? ParseList(List<CssValue> values, int depth, bool forgiving)
@@ -347,7 +382,9 @@ internal abstract class CssCondition
 {
     public virtual CssSpecificity Specificity => new(0, 1, 0);
 
-    public abstract bool Matches(HtmlElement e);
+    /// <param name="e">The element tested.</param>
+    /// <param name="budget">Counts the work of selectors nested in the condition, and of walks over siblings or ancestors.</param>
+    public abstract bool Matches(HtmlElement e, WorkBudget budget);
 }
 
 internal sealed class IdCondition(string id) : CssCondition
@@ -356,18 +393,21 @@ internal sealed class IdCondition(string id) : CssCondition
 
     public override CssSpecificity Specificity => new(1, 0, 0);
 
-    public override bool Matches(HtmlElement e) => e.GetAttribute("id") == Id;
+    public override bool Matches(HtmlElement e, WorkBudget budget) => e.GetAttribute("id") == Id;
 }
 
 internal sealed class ClassCondition(string name) : CssCondition
 {
     public string Name { get; } = name;
 
-    public override bool Matches(HtmlElement e)
+    public override bool Matches(HtmlElement e, WorkBudget budget)
     {
-        foreach (string c in e.ClassList)
+        // Indexed, not foreach: through the interface each loop would allocate an enumerator, and
+        // this is the most frequent test of all.
+        IReadOnlyList<string> classes = e.ClassList;
+        for (int i = 0; i < classes.Count; i++)
         {
-            if (c == Name) return true;
+            if (classes[i] == Name) return true;
         }
 
         return false;
@@ -437,7 +477,7 @@ internal sealed class AttributeCondition(string name, string op, string value, b
         return i == children.Count ? new AttributeCondition(name, op, value, ignoreCase) : null;
     }
 
-    public override bool Matches(HtmlElement e)
+    public override bool Matches(HtmlElement e, WorkBudget budget)
     {
         string? actual = e.GetAttribute(name);
         if (actual is null) return false;
@@ -492,7 +532,7 @@ internal sealed class PseudoCondition : CssCondition
     public static PseudoCondition? Create(string name) =>
         Known.Contains(name) || Dynamic.Contains(name) ? new PseudoCondition(name) : null;
 
-    public override bool Matches(HtmlElement e) => _name switch
+    public override bool Matches(HtmlElement e, WorkBudget budget) => _name switch
     {
         "root" => e.ParentElement is null,
         "empty" => e.Children.All(c => c is HtmlText t && t.Data.Length == 0),
@@ -520,12 +560,12 @@ internal sealed class LogicalCondition(string name, List<CssSelector> selectors)
 {
     public override CssSpecificity Specificity => name == "where" ? default : CssSpecificity.Max(selectors);
 
-    public override bool Matches(HtmlElement e)
+    public override bool Matches(HtmlElement e, WorkBudget budget)
     {
         bool any = false;
         foreach (CssSelector s in selectors)
         {
-            if (s.PseudoElement is null && s.Matches(e))
+            if (s.PseudoElement is null && s.Matches(e, budget))
             {
                 any = true;
                 break;
@@ -539,6 +579,8 @@ internal sealed class LogicalCondition(string name, List<CssSelector> selectors)
 /// <summary>The :nth-* family: an+b, counted from the start or end, among all siblings or one type.</summary>
 internal sealed class NthCondition(string name, int a, int b, List<CssSelector>? of) : CssCondition
 {
+    private Counted? _counted;
+
     public override CssSpecificity Specificity => new CssSpecificity(0, 1, 0) + (of is null ? default : CssSpecificity.Max(of));
 
     public static NthCondition? Parse(string name, List<CssValue> args, Func<List<CssValue>, List<CssSelector>?>? parseOf)
@@ -609,23 +651,15 @@ internal sealed class NthCondition(string name, int a, int b, List<CssSelector>?
         return true;
     }
 
-    public override bool Matches(HtmlElement e)
+    public override bool Matches(HtmlElement e, WorkBudget budget)
     {
         int position;
         if (of is not null)
         {
-            if (!of.Any(s => s.Matches(e))) return false;
-            List<HtmlElement> siblings = e.Parent?.ElementChildren ?? [e];
+            if (!MatchesAny(of, e, budget)) return false;
+            int[] before = MatchingBefore(e, budget);
             int index = e.ElementIndex;
-            position = 1;
-            if (name == "nth-child")
-            {
-                for (int k = 0; k < index; k++) position += of.Any(s => s.Matches(siblings[k])) ? 1 : 0;
-            }
-            else
-            {
-                for (int k = index + 1; k < siblings.Count; k++) position += of.Any(s => s.Matches(siblings[k])) ? 1 : 0;
-            }
+            position = 1 + (name == "nth-child" ? before[index] : before[^1] - before[index + 1]);
         }
         else
         {
@@ -642,15 +676,52 @@ internal sealed class NthCondition(string name, int a, int b, List<CssSelector>?
         long diff = (long)position - b;
         return a == 0 ? diff == 0 : diff / a >= 0 && diff % a == 0;
     }
+
+    /// <summary>
+    /// For the element's parent, how many children before each position match S: element k has
+    /// <c>result[k]</c> matching siblings before it, and the last entry counts them all. Worked
+    /// out once per parent, as styling asks about every child in turn and counting afresh for
+    /// each made a long list of siblings quadratic.
+    /// </summary>
+    private int[] MatchingBefore(HtmlElement e, WorkBudget budget)
+    {
+        HtmlElement? parent = e.Parent;
+        if (parent is not null && _counted is Counted counted && ReferenceEquals(counted.Parent, parent)) return counted.Before;
+        List<HtmlElement> siblings = parent?.ElementChildren ?? [e];
+        int[] before = new int[siblings.Count + 1];
+        for (int k = 0; k < siblings.Count; k++) before[k + 1] = before[k] + (MatchesAny(of!, siblings[k], budget) ? 1 : 0);
+
+        // One reference, replaced whole, so a selector shared by mistake still reads a consistent pair.
+        if (parent is not null) _counted = new Counted(parent, before);
+        return before;
+    }
+
+    private static bool MatchesAny(List<CssSelector> selectors, HtmlElement e, WorkBudget budget)
+    {
+        foreach (CssSelector s in selectors)
+        {
+            if (s.Matches(e, budget)) return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>The children of one parent that match S, counted up to each position.</summary>
+    private sealed record Counted(HtmlElement Parent, int[] Before);
 }
 
 /// <summary>:lang(): the nearest lang attribute, matched by prefix as in BCP 47 extended filtering.</summary>
 internal sealed class LangCondition(List<string> ranges) : CssCondition
 {
-    public override bool Matches(HtmlElement e)
+    public override bool Matches(HtmlElement e, WorkBudget budget)
     {
         string? lang = null;
-        for (HtmlElement? x = e; x is not null && lang is null; x = x.ParentElement) lang = x.GetAttribute("lang");
+        for (HtmlElement? x = e; x is not null && lang is null; x = x.ParentElement)
+        {
+            budget.Style(1);
+            lang = x.GetAttribute("lang");
+        }
+
         if (string.IsNullOrEmpty(lang)) return false;
         return ranges.Any(r => r == "*" || string.Equals(lang, r, StringComparison.OrdinalIgnoreCase) || lang!.StartsWith(r + "-", StringComparison.OrdinalIgnoreCase));
     }
@@ -659,10 +730,11 @@ internal sealed class LangCondition(List<string> ranges) : CssCondition
 /// <summary>:dir(): the nearest dir attribute, left to right by default.</summary>
 internal sealed class DirCondition(string direction) : CssCondition
 {
-    public override bool Matches(HtmlElement e)
+    public override bool Matches(HtmlElement e, WorkBudget budget)
     {
         for (HtmlElement? x = e; x is not null; x = x.ParentElement)
         {
+            budget.Style(1);
             string? dir = x.GetAttribute("dir")?.ToLowerInvariant();
             if (dir is "ltr" or "rtl") return dir == direction;
         }

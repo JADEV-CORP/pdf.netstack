@@ -26,6 +26,10 @@ internal sealed class TextExtractor(PdfDocument document) : ContentInterpreter(d
     private readonly List<(string? ActualText, int Start)> _marked = [];
     private int _actualTextDepth;
 
+    // Characters in Letters, against PdfLimits.MaxTextCharsPerPage.
+    private long _chars;
+    private bool _full;
+
     public List<PdfLetter> Letters { get; } = [];
 
     protected override void OnShowText(List<PdfObject> items, PdfDictionary? resources)
@@ -130,7 +134,29 @@ internal sealed class TextExtractor(PdfDocument document) : ContentInterpreter(d
         double length = Math.Sqrt((dx * dx) + (dy * dy));
         PdfPoint direction = length > 1e-12 ? new(dx / length, dy / length) : new(1, 0);
         if (!Finite(bounds.Left) || !Finite(bounds.Bottom) || !Finite(bounds.Right) || !Finite(bounds.Top) || !Finite(size) || !Finite(direction.X) || !Finite(direction.Y)) return;
+        if (!Room(text.Length)) return;
         Letters.Add(new PdfLetter(text, bounds, from, to, direction, font.Name, size, mode));
+    }
+
+    /// <summary>
+    /// Takes <paramref name="length"/> characters from the page's budget; false, reported once,
+    /// when they do not fit, and for every letter after.
+    /// </summary>
+    private bool Room(int length)
+    {
+        if (!_full && _chars + length <= Document.Limits.MaxTextCharsPerPage)
+        {
+            _chars += length;
+            return true;
+        }
+
+        if (!_full)
+        {
+            _full = true;
+            ReportPageLimit(PdfLimitKind.TextCharsPerPage, Compat.Format("The page's text is longer than {0} characters (PdfLimits.MaxTextCharsPerPage); the rest is left out.", Document.Limits.MaxTextCharsPerPage));
+        }
+
+        return false;
     }
 
     /// <summary>Replaces the letters of an ActualText span by one letter holding its text, or drops them for empty text.</summary>
@@ -138,7 +164,8 @@ internal sealed class TextExtractor(PdfDocument document) : ContentInterpreter(d
     {
         int count = Letters.Count - start;
         if (count <= 0) return;
-        if (text.Length == 0)
+        for (int i = start; i < Letters.Count; i++) _chars -= Letters[i].Text.Length;
+        if (text.Length == 0 || !Room(text.Length))
         {
             Letters.RemoveRange(start, count);
             return;

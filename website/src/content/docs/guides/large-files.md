@@ -176,9 +176,9 @@ peaked at 3 MB instead of 835 MB.
 
 ## Compressing large files
 
-By default the optimizer reads the whole document into memory. Plan for about 10 times the file
-size, more for image heavy files, and lower `MaxDegreeOfParallelism` to cap memory, or use
-`Streaming` as above. Inputs larger than `MaxInputBytes` (1 GiB by default) are returned
+By default the optimizer reads the whole document into memory, and each worker holds about three
+times the largest decoded stream it works on; on 1.2.0 the peak measured 24 to 60 times the file.
+Lower `MaxDegreeOfParallelism` to cut the peak, or use `Streaming` as above. Inputs larger than `MaxInputBytes` (1 GiB by default) are returned
 unchanged; raise it for streaming mode. See
 [Memory and performance](/concepts/memory-and-performance/).
 

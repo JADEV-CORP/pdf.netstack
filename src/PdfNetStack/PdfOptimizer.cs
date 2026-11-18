@@ -45,16 +45,56 @@ public static partial class PdfOptimizer
         if (options.Streaming) return OptimizeStreaming(new Source(input), output, options, cancellationToken);
 
         var clock = Stopwatch.StartNew();
+        (ReadOnlyMemory<byte> written, PdfOptimizationResult result) = OptimizeInMemory(input, options, cancellationToken);
+        output.Write(written.Span);
+        return WithElapsed(result, clock);
+    }
+
+    /// <summary>
+    /// The in-memory run: the bytes to write, which are the input itself when it is kept, and the
+    /// result. Nothing is copied; each entry point writes or copies the bytes once, as it needs them.
+    /// </summary>
+    private static (ReadOnlyMemory<byte> Written, PdfOptimizationResult Result) OptimizeInMemory(ReadOnlyMemory<byte> input, PdfOptimizerOptions options, CancellationToken ct)
+    {
         string sourceHash = Sha256Hex(input.Span);
-        Outcome outcome = Run(input, options, cancellationToken);
+        Outcome outcome = RunWithin(input, options, ct);
 
-        ReadOnlySpan<byte> written = outcome.Candidate is { } candidate ? candidate.Span : input.Span;
-        output.Write(written);
-        string outputHash = outcome.Candidate is null ? sourceHash : Sha256Hex(written);
+        ReadOnlyMemory<byte> written = outcome.Candidate ?? input;
+        string outputHash = outcome.Candidate is null ? sourceHash : Sha256Hex(written.Span);
+        OptimizationStatistics stats = outcome.Statistics ?? OptimizationStatistics.Empty(TimeSpan.Zero);
+        var result = new PdfOptimizationResult(outcome.Disposition, input.Length, written.Length, sourceHash, outputHash,
+            outcome.PageCount, outcome.Reason, stats)
+        {
+            Diagnostics = outcome.Diagnostics,
+        };
+        return (written, result);
+    }
 
-        OptimizationStatistics stats = (outcome.Statistics ?? OptimizationStatistics.Empty(TimeSpan.Zero)) with { Elapsed = clock.Elapsed };
-        return new PdfOptimizationResult(outcome.Disposition, input.Length, written.Length, sourceHash, outputHash,
-            outcome.PageCount, outcome.Reason, stats);
+    /// <summary>The result with the time since <paramref name="clock"/> started, writing the output included.</summary>
+    private static PdfOptimizationResult WithElapsed(PdfOptimizationResult result, Stopwatch clock) =>
+        result with { Statistics = result.Statistics with { Elapsed = clock.Elapsed } };
+
+    /// <summary>
+    /// <see cref="RunOnce"/> within <see cref="PdfLimits.Timeout"/>. Lossy work is the slow part, so
+    /// with a time limit the lossless rewrite is made first and kept should time run out while
+    /// images are changed lossily; without a time limit the passes run once, as before.
+    /// </summary>
+    private static Outcome RunWithin(ReadOnlyMemory<byte> input, PdfOptimizerOptions options, CancellationToken ct)
+    {
+        var deadline = Deadline.Start(options.Limits);
+        if (!options.IsLossy || !options.Limits.HasTimeout) return RunOnce(input, options, deadline, ct);
+
+        Outcome lossless = RunOnce(input, options.Lossless, deadline, ct);
+        if (lossless.Disposition == OptimizationDisposition.LimitExceeded) return lossless;
+        Outcome lossy = RunOnce(input, options, deadline, ct);
+        if (lossy.Disposition == OptimizationDisposition.Optimized) return lossy;
+        if (lossless.Disposition != OptimizationDisposition.Optimized && !lossy.TimedOut) return lossy;
+        string why = lossy.TimedOut ? "ran out of time (PdfLimits.Timeout)." : "were not kept: " + lossy.Reason;
+        return lossless with
+        {
+            Reason = lossless.Reason + " Lossy image changes " + why,
+            Diagnostics = [.. lossless.Diagnostics, .. lossy.Diagnostics],
+        };
     }
 
     /// <summary>Optimizes a PDF and returns the output bytes together with the result.</summary>
@@ -64,9 +104,20 @@ public static partial class PdfOptimizer
         CancellationToken cancellationToken = default)
     {
         Compat.ThrowIfNull(input, nameof(input));
-        using var output = new MemoryStream();
-        PdfOptimizationResult result = Optimize(input, output, options, cancellationToken);
-        return (output.ToArray(), result);
+        options ??= PdfOptimizerOptions.Default;
+        if (options.Streaming)
+        {
+            using var output = new MemoryStream();
+            PdfOptimizationResult streamed = Optimize(input, output, options, cancellationToken);
+            return (output.ToArray(), streamed);
+        }
+
+        // The rewrite is copied once, to an array of its exact size; a kept input is copied too, so
+        // the caller never holds the array it passed in.
+        options.Validate();
+        var clock = Stopwatch.StartNew();
+        (ReadOnlyMemory<byte> written, PdfOptimizationResult result) = OptimizeInMemory(input, options, cancellationToken);
+        return (written.ToArray(), WithElapsed(result, clock));
     }
 
     /// <summary>Reads <paramref name="input"/> to the end, optimizes it and writes to <paramref name="output"/>.</summary>
@@ -97,8 +148,10 @@ public static partial class PdfOptimizer
 
 #pragma warning disable CA1835 // Array overloads keep one code path for .NET Standard 2.0.
         // Buffer at most MaxInputBytes. Anything larger is streamed through untouched without
-        // ever being held in memory, as the in-memory path would return it unchanged anyway.
-        using var buffer = new MemoryStream();
+        // ever being held in memory, as the in-memory path would return it unchanged anyway. A
+        // seekable input of known length gets its buffer at once, rather than by doubling.
+        long known = input.CanSeek ? input.Length - input.Position : 0;
+        using var buffer = new MemoryStream(known > 0 && known <= Math.Min(options.MaxInputBytes, Compat.MaxArrayLength) ? (int)known : 0);
         byte[] chunk = new byte[81920];
         int read;
         while ((read = await input.ReadAsync(chunk, 0, chunk.Length, cancellationToken).ConfigureAwait(false)) > 0)
@@ -121,11 +174,13 @@ public static partial class PdfOptimizer
         }
 
 #pragma warning restore CA1835
-        using var result = new MemoryStream();
-        PdfOptimizationResult r = Optimize(buffer.GetBuffer().AsMemory(0, (int)buffer.Length), result, options, cancellationToken);
-        result.Position = 0;
-        await result.CopyToAsync(output, 81920, cancellationToken).ConfigureAwait(false);
-        return r;
+
+        // The rewrite goes to the output as it lies in memory, without a copy into another stream.
+        options.Validate();
+        var clock = Stopwatch.StartNew();
+        (ReadOnlyMemory<byte> written, PdfOptimizationResult r) = OptimizeInMemory(buffer.GetBuffer().AsMemory(0, (int)buffer.Length), options, cancellationToken);
+        await Compat.WriteAsync(output, written, cancellationToken).ConfigureAwait(false);
+        return WithElapsed(r, clock);
     }
 
     /// <summary>
@@ -189,23 +244,44 @@ public static partial class PdfOptimizer
         ReadOnlyMemory<byte>? Candidate,
         string Reason,
         int PageCount,
-        OptimizationStatistics? Statistics);
+        OptimizationStatistics? Statistics)
+    {
+        public IReadOnlyList<PdfDiagnostic> Diagnostics { get; init; } = [];
 
-    private static Outcome Run(ReadOnlyMemory<byte> input, PdfOptimizerOptions options, CancellationToken ct)
+        /// <summary>The run ended at the time limit.</summary>
+        public bool TimedOut { get; init; }
+    }
+
+    /// <summary>One run of the passes with its own budget.</summary>
+    private static Outcome RunOnce(ReadOnlyMemory<byte> input, PdfOptimizerOptions options, Deadline deadline, CancellationToken caller)
     {
         if (input.Length > options.MaxInputBytes)
         {
             return new Outcome(OptimizationDisposition.UnsupportedRetained, null, "Input exceeds the configured size limit.", 0, null);
         }
 
+        using var guard = new RunGuard(options.Limits, input.Length, deadline, caller, options.Workers);
+        Outcome outcome = Run(input, options, guard);
+        return outcome with { Diagnostics = guard.Diagnostics, TimedOut = guard.TimedOut };
+    }
+
+    private static Outcome Run(ReadOnlyMemory<byte> input, PdfOptimizerOptions options, RunGuard guard)
+    {
+        if (input.Length > options.Limits.MaxInputBytes)
+        {
+            return new Outcome(OptimizationDisposition.LimitExceeded, null, guard.InputTooLarge(), 0, null);
+        }
+
+        CancellationToken ct = guard.Token;
         PdfFile file;
         try
         {
-            file = PdfFile.Open(input, options.MaxDecodedStreamBytes);
+            file = PdfFile.Open(input, options.MaxDecodedStreamBytes, guard.Budget);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (Exception ex) when (guard.Failure(ex) is { } failure)
         {
-            return new Outcome(OptimizationDisposition.UnsupportedRetained, null, "Not a readable PDF: " + ex.Message, 0, null);
+            return new Outcome(failure.Disposition == OptimizationDisposition.OriginalRetained ? OptimizationDisposition.UnsupportedRetained : failure.Disposition, null,
+                failure.Disposition == OptimizationDisposition.OriginalRetained ? "Not a readable PDF: " + ex.Message : failure.Reason, 0, null);
         }
 
         int pageCount = 0;
@@ -213,8 +289,10 @@ public static partial class PdfOptimizer
         var timings = new PhaseTimings();
         try
         {
-            pageCount = CountPages(file);
-            if (Unsupported(file, input.Span.IndexOf("/ByteRange"u8) >= 0, options) is { } unsupported)
+            pageCount = CountPages(file, guard.Budget.Diagnostics);
+            int byteRanges = UsageRights.CountByteRanges(input.Span);
+            bool usageRightsRemoved = options.RemoveUsageRights && UsageRights.Remove(file, byteRanges);
+            if (Unsupported(file, byteRanges > 0 && !usageRightsRemoved, options) is { } unsupported)
             {
                 return Retained(OptimizationDisposition.UnsupportedRetained, unsupported);
             }
@@ -226,7 +304,10 @@ public static partial class PdfOptimizer
             }
 
             bool pdfA1 = IsPdfA1(file, options.MaxDecodedStreamBytes);
-            int stripped = graph.StrippedEntries;
+            bool objectStreams = options.UseObjectStreams && !pdfA1;
+            string version = OutputVersion(file.HeaderVersion, objectStreams);
+            bool progressive = options.ProgressiveJpeg && AllowsProgressiveJpeg(version) && (!options.Linearize || AllowsProgressiveJpeg(LinearizedVersion(file.HeaderVersion)));
+            int stripped = graph.StrippedEntries + (usageRightsRemoved ? 1 : 0);
             timings = timings with { Analyze = phase.Elapsed };
             phase.Restart();
 
@@ -256,13 +337,13 @@ public static partial class PdfOptimizer
             RecompressionCounts recompressed = new(0, 0, []);
             if (options.RecompressStreams || compact.Count > 0)
             {
-                JpegSettings? jpeg = options.OptimizeJpegImages ? new JpegSettings(options.JpegQuality, options.ProgressiveJpeg, options.MinImageSsim) : null;
+                JpegSettings? jpeg = options.OptimizeJpegImages ? new JpegSettings(options.JpegQuality, progressive, options.MinImageSsim) : null;
                 ImageSettings? images = options.MaxImageDpi is not null || options.MaxBilevelImageDpi is not null || options.ConvertImagesToJpeg || options.QuantizeImages
-                    ? new ImageSettings(options.MaxImageDpi, options.ConvertImagesToJpeg, options.JpegQuality, options.MinImageSsim, options.ProgressiveJpeg) { Quantize = options.QuantizeImages, MaxBilevelDpi = options.MaxBilevelImageDpi }
+                    ? new ImageSettings(options.MaxImageDpi, options.ConvertImagesToJpeg, options.JpegQuality, options.MinImageSsim, progressive) { Quantize = options.QuantizeImages, MaxBilevelDpi = options.MaxBilevelImageDpi }
                     : null;
-                var scope = new RecompressionScope(options.RecompressStreams, compact, encoded, options.DeduplicateObjects);
+                var scope = new RecompressionScope(options.RecompressStreams, compact, encoded, options.DeduplicateObjects) { KeepMetadataUnfiltered = pdfA1 || options.KeepMetadataUnfiltered };
                 recompressed = StreamRecompressor.Run(file, graph, scope, options.ZlibLevel, options.Compression == CompressionEffort.Exhaustive, options.UseImagePredictors,
-                    options.OptimizeBilevelImages, jpeg, images, options.MaxDecodedStreamBytes, options.MaxDegreeOfParallelism, ct);
+                    options.OptimizeBilevelImages, jpeg, images, options.MaxDecodedStreamBytes, options.Workers, ct);
 
                 // A JBIG2 image coded anew no longer needs its JBIG2Globals, which may now be unused.
                 if (recompressed.ResampledObjects.Count > 0) graph = ObjectGraph.Collect(file, options.RemovePageThumbnails, options.RemovePieceInfo, ct);
@@ -271,11 +352,12 @@ public static partial class PdfOptimizer
             timings = timings with { Recompress = phase.Elapsed };
             phase.Restart();
 
+            // The obsolete XObject /Name is ignored when merging, unless the output stays PDF 1.0.
             Dictionary<int, int> representative;
-            int merged = 0;
+            int merged = 0, namesRemoved = 0;
             if (options.DeduplicateObjects)
             {
-                (representative, merged) = Deduplicator.Run(file, graph, recompressed.ContentHashes, ct);
+                (representative, merged, namesRemoved) = Deduplicator.Run(file, graph, recompressed.ContentHashes, ignoreXObjectNames: version != "1.0", ct);
             }
             else
             {
@@ -306,11 +388,10 @@ public static partial class PdfOptimizer
 
             if (file.Resolve(file.Trailer["ID"]) is PdfArray id) trailer.Set("ID", id);
 
-            bool objectStreams = options.UseObjectStreams && !pdfA1;
-            var settings = new WriterSettings(objectStreams, options.ObjectsPerStream,
-                OutputVersion(file.HeaderVersion, objectStreams), options.ZlibLevel)
+            var settings = new WriterSettings(objectStreams, options.ObjectsPerStream, version, options.ZlibLevel)
             {
                 Exhaustive = options.Compression == CompressionEffort.Exhaustive,
+                Parallelism = options.Workers,
             };
             ReadOnlyMemory<byte> candidate;
             bool linearized = false;
@@ -364,8 +445,8 @@ public static partial class PdfOptimizer
             if (options.Verify)
             {
                 ct.ThrowIfCancellationRequested();
-                PdfFile reference = PdfFile.Open(input, options.MaxDecodedStreamBytes);
-                PdfFile written = PdfFile.Open(candidate, options.MaxDecodedStreamBytes);
+                PdfFile reference = PdfFile.Open(input, options.MaxDecodedStreamBytes, guard.Budget);
+                PdfFile written = PdfFile.Open(candidate, options.MaxDecodedStreamBytes, guard.Budget);
                 if (written.WasReconstructed || written.LengthsRepaired > 0)
                 {
                     return new Outcome(OptimizationDisposition.OriginalRetained, null, "Verification failed: output is not well formed.", pageCount, stats);
@@ -374,6 +455,7 @@ public static partial class PdfOptimizer
                 var ignored = new List<string>();
                 if (options.RemovePageThumbnails) ignored.Add("Thumb");
                 if (options.RemovePieceInfo) ignored.Add("PieceInfo");
+                if (usageRightsRemoved) ignored.Add("Perms");
                 var rules = new VerificationRules
                 {
                     IgnoredSourceKeys = ignored,
@@ -383,9 +465,10 @@ public static partial class PdfOptimizer
                     AllowFontMerging = fontsMerged > 0,
                     AllowInheritedAttributes = pushedDown,
                     AllowBilevelRecoding = recompressed.Group4 > 0,
+                    AllowXObjectNameRemoval = namesRemoved > 0,
                 };
                 string? difference = EquivalenceVerifier.Verify(reference, written, rules, options.MaxDecodedStreamBytes,
-                    options.MaxDegreeOfParallelism, ct, out int compared);
+                    options.Workers, ct, out int compared);
                 if (difference is not null)
                 {
                     return new Outcome(OptimizationDisposition.OriginalRetained, null, "Verification failed: " + difference, pageCount, stats);
@@ -395,16 +478,94 @@ public static partial class PdfOptimizer
             }
 
             string reason = Reason(options, recompressed);
+            if (usageRightsRemoved) reason += " Usage rights removed.";
             if (linearized) reason += " The output is linearized.";
             else if (notLinearized is not null) reason += " Not linearized: " + notLinearized + ".";
             return new Outcome(OptimizationDisposition.Optimized, candidate, reason, pageCount, stats);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (Exception ex) when (guard.Failure(ex) is { } failure)
         {
-            return Retained(OptimizationDisposition.OriginalRetained, $"Rewrite failed ({ex.GetType().Name}): {ex.Message}");
+            return Retained(failure.Disposition, failure.Reason);
         }
 
         Outcome Retained(OptimizationDisposition disposition, string reason) => new(disposition, null, reason, pageCount, null);
+    }
+
+    /// <summary>
+    /// The limits of one run: its budget, a token that also ends at the time limit, and how an
+    /// exception thrown by a pass ends the run.
+    /// </summary>
+    internal sealed class RunGuard : IDisposable
+    {
+        private readonly CancellationToken _caller;
+        private readonly CancellationTokenSource? _timer;
+        private readonly CancellationTokenSource? _linked;
+
+        public RunGuard(PdfLimits limits, long inputBytes, Deadline deadline, CancellationToken caller, int workers = 1)
+        {
+            // Each worker holds a few buffers of a size at once: the source, a filter layer, the result.
+            Budget = new ResourceBudget(limits, inputBytes, new PdfDiagnostics())
+            {
+                Pool = System.Buffers.ArrayPool<byte>.Create(1 << 30, Math.Max(4, 3 * workers)),
+            };
+            _caller = caller;
+            _timer = deadline.NewTimer();
+            _linked = _timer is null ? null : CancellationTokenSource.CreateLinkedTokenSource(caller, _timer.Token);
+            Token = _linked?.Token ?? caller;
+        }
+
+        public ResourceBudget Budget { get; }
+
+        /// <summary>The caller's token, cancelled as well at the time limit.</summary>
+        public CancellationToken Token { get; }
+
+        /// <summary>The time limit ended the run, not the caller.</summary>
+        public bool TimedOut => _timer is { IsCancellationRequested: true } && !_caller.IsCancellationRequested;
+
+        public IReadOnlyList<PdfDiagnostic> Diagnostics => Budget.Diagnostics.Snapshot();
+
+        public string InputTooLarge()
+        {
+            string message = Compat.Format("Input exceeds its limit of {0} bytes (PdfLimits.MaxInputBytes).", Budget.Limits.MaxInputBytes);
+            Budget.Report(PdfLimitKind.InputBytes, message);
+            return message;
+        }
+
+        /// <summary>
+        /// How a pass that threw ends the run, or null for an exception that must reach the
+        /// caller: the caller's cancellation, and running out of memory or a corrupted process,
+        /// after which the process may be in no state to go on and the caller must know the input
+        /// was not processed. Exceptions from parallel workers arrive wrapped, so every inner one
+        /// is looked at.
+        /// </summary>
+        public (OptimizationDisposition Disposition, string Reason)? Failure(Exception ex)
+        {
+            if (Find<OutOfMemoryException>(ex) is not null || Find<AccessViolationException>(ex) is not null) return null;
+            if (Find<OperationCanceledException>(ex) is not null)
+            {
+                if (!TimedOut) return null;
+                const string message = "The run ran past its time limit (PdfLimits.Timeout).";
+                Budget.Report(PdfLimitKind.Timeout, message);
+                return (OptimizationDisposition.LimitExceeded, message);
+            }
+
+            if (Find<PdfLimitExceededException>(ex) is { } limit) return (OptimizationDisposition.LimitExceeded, "Limit reached: " + limit.Message);
+            return (OptimizationDisposition.OriginalRetained, $"Rewrite failed ({ex.GetType().Name}): {ex.Message}");
+        }
+
+        public void Dispose()
+        {
+            _linked?.Dispose();
+            _timer?.Dispose();
+        }
+
+        private static T? Find<T>(Exception ex)
+            where T : Exception => ex switch
+        {
+            T match => match,
+            AggregateException all => all.InnerExceptions.Select(Find<T>).FirstOrDefault(found => found is not null),
+            _ => ex.InnerException is { } inner ? Find<T>(inner) : null,
+        };
     }
 
     /// <summary>Why a file is left as it is, from what opening it showed; null when it may be rewritten.</summary>
@@ -473,13 +634,60 @@ public static partial class PdfOptimizer
             : "Rewritten. " + changes + ". Verification was disabled.";
     }
 
-    internal static int CountPages(PdfFile file)
+    /// <summary>
+    /// The pages the page tree holds, counted leaf by leaf as <see cref="PdfDocument"/> reads them:
+    /// /Count is only the file's claim, and a hostile file claims a billion. Nodes listed twice
+    /// are read once and the tree is read <see cref="PdfDocument.MaxPageTreeDepth"/> levels deep,
+    /// so the walk is linear in the file.
+    /// </summary>
+    internal static int CountPages(PdfFile file, PdfDiagnostics? diagnostics = null)
     {
         PdfDictionary? catalog = file.ResolveDictionary(file.Trailer["Root"]);
-        PdfDictionary? pages = file.ResolveDictionary(catalog?["Pages"]);
-        return file.Resolve(pages?["Count"]) is PdfNumber { IsInteger: true } n && n.IntegerValue is >= 0 and <= int.MaxValue
-            ? (int)n.IntegerValue
-            : 0;
+        if (catalog?["Pages"] is not PdfReference root) return 0;
+        var seen = new HashSet<int>();
+        var stack = new Stack<(int Number, int Depth)>();
+        stack.Push((root.Number, 0));
+        int pages = 0, looped = 0, tooDeep = 0;
+        while (stack.Count > 0)
+        {
+            (int number, int depth) = stack.Pop();
+            if (file.ResolveDictionary(new PdfReference(number, 0)) is not { } node) continue;
+            if (node.GetName("Type") == "Page" || (node.GetName("Type") != "Pages" && node["Kids"] is null))
+            {
+                pages++;
+                continue;
+            }
+
+            if (!seen.Add(number))
+            {
+                looped++;
+                continue;
+            }
+
+            if (depth > PdfDocument.MaxPageTreeDepth)
+            {
+                tooDeep++;
+                continue;
+            }
+
+            if (file.Resolve(node["Kids"]) is not PdfArray kids) continue;
+            for (int i = kids.Count - 1; i >= 0; i--)
+            {
+                if (kids[i] is PdfReference kid) stack.Push((kid.Number, depth + 1));
+            }
+        }
+
+        if (diagnostics is not null)
+        {
+            if (looped > 0) diagnostics.Skipped(Compat.Format("The page tree lists {0} of its nodes more than once (a loop or a shared branch); they were read once.", looped));
+            if (tooDeep > 0) diagnostics.Skipped(Compat.Format("The page tree nests deeper than {0} levels; {1} branch(es) below that were not read, with their pages.", PdfDocument.MaxPageTreeDepth, tooDeep));
+            if (file.Resolve(file.ResolveDictionary(root)?["Count"]) is PdfNumber { IsInteger: true } count && count.IntegerValue != pages)
+            {
+                diagnostics.Repaired(Compat.Format("The page tree says it has {0} page(s) but {1} were found; the pages found are used.", count.IntegerValue, pages));
+            }
+        }
+
+        return pages;
     }
 
     private static string OutputVersion(string header, bool objectStreams)
@@ -489,6 +697,10 @@ public static partial class PdfOptimizer
             ? header
             : "1.5";
     }
+
+    /// <summary>Progressive JPEG (DCTDecode) arrived with PDF 1.3; output at an earlier version keeps sequential coding.</summary>
+    private static bool AllowsProgressiveJpeg(string version) =>
+        decimal.TryParse(version, NumberStyles.AllowDecimalPoint, CultureInfo.InvariantCulture, out decimal v) && v >= 1.3m;
 
     /// <summary>Linearization arrived with PDF 1.2.</summary>
     private static string LinearizedVersion(string header) =>
@@ -502,7 +714,7 @@ public static partial class PdfOptimizer
         try
         {
             using DecodedStream decoded = StreamCodec.Decode(metadata.Data, StreamCodec.GetFilters(metadata.Dictionary, file.Resolve),
-                DecodeDepth.Full, decodeLimit, file.Resolve);
+                DecodeDepth.Full, decodeLimit, file.Resolve, file.Budget);
             return PdfAPartOne().IsMatch(Compat.Latin1.GetString(decoded.Data.Span));
         }
         catch (StreamDecodeException)

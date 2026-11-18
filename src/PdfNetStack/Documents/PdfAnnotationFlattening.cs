@@ -11,7 +11,7 @@ public sealed class PdfFlattenOptions
 
     /// <summary>
     /// Also flatten form widgets: the field shows its current value and leaves the form. Default
-    /// false. <see cref="PdfAcroForm.Flatten"/> flattens a whole form.
+    /// false. <see cref="PdfAcroForm.Flatten()"/> flattens a whole form.
     /// </summary>
     public bool IncludeWidgets { get; init; }
 }

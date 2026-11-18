@@ -9,6 +9,8 @@ faq:
     a: Yes. Setting a value redraws the field's appearance from its border, background, font and color settings, so the form does not rely on the viewer to rebuild it.
   - q: How do I make a filled form read only?
     a: Call doc.Form.Flatten(). Every field's appearance is drawn into its page and the form is removed, so the values stay visible and printable but can no longer be edited.
+  - q: How do I fill many fields at once from a dictionary?
+    a: From version 1.3, call doc.Form.Fill with field names and values. It checks every name and value first, and when anything is wrong it throws one ArgumentException listing every problem and changes nothing. Pass flatten true to flatten the form afterwards.
   - q: Does PdfNetStack support XFA forms?
     a: No. Documents that also carry an XFA form lose it when values change, so viewers show the AcroForm values.
 ---
@@ -23,6 +25,32 @@ value: the field's appearance is redrawn at once. `Flatten` turns the values int
 content.
 
 ```csharp sample="forms-fill.cs" region="fill"
+```
+
+## Fill several fields at once
+
+From 1.3, `Fill` sets fields by name from a dictionary, then flattens the form when asked. It is
+all or nothing: every name and value is checked first, and when any is wrong one
+`ArgumentException` lists every problem and no field changes. A name no field has is an error,
+not skipped, so a typo or a renamed field cannot go unnoticed.
+
+```csharp sample="forms-fill-many.cs" region="fill"
+```
+
+```csharp sample="forms-fill-many.cs" region="errors"
+```
+
+Values by kind: a text field takes the text, cut to its maximum length. A check box is checked by
+its on value, `true`, `yes`, `on` or `1`, and cleared by `off`, `false`, `no`, `0` or an empty
+string, ignoring case. A radio group takes the value of one of its buttons, or an empty string or
+`Off` for none. A combo box or list box takes an export value or the text shown for it; an
+editable combo box takes any text. A null value clears the field. Read only fields, push buttons,
+signature fields and fields of an unknown type cannot be filled.
+
+`TryGetField` finds a field of the kind you expect without a cast, and returns false when the name
+is missing or the field is of another kind:
+
+```csharp sample="forms-fill-many.cs" region="try-get"
 ```
 
 ## Reading fields

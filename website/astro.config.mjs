@@ -64,8 +64,10 @@ export default defineConfig({
           label: 'Guides',
           items: [
             'guides/compress-pdf',
+            'guides/migrate-from-pdfsharp',
             'guides/edit-pages',
             'guides/large-files',
+            'guides/cancellation-and-progress',
             'guides/drawing',
             'guides/fonts-and-text',
             'guides/images',
@@ -98,6 +100,7 @@ export default defineConfig({
           items: [
             'concepts/fidelity',
             'concepts/safety-model',
+            'concepts/resource-limits',
             'concepts/architecture',
             'concepts/coordinates-and-units',
             'concepts/memory-and-performance',

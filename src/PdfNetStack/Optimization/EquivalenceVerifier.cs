@@ -131,6 +131,8 @@ internal sealed class EquivalenceVerifier
         return failure;
     }
 
+    private const int MaxPathLength = 256;
+
     private string? Compare(PdfObject? a, PdfObject? b, string path, int depth)
     {
         if (depth > PdfParser.MaxNesting) return path + ": nesting too deep to verify";
@@ -158,7 +160,12 @@ internal sealed class EquivalenceVerifier
 
             _aToB[ra.Number] = rb.Number;
             _bToA.TryAdd(rb.Number, ra.Number);
-            if (_visited.Add((ra.Number, rb.Number))) _pending.Enqueue((ra.Number, rb.Number, path));
+
+            // A path names where a difference is; past a few hundred characters, as down a page
+            // tree nested thousands deep, the object's number names it as well, and copying ever
+            // longer paths would cost the square of the depth.
+            string next = path.Length <= MaxPathLength ? path : Compat.Format("object {0}", ra.Number);
+            if (_visited.Add((ra.Number, rb.Number))) _pending.Enqueue((ra.Number, rb.Number, next));
             return null;
         }
 
@@ -334,6 +341,7 @@ internal sealed class EquivalenceVerifier
             if (mergedProgram && key == "Length1") continue;
             if ((page || node) && Inheritable(key)) continue;
             if (_ignoredSourceKeys.Contains(key) && b[key] is null) continue;
+            if (isStream && key == "Name" && b[key] is null && _rules.AllowXObjectNameRemoval && Deduplicator.IsXObject(a)) continue;
             if (b[key] is null && _rules.AllowResourcePruning && Unused(a, key)) continue;
             string? d = Compare(a[key], b[key] ?? PdfNull.Instance, path + "/" + key, depth + 1);
             if (d is not null) return d;
@@ -501,7 +509,7 @@ internal sealed class EquivalenceVerifier
         if (filters is null) return null;
         try
         {
-            return StreamCodec.Decode(s.Data, filters, DecodeDepth.Full, _decodeLimit, static o => o);
+            return StreamCodec.Decode(s.Data, filters, DecodeDepth.Full, _decodeLimit, static o => o, _a.Budget);
         }
         catch (StreamDecodeException)
         {
@@ -570,6 +578,9 @@ internal sealed record VerificationRules
     /// <summary>Bilevel images stored as samples or CCITT data may be coded again as CCITT data with the same pixels.</summary>
     public bool AllowBilevelRecoding { get; init; }
 
+    /// <summary>An XObject may lose its /Name, which readers ignore after PDF 1.0, when the deduplicator merged copies that named it differently.</summary>
+    public bool AllowXObjectNameRemoval { get; init; }
+
     /// <summary>Every lossless structural change the optimizer makes, and no lossy image change.</summary>
-    public static VerificationRules Lossless { get; } = new() { AllowResourcePruning = true, AllowContentCompaction = true, AllowFontMerging = true, AllowInheritedAttributes = true, AllowBilevelRecoding = true };
+    public static VerificationRules Lossless { get; } = new() { AllowResourcePruning = true, AllowContentCompaction = true, AllowFontMerging = true, AllowInheritedAttributes = true, AllowBilevelRecoding = true, AllowXObjectNameRemoval = true };
 }

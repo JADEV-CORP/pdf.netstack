@@ -1,9 +1,11 @@
 # PdfNetStack
 
-Compress, optimize, edit and create PDF files in .NET, and convert HTML and CSS to PDF. Pure C#,
-MIT licensed, no native binaries, no dependencies on .NET 8 and later.
+Shrink PDFs on a server without breaking them, in pure C#. Forms, tags, signatures and PDF/A
+survive, and every output is proved equivalent to its input before you get it. MIT licensed, so
+it is also a home for code leaving PDFsharp now that 6.5.0 is AGPL-3.0. No native binaries, no
+dependencies on .NET 8 and later.
 
-[![CI](https://github.com/jams4code/pdf.netstack/actions/workflows/ci.yml/badge.svg)](https://github.com/jams4code/pdf.netstack/actions/workflows/ci.yml)
+[![CI](https://github.com/JADEV-CORP/pdf.netstack/actions/workflows/ci.yml/badge.svg)](https://github.com/JADEV-CORP/pdf.netstack/actions/workflows/ci.yml)
 [![NuGet](https://img.shields.io/nuget/v/PdfNetStack.svg)](https://www.nuget.org/packages/PdfNetStack)
 [![NuGet downloads](https://img.shields.io/nuget/dt/PdfNetStack.svg)](https://www.nuget.org/packages/PdfNetStack)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -11,13 +13,26 @@ MIT licensed, no native binaries, no dependencies on .NET 8 and later.
 Documentation, guides and benchmarks: **[jadev-corp.com/pdfnetstack](https://www.jadev-corp.com/pdfnetstack/)**.
 Built and maintained by [JADEV](https://www.jadev-corp.com/en), software engineering.
 
-PdfNetStack makes PDFs smaller without changing a single rendered pixel. It rewrites the file
-with compressed object streams and a compressed cross-reference stream, drops objects nothing
-points to and resources no page uses, recompresses streams, rewrites content streams compactly,
-adds PNG prediction to raw images, and merges duplicate fonts, images and resources, including
-separately embedded subsets of one font. Then it reads its own output back and proves, object by
-object, that the document is the same as the one you gave it. If anything is off, you get your
-original bytes back.
+Two jobs come first.
+
+**Shrink PDFs on a server without breaking them.** The optimizer makes PDFs smaller without
+changing a single rendered pixel. It rewrites the file with compressed object streams and a
+compressed cross-reference stream, drops objects nothing points to and resources no page uses,
+recompresses streams, rewrites content streams compactly, adds PNG prediction to raw images, and
+merges duplicate fonts, images and resources, including separately embedded subsets of one font.
+Then it reads its own output back and proves, object by object, that the document is the same as
+the one you gave it. If anything is off, you get your original bytes back. Forms, structure tags,
+bookmarks and attachments come through; signed and encrypted files are returned untouched; PDF/A-1
+files keep the classic layout their standard requires.
+
+**Give PDFsharp users an MIT home.** PDFsharp and MigraDoc 6.5.0, published on 14 October 2026,
+carry the license AGPL-3.0-only; 6.2.4 and earlier stay MIT. PdfNetStack draws, edits, merges,
+splits, fills forms and encrypts under MIT, with drawing calls that follow `XGraphics`. The
+[migration guide](https://www.jadev-corp.com/pdfnetstack/guides/migrate-from-pdfsharp/) maps the
+common calls, with before and after code.
+
+It also extracts text and images, converts HTML and CSS to PDF, signs to PAdES, writes PDF/A and
+makes scans searchable. See [Usage](#usage).
 
 ```csharp
 using PdfNetStack;
@@ -28,16 +43,19 @@ Console.WriteLine($"{result.Disposition}: saved {result.SavingPercent:F1}%");
 
 ## Purpose
 
-PdfNetStack gives .NET developers a PDF toolkit that is permissively licensed all the way down,
-safe to run on files from strangers, and honest about what it changes. It optimizes, creates,
-edits, merges, splits and protects PDFs, extracts their text and images, and converts HTML and CSS
-to PDF.
+PdfNetStack gives .NET developers a PDF toolkit that is permissively licensed all the way down
+and honest about what it changes. Its first job is shrinking PDFs on servers without breaking
+them; its second is an MIT path for teams that cannot take the AGPL that came with PDFsharp 6.5.0.
+Around those, it optimizes, creates, edits, merges, splits and protects PDFs, extracts their text
+and images, and converts HTML and CSS to PDF. For files from untrusted sources, the
+[safety model](#safety-model) says what it refuses and what is bounded today.
 
 PdfNetStack is a greenfield project. Its code is original and written from the published
 specifications: ISO 32000 for PDF, OpenType, Unicode, and the HTML and CSS standards. See
 [Acknowledgements](#acknowledgements) for the tools that influenced it.
 
-It is created and maintained by Jamal Abdelkhalek at JADEV.
+It was created by Jamal Abdelkhalek at JADEV and is maintained by Jamal Abdelkhalek and Ilyass
+Krichi; see [GOVERNANCE.md](GOVERNANCE.md).
 
 ## Compatibility
 
@@ -65,7 +83,7 @@ The libraries run in AWS Lambda, Azure Functions and containers without changes:
   only read, when `PdfFontCollection.System` is used; a missing font directory, an unreadable one
   or no home directory gives an empty collection.
 - **Memory and streams.** `PdfLoadOptions` caps decoded streams and image pixels and opens files
-  on demand; `OpenAsync`, `SaveAsync` and `HtmlConverter.ConvertToPdfAsync` never block on the
+  on demand, and from 1.3 its `Limits` cap what a whole document may cost; `OpenAsync`, `SaveAsync` and `HtmlConverter.ConvertToPdfAsync` never block on the
   caller's stream; an unoptimized save is written progressively; and
   `PdfOptimizerOptions.Streaming` optimizes files larger than memory. See
   [the large files guide](website/src/content/docs/guides/large-files.md).
@@ -116,7 +134,7 @@ dotnet add package PdfNetStack.Ocr.Tesseract  # OCR with an installed Tesseract
 ```
 
 The command line tool also comes as a single native executable, with no .NET install needed:
-each [GitHub release](https://github.com/jams4code/pdf.netstack/releases) carries
+each [GitHub release](https://github.com/JADEV-CORP/pdf.netstack/releases) carries
 `pdfnetstack-<version>-<platform>` for linux-x64, linux-arm64, win-x64, osx-x64 and osx-arm64,
 compiled ahead of time, with their SHA-256 checksums in `SHA256SUMS.txt`.
 
@@ -165,15 +183,14 @@ input and output, page count, a human readable `Reason`, and per pass statistics
 ### Editing
 
 ```csharp
-using var input = File.OpenRead("contract.pdf");
-PdfDocument doc = PdfDocument.Open(input);
+using PdfDocument doc = PdfDocument.Open("contract.pdf");
 
 doc.Pages.RemoveAt(0);                         // drop the cover
 doc.Pages.Move(2, 0);                          // reorder
 doc.Pages[0].Rotate(90);                       // rotate clockwise
 doc.Pages.Add(PdfRectangle.A4);                // blank page
 
-PdfDocument annex = PdfDocument.Open("annex.pdf");
+using PdfDocument annex = PdfDocument.Open("annex.pdf");
 doc.Pages.Import(annex.Pages);                 // fonts and images shared between pages are copied once
 
 doc.Info.Title = "Signed contract";
@@ -181,9 +198,22 @@ doc.Outlines.Add("Annex", doc.Pages[^1]);      // bookmarks, read and written
 
 doc.Save("contract-final.pdf");                // optimized and verified by default
 await doc.SaveAsync(response.Body);            // asynchronous writes only, for response bodies
+```
 
-PdfDocument merged = PdfDocument.Merge([PdfDocument.Open("a.pdf"), PdfDocument.Open("b.pdf")]);
-foreach (PdfDocument single in merged.Split()) { /* one document per page */ }
+Merge and split. From 1.3 tagged PDFs stay tagged: the structure elements of the copied pages
+come along, with `/MarkInfo` and the language.
+
+```csharp
+using PdfDocument a = PdfDocument.Open("a.pdf");
+using PdfDocument b = PdfDocument.Open("b.pdf");
+using PdfDocument merged = PdfDocument.Merge([a, b]);
+merged.Save("merged.pdf");
+
+merged.SplitTo(i => File.Create($"page-{i + 1}.pdf"));     // 1.3: one file per page, one at a time
+using PdfDocument firstTwo = merged.ExtractPages(0, 2);     // 1.3: a run of pages
+
+// 1.3: merge streams holding one input at a time, straight into a response
+await PdfDocument.MergeAsync(uploads.Select(f => f.OpenReadStream()), response.Body, cancellationToken);
 ```
 
 Large files can be read without loading them, and changes saved as an incremental update that
@@ -241,7 +271,7 @@ its signatures.
 ```csharp
 using PdfNetStack.Drawing;
 
-PdfDocument doc = PdfDocument.Create();
+using PdfDocument doc = PdfDocument.Create();
 PdfPage page = doc.Pages.Add(PdfRectangle.A4);
 using (PdfGraphics g = page.CreateGraphics())          // origin top left, y down, points
 {
@@ -401,13 +431,22 @@ stay unless `PdfFlattenOptions` asks for them.
 Fill and flatten forms:
 
 ```csharp
-PdfDocument doc = PdfDocument.Open("application.pdf");
-((PdfTextField)doc.Form["name"]!).Text = "Jamal Abdelkhalek";
+using PdfDocument doc = PdfDocument.Open("application.pdf");
+((PdfTextField)doc.Form["name"]!).Text = "Jane Doe";
 ((PdfCheckBoxField)doc.Form["subscribe"]!).Checked = true;
 ((PdfRadioButtonField)doc.Form["plan"]!).Selected = "pro";
 ((PdfChoiceField)doc.Form["country"]!).Select("Morocco");
 doc.Form.Flatten();                                  // optional: values become page content
 doc.Save("filled.pdf");
+```
+
+From 1.3, `Fill` sets many fields in one call. It checks every name and value first and, when
+any is wrong, throws one `ArgumentException` listing every problem without changing a field.
+`TryGetField` finds a field of the kind you expect without a cast:
+
+```csharp
+doc.Form.Fill(new Dictionary<string, string> { ["name"] = "Jane Doe", ["subscribe"] = "yes", ["plan"] = "pro" });
+if (doc.Form.TryGetField("country", out PdfChoiceField? country)) country.Select("Morocco");
 ```
 
 Every field kind is read (text, check box, radio group, combo and list box, push button,
@@ -561,12 +600,12 @@ manual check that reads and verifies the live lists is in `tools/PdfNetStack.Tru
 ### Encryption
 
 ```csharp
-PdfDocument doc = PdfDocument.Open("report.pdf");
+using PdfDocument doc = PdfDocument.Open("report.pdf");
 doc.Security.Encrypt(userPassword: "read", ownerPassword: "admin",
     permissions: PdfPermissions.Print | PdfPermissions.CopyContent);   // AES-256 by default
 doc.Save("report-protected.pdf");
 
-PdfDocument opened = PdfDocument.Open("report-protected.pdf", password: "admin");
+using PdfDocument opened = PdfDocument.Open("report-protected.pdf", password: "admin");
 opened.Pages.RemoveAt(0);
 opened.Save("trimmed.pdf");          // keeps the original passwords and permissions
 opened.Security.RemoveEncryption();  // or save it unprotected
@@ -581,7 +620,7 @@ its permissions allow copying.
 ### Extracting images
 
 ```csharp
-PdfDocument doc = PdfDocument.Open("scan.pdf");
+using PdfDocument doc = PdfDocument.Open("scan.pdf");
 foreach (PdfPageImage image in doc.Pages[0].GetImages())
 {
     Console.WriteLine($"{image.Width}x{image.Height} at {image.Bounds}, {image.HorizontalResolution:0} dpi");
@@ -604,7 +643,7 @@ color page of 4812 by 7541 pixels takes about 190 MB at peak, its 109 MB of pixe
 ### Extracting text
 
 ```csharp
-PdfDocument doc = PdfDocument.Open("report.pdf");
+using PdfDocument doc = PdfDocument.Open("report.pdf");
 Console.WriteLine(doc.Pages[0].ExtractText());               // lines top to bottom, words spaced
 foreach (PdfWord word in doc.Pages[0].GetWords())
 {
@@ -631,7 +670,7 @@ text reads in order too, and vertical writing reads its columns from right to le
 using PdfNetStack.Ocr;   // PdfNetStack.Ocr, models in PdfNetStack.Ocr.Models
 
 using var engine = OnnxOcrEngine.Load(new OnnxOcrEngineOptions { Languages = ["latin", "arabic"] });
-PdfDocument doc = PdfDocument.Open("scan.pdf");
+using PdfDocument doc = PdfDocument.Open("scan.pdf");
 PdfOcrReport report = new PdfOcr(engine, new PdfOcrOptions { Languages = ["latin", "arabic"] }).MakeSearchable(doc);
 doc.Save("scan-searchable.pdf");             // looks the same, now selects, copies and searches
 Console.WriteLine(report.Text);
@@ -670,7 +709,7 @@ using PdfNetStack.Html;
 
 byte[] pdf = HtmlConverter.ConvertToPdf(html);                              // a string
 await HtmlConverter.ConvertToPdfAsync(html, response.Body, cancellationToken: ct); // straight to a response
-PdfDocument doc = HtmlConverter.ConvertFileToDocument("invoice.html");      // a file and its assets
+using PdfDocument doc = HtmlConverter.ConvertFileToDocument("invoice.html");      // a file and its assets
 ```
 
 A layout engine in C#, no browser: the CSS cascade, block, inline, table, flex and grid layout
@@ -678,8 +717,42 @@ A layout engine in C#, no browser: the CSS cascade, block, inline, table, flex a
 named pages on any element of the block flow, running headers and footers
 with page counters and named strings, repeated table headers, tagged output for accessibility, web fonts and variable fonts, right to left and Arabic text, links and bookmarks.
 Without a resource loader nothing is fetched from the network. `ConvertToPdf` optimizes the file
-without re-proving it (`HtmlConverterOptions.SaveOptions` changes that). Details, options and
-limits in the [package readme](eng/nuget/PdfNetStack.Html.md).
+without re-proving it (`HtmlConverterOptions.SaveOptions` changes that). On 20 public invoice and
+report templates from wkhtmltopdf and DinkToPdf projects, compared page by page with Chrome, 10
+render the same, 7 with small differences and 3 cut wide tables: content wider than the page is
+not yet shrunk to fit. No JavaScript runs. From 1.3, `MaxStyleWork` and `MaxLayoutWork` bound a
+conversion's work, `HtmlConverter.MaxConcurrentConversions` bounds how many run at once, and every
+entry point takes a cancellation token. Details, options and limits in the
+[package readme](eng/nuget/PdfNetStack.Html.md).
+
+### Servers and files from users
+
+From 1.3, `PdfLimits` bounds what a whole document may cost, and long calls take a
+`CancellationToken`:
+
+```csharp
+app.MapPost("/text", async (HttpContext context) =>
+{
+    CancellationToken cancellationToken = context.RequestAborted;    // stops when the client leaves
+    var options = new PdfLoadOptions { Mode = PdfLoadMode.OnDemand, Limits = PdfLimits.Untrusted };
+    using PdfDocument doc = await PdfDocument.OpenAsync(context.Request.Body, options, cancellationToken);
+
+    var text = new StringBuilder();
+    foreach (PdfPage page in doc.Pages) text.AppendLine(page.ExtractText(cancellationToken));
+    foreach (PdfDiagnostic warning in doc.Diagnostics) app.Logger.LogWarning("{Warning}", warning.Message);
+    return Results.Text(text.ToString());
+});
+```
+
+`PdfLimits.Untrusted` allows 256 MiB of input, 1 GiB decoded and 2^29 image pixels in total, 25
+million content operators, 250,000 characters a page and 60 seconds a call. The default limits
+scale with the file and stop only what no ordinary document needs. When a total runs out, a page
+reads as far as it got and `doc.Diagnostics` says so; an image raises
+`PdfLimitExceededException`; the optimizer (`PdfOptimizerOptions.Limits`) returns the input with
+`OptimizationDisposition.LimitExceeded`. Budgets last as long as the document: for one kept open
+and read many times, raise `MaxTotalDecodedBytes`. See
+[Resource limits](https://www.jadev-corp.com/pdfnetstack/concepts/resource-limits/) and
+[Cancellation and progress](https://www.jadev-corp.com/pdfnetstack/guides/cancellation-and-progress/).
 
 ### Command line
 
@@ -717,7 +790,7 @@ pdfnetstack ocr scan.pdf searchable.pdf --languages latin,arabic   # runs pdfnet
 | Stream recompression | Removes ASCIIHex/ASCII85 layers, turns LZW and RunLength into Flate, recompresses Flate at zlib level 9, keeps a result only when smaller | Yes |
 | Image prediction | Tries PNG predictors on raw images of 8 bits or less per component | Yes |
 | Bilevel images | `OptimizeBilevelImages`: 1 bit images stored as samples (raw, Flate, LZW, RunLength) or as CCITT Group 3 become CCITT Group 4 (ITU-T T.6) when smaller. Group 3 data is taken only when it decodes without a flaw, and the proof compares every pixel | Yes |
-| JPEG re-encoding | Rebuilds each JPEG's Huffman tables for that image, writes progressive and restart-marked JPEGs as plain baseline, drops segments PDF readers ignore (Exif, XMP, embedded ICC, comments). Works on the DCT coefficients, which stay identical | Yes |
+| JPEG re-encoding | Rebuilds each JPEG's Huffman tables for that image, writes progressive and restart-marked JPEGs as plain baseline unless progressive coding is smaller, drops segments PDF readers ignore (Exif, XMP, embedded ICC, comments). Works on the DCT coefficients, which stay identical | Yes |
 | Deduplication | Merges identical fonts, images, ICC profiles, resource dictionaries and arrays, streams compared by what they decode to, iterating until merges stop | Yes |
 | Unused resources | Drops fonts, images, forms, graphics states, patterns, shadings, color spaces and property lists that no content using the resource dictionary names | Yes |
 | Content streams | Rewrites page, form, pattern and appearance content with minimal white space, canonical numbers and no comments; the same operators and operands | Yes |
@@ -729,7 +802,7 @@ pdfnetstack ocr scan.pdf searchable.pdf --languages latin,arabic   # runs pdfnet
 | Downsampling | `MaxImageDpi`: images drawn above 1.5 times the target resolution, measured at their largest placement, are resampled with a Lanczos filter; JPEG 2000 becomes JPEG at `JpegQuality` (or lossless samples without it). Bilevel images, raw, CCITT or JBIG2, stay bilevel: a box filter and a threshold that keeps strokes thinner than the new pixels, coded as Group 4 or Flate. Masks, indexed and color keyed images are left alone | No, opt-in |
 | Photographs to JPEG | `ConvertImagesToJpeg`: raw gray and RGB images and gray and RGB JPEG 2000 images that look photographic become baseline JPEG at `JpegQuality`; line art, screenshots and palette images stay lossless | No, opt-in |
 | Quality gate | `MinImageSsim`: any lossy image change below this luminance SSIM is dropped and the image kept as it was | Opt-in |
-| Progressive JPEG | `ProgressiveJpeg`: every JPEG written is also tried progressive, kept when smaller | Yes, opt-in |
+| Progressive JPEG | `ProgressiveJpeg`: every JPEG written is also tried progressive, kept when smaller | Yes, on by default from 1.3 |
 | Exhaustive Flate | `Compression = Exhaustive`: optimal parsing and block splitting in the manner of Zopfli, zlib kept when smaller | Yes, opt-in |
 
 Without the lossy image options, JPEG data is decoded to DCT coefficients and never to pixels, so
@@ -741,18 +814,25 @@ JPEG 2000 and JBIG2 data is then never decoded or touched, and CCITT data only b
 The optimizer refuses to rewrite, and returns the input unchanged, when the file is:
 
 - encrypted,
-- digitally signed or has usage rights (any `/ByteRange`, signature dictionary, `/Perms` or `/DSS`),
+- digitally signed or has usage rights (any `/ByteRange`, signature dictionary, `/Perms` or `/DSS`);
+  from 1.3, `RemoveUsageRights` rewrites a form whose only signature is usage rights, removing them,
 - incrementally updated, unless `AllowIncrementalUpdates` is set,
 - damaged: xref reconstruction, stream length repair, unreadable objects, or references whose
   generation numbers disagree with the xref, unless `AllowRepairedFiles` is set,
-- larger than `MaxInputBytes`.
+- larger than `MaxInputBytes`,
+- from 1.3, too costly for `PdfOptimizerOptions.Limits` (disposition `LimitExceeded`).
 
 PDF/A-1 files are detected from their XMP metadata and written with a classic xref table and
 no object streams, because PDF/A-1 predates both.
 
-Hostile input is bounded: nesting depth is capped, decoded stream size is capped
-(`MaxDecodedStreamBytes`, default 256 MiB) as a zip bomb defence, `/Prev` loops terminate,
-wrong stream lengths are recovered from `endstream`, and unreadable objects never crash the run.
+Hostile input meets two kinds of limits. Per object: nesting depth is capped, each decoded stream
+is capped (`MaxDecodedStreamBytes`, default 256 MiB) as a zip bomb defence, each image's pixels are
+capped before its buffer is allocated, `/Prev` loops terminate, wrong stream lengths are recovered
+from `endstream`, and unreadable objects never crash the run. Per document, from 1.3:
+`PdfOptimizerOptions.Limits` caps the input, the bytes and image pixels decoded in total, the
+content operators and the time, and a run that reaches one returns the input with
+`LimitExceeded`. Use `PdfLimits.Untrusted` for files from users of a service, and run the work in
+a process or container with a memory limit as well.
 
 The verifier walks the source and output graphs in lockstep from the trailer. Dictionaries
 must have the same keys and values, arrays the same items, references must line up, and every
@@ -772,9 +852,40 @@ See [docs/FIDELITY.md](docs/FIDELITY.md) for the full method and its limits.
 
 ## Results
 
-Measured on a mixed real world corpus of 1,296 files (569 MiB): invoices, reports, manuals,
-scanned documents, presentations and a 631 page spare parts catalogue, on an 8 core Windows
-machine with default options.
+### Public corpus, against qpdf and Ghostscript
+
+77 openly licensed and public domain PDFs that anyone can download: NIST and NASA publications,
+arXiv papers, government gazettes and test files from other PDF projects, listed in
+[eng/corpus/manifest.json](eng/corpus/manifest.json). [tools/compare_optimizers.py](tools/compare_optimizers.py)
+runs PdfNetStack with the library defaults next to the other tools and scores every output on
+size, on rendering in PDFium and on what it kept: tags, form fields, outlines, attachments,
+signatures, usage rights and PDF/A conformance. CI runs it every week and for every release,
+with MuPDF too. Measured on 18 November 2026 with qpdf 12.4.2 and Ghostscript 10.05, on the 76
+files PDFium can open:
+
+| Tool | Saved | Outputs that keep quality |
+|---|---:|---:|
+| PdfNetStack, lossless (defaults) | 11.2% | 76 of 76 |
+| qpdf, lossless | 5.7% | 64 of 76 |
+| PdfNetStack, `Balanced` preset | 21.8% | 76 of 76 |
+| PdfNetStack, `Smallest` preset | 33.3% | 73 of 76 |
+| Ghostscript, `/ebook` | 32.1% | 23 of 76 |
+
+qpdf's 12 outputs below the bar broke the signatures of 6 files and the usage rights of 2
+forms, wrote object streams into 3 PDF/A-1b files (PDF/A-1 is based on PDF 1.4, which has
+none) and lost the outline of a damaged file. On the 64 files where both keep quality,
+PdfNetStack's output is 8% smaller in total (154.1 MiB against 167.6 MiB). qpdf is smaller on
+18 of them: 15 that PdfNetStack keeps as they are by default (7 with incremental updates, 2
+encrypted, 1 that needed repair, 5 where the rewrite saved less than 1%) and 3 real gaps. With
+`AllowIncrementalUpdates` the 7 files go from 7.2 MiB to 5.5 MiB. Ghostscript's output falls
+below the bar on 53 files: changed text or page geometry, lost form fields, tags, annotations
+or signatures.
+
+### Private corpus
+
+Measured for version 1.0 on a mixed real world corpus of 1,296 files (569 MiB) that is not
+public: invoices, reports, manuals, scanned documents, presentations and a 631 page spare parts
+catalogue, on an 8 core Windows machine with default options.
 
 | | |
 |---|---|
@@ -826,16 +937,18 @@ object streams have little left to gain losslessly.
 | `MaxBilevelImageDpi` | null | The resolution for bilevel images in place of `MaxImageDpi`; null uses `MaxImageDpi`. Lossy |
 | `ConvertImagesToJpeg` | false | Photographic raw and JPEG 2000 images to JPEG at `JpegQuality`. Lossy |
 | `MinImageSsim` | null | 0 to 1; around 0.95 keeps changes hard to see |
-| `ProgressiveJpeg` | false | Progressive JPEG when smaller. Lossless |
+| `ProgressiveJpeg` | true | Progressive JPEG when smaller. Lossless. Off by default before 1.3 |
 | `Verify` | true | Disable only for inputs you already trust |
 | `AllowIncrementalUpdates` | false | Flattens edit history into one revision |
 | `AllowRepairedFiles` | false | Rewrites damaged files into clean ones |
 | `RemovePageThumbnails` | false | Not lossless |
 | `RemovePieceInfo` | false | Not lossless for the authoring app, invisible to viewers |
+| `RemoveUsageRights` | false | 1.3. Rewrites forms whose only signature is Adobe Reader usage rights, removing them |
 | `Streaming` | false | Read on demand, write through a temporary file, prove it there: memory bounded by objects and batches, not the file. Not with `Linearize` |
 | `MaxInputBytes` | 1 GiB | Raise it with `Streaming` for larger files |
 | `MaxDecodedStreamBytes` | 256 MiB | Per stream decode ceiling |
-| `MaxDegreeOfParallelism` | CPU count | Lower it to cap memory on image heavy files |
+| `MaxDegreeOfParallelism` | CPU count | From 1.3 also capped by the memory the runtime reports. Lower it to cap memory on image heavy files |
+| `Limits` | `PdfLimits.Default` | 1.3. What one run may cost in total; `PdfLimits.Untrusted` for files from users |
 
 ## Feature status
 
@@ -861,13 +974,15 @@ in the [roadmap](docs/ROADMAP.md).
 | OCR | `PdfNetStack.Ocr` add-on and `PdfNetStack.Ocr.Models`: searchable scans, Latin and Arabic, scans in one image or several, pages scanned sideways, an application supplied rasterizer; the `pdfnetstack-ocr` tool | 1.1 |
 | OCR with Tesseract | `PdfNetStack.Ocr.Tesseract`: an engine that runs an installed `tesseract`, any language it has data for | 1.2 |
 | Large files and serverless | Documents opened on demand from files and streams that cannot seek, image and decode limits, progressive and asynchronous saving, a streaming optimizer for files larger than memory; Native AOT on linux-x64 and linux-arm64; AWS Lambda and Azure Functions samples | 1.1 |
+| Resource limits | `PdfLimits` for a whole document, with an `Untrusted` preset; `PdfDocument.Diagnostics`; `PdfLimitExceededException`; `LimitExceeded` in the optimizer | 1.3, not yet on NuGet |
+| Servers | Cancellation tokens and progress on long calls, `MergeAsync` one input at a time, `SplitTo`, `ExtractPages`; tagged PDFs stay tagged through merge and split; `Form.Fill` and `TryGetField` | 1.3, not yet on NuGet |
 
 ### Low level access
 
 ```csharp
 using PdfNetStack.Objects;
 
-PdfDocument doc = PdfDocument.Open("report.pdf");
+using PdfDocument doc = PdfDocument.Open("report.pdf");
 doc.Catalog.Set("PageMode", new PdfName("UseOutlines"));        // open with bookmarks shown
 var content = PdfStream.FromData("0 0 1 rg 72 72 144 144 re f"u8);
 doc.Pages[0].Dictionary.Set("Contents", doc.AddObject(content));  // replace page content
@@ -880,11 +995,11 @@ doc.Pages[0].Dictionary.Set("Contents", doc.AddObject(content));  // replace pag
   indexed, Lab, Separation and DeviceN images keep their resolution, masks and soft masks (the
   JBIG2 layer of a book scan is usually one) are never changed, and images inside Type 3 glyphs
   are never downsampled. The quality gate measures luminance only. On the public benchmark
-  corpus (`eng/corpus/manifest.json`, see docs/FIDELITY.md) the lossy options take the saving
-  from 12.1% to 29.5%, and on its nine scanned documents from 4.1% to 24.0%: 37% on a 309 page
-  JBIG2 report and 42% to 88% on CCITT pages. Book scans that split each page into a JPEG 2000
-  picture over a JBIG2 mask gain about 2%: the pictures are already smaller than a JPEG of them,
-  and decoding them costs about a second each.
+  corpus (`eng/corpus/manifest.json`, see docs/FIDELITY.md), in the 1.1.0 release run, the lossy
+  options took the saving from 12.1% to 29.5%, and on its nine scanned documents from 4.1% to
+  24.0%: 37% on a 309 page JBIG2 report and 42% to 88% on CCITT pages. Book scans that split
+  each page into a JPEG 2000 picture over a JBIG2 mask gain about 2%: the pictures are already
+  smaller than a JPEG of them, and decoding them costs about a second each.
 - Arithmetic coded, 12 bit, lossless and hierarchical JPEGs, JPEGs with more than 64 scans, and
   damaged JPEG data, are carried over untouched.
 - The optimizer does not subset fonts; it merges subsets of one font only when they keep the
@@ -909,12 +1024,19 @@ doc.Pages[0].Dictionary.Set("Contents", doc.AddObject(content));  // replace pag
   run 64 bit and reference `Microsoft.ML.OnnxRuntime` itself, so its native runtime is copied next
   to the app.
 - Linearization is opt-in (`Linearize`); without it, the linearization of an input is dropped.
-- In memory, the default, the optimizer holds the whole document. Peak memory depends on decoded
-  image sizes and on parallelism: plan for about 10 times the file size, more for image heavy
-  files, or lower `MaxDegreeOfParallelism`. `Streaming` keeps memory bounded instead, at the
-  cost of a temporary file the size of the output and more reads of the source. Its output can
-  differ slightly from the in-memory rewrite, because duplicates are found before recompression:
-  two JPEG files that differ only in metadata stay two.
+- In memory, the default, the optimizer holds the whole document, and each worker about three
+  times the largest decoded stream it works on: plan for about `workers x 3 x largest decoded
+  stream` on top of the document, from the decoded size of the images, not the file size. From
+  1.3 the default worker count follows the memory the runtime reports, a container's limit
+  included, and large decode buffers no longer stay in the shared pool after a call (an image
+  heavy run held 1.3 GB after returning, now 25 MB). Measured on 1.2.0, the peak working set was
+  24 to 60 times the input; 1.3 lowers it by 8 to 20% on image heavy files. Lower
+  `MaxDegreeOfParallelism` to cut the peak, and see
+  [Memory and performance](https://www.jadev-corp.com/pdfnetstack/concepts/memory-and-performance/)
+  for container sizing and GC settings. `Streaming`
+  keeps the file itself out of memory, at the cost of a temporary file the size of the output and
+  more reads of the source. Its output can differ slightly from the in-memory rewrite, because
+  duplicates are found before recompression: two JPEG files that differ only in metadata stay two.
 - A full save with the optimizer, the default, builds the file in memory; with `Optimize = false`
   it is written progressively. To read or edit a large file without loading it, open
   it with `PdfLoadMode.OnDemand`, then use `SaveIncremental` or a progressive save.
@@ -929,11 +1051,14 @@ doc.Pages[0].Dictionary.Set("Contents", doc.AddObject(content));  // replace pag
 ## Documentation
 
 - [Documentation site](https://www.jadev-corp.com/pdfnetstack): guides, recipes and the API reference
+- [Migrating from PDFsharp 6](https://www.jadev-corp.com/pdfnetstack/guides/migrate-from-pdfsharp/): common calls mapped, with before and after code
+- [Resource limits](https://www.jadev-corp.com/pdfnetstack/concepts/resource-limits/) and [cancellation](https://www.jadev-corp.com/pdfnetstack/guides/cancellation-and-progress/): running on files from users
 - [Architecture](docs/ARCHITECTURE.md)
 - [Fidelity and verification](docs/FIDELITY.md)
 - [Roadmap](docs/ROADMAP.md)
 - [Contributing](CONTRIBUTING.md)
 - [Security policy](SECURITY.md)
+- [Governance](GOVERNANCE.md): maintainers, decisions and releases
 
 ## Acknowledgements
 

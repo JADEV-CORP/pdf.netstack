@@ -407,6 +407,90 @@ public sealed class StructuralOptimizationTests
         CollectionAssert.AreEqual(content, Compat.Latin1.GetBytes(Decoded(file, (PdfStream)file.Resolve(Page(file)["Contents"])!)));
     }
 
+    // --- Obsolete XObject names ----------------------------------------------------------------
+
+    /// <summary>Two pages drawing the same image through two image objects named /Im1 and /Im2.</summary>
+    private static byte[] TwoNamedImages(string version, string name1, string name2, string type = "/Type/XObject/Subtype/Image")
+    {
+        byte[] pixels = new byte[48 * 48 * 3];
+        new Random(11).NextBytes(pixels);
+        string image = type + "/Width 48/Height 48/ColorSpace/DeviceRGB/BitsPerComponent 8";
+        var b = new PdfBuilder { Version = version };
+        b.Set(1, "<</Type/Catalog/Pages 2 0 R>>");
+        b.Set(2, "<</Type/Pages/Kids[3 0 R 4 0 R]/Count 2>>");
+        b.Set(3, "<</Type/Page/Parent 2 0 R/MediaBox[0 0 100 100]/Resources<</XObject<</Im1 5 0 R>>>>/Contents 7 0 R>>");
+        b.Set(4, "<</Type/Page/Parent 2 0 R/MediaBox[0 0 100 100]/Resources<</XObject<</Im2 6 0 R>>>>/Contents 8 0 R>>");
+        b.SetStream(5, image + name1, pixels);
+        b.SetStream(6, image + name2, pixels);
+        b.SetStream(7, "", "q 48 0 0 48 0 0 cm /Im1 Do Q"u8.ToArray());
+        b.SetStream(8, "", "q 48 0 0 48 0 0 cm /Im2 Do Q"u8.ToArray());
+        return b.Build();
+    }
+
+    private static List<PdfStream> Images(byte[] pdf)
+    {
+        PdfFile file = Open(pdf);
+        return [.. Enumerable.Range(0, 2).Select(i => (PdfStream)file.Resolve(Category(file, Page(file, i), "XObject").EntryAt(0).Value)!).Distinct()];
+    }
+
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public void XObjectsThatDifferOnlyByTheirObsoleteNameAreMerged(bool streaming)
+    {
+        byte[] input = TwoNamedImages("1.4", "/Name/Im1", "/Name/Im2");
+
+        (byte[] output, PdfOptimizationResult result) = Run(input, NoThreshold with { Streaming = streaming });
+
+        AssertVerified(input, output, result);
+        Assert.AreEqual(1, result.Statistics.ObjectsDeduplicated);
+        List<PdfStream> images = Images(output);
+        Assert.HasCount(1, images);
+        Assert.IsNull(images[0].Dictionary["Name"], "Neither copy's name may stand for the other.");
+    }
+
+    [TestMethod]
+    public void XObjectsWithTheSameNameKeepIt()
+    {
+        byte[] input = TwoNamedImages("1.4", "/Name/Im1", "/Name/Im1");
+
+        (byte[] output, PdfOptimizationResult result) = Run(input);
+
+        AssertVerified(input, output, result);
+        List<PdfStream> images = Images(output);
+        Assert.HasCount(1, images);
+        Assert.AreEqual("Im1", images[0].Dictionary.GetName("Name"));
+    }
+
+    [TestMethod]
+    public void XObjectNamesStayDistinctInPdf10Output()
+    {
+        // PDF 1.0 required /Name; without object streams the output stays 1.0.
+        byte[] input = TwoNamedImages("1.0", "/Name/Im1", "/Name/Im2");
+
+        (byte[] output, PdfOptimizationResult result) = Run(input, NoThreshold with { UseObjectStreams = false });
+
+        AssertVerified(input, output, result);
+        Assert.AreEqual(0, result.Statistics.ObjectsDeduplicated);
+        Assert.HasCount(2, Images(output));
+    }
+
+    [TestMethod]
+    public void OnlyAnXObjectMayLoseItsName()
+    {
+        byte[] input = TwoNamedImages("1.4", "/Name/Im1", "/Name/Im2");
+        string text = Compat.Latin1.GetString(input);
+
+        // An image that drops its /Name proves equal; a stream that is no XObject does not.
+        // Blanks of the same length keep the cross-reference offsets right.
+        byte[] unnamed = Compat.Latin1.GetBytes(text.Replace("/Name/Im2", "         ", StringComparison.Ordinal));
+        Assert.IsNull(PdfEquivalence.FindDifference(input, unnamed));
+        byte[] notXObject = TwoNamedImages("1.4", "/Name/Im1", "/Name/Im2", type: "/Type/Other/Subtype/Image");
+        byte[] notXObjectUnnamed = Compat.Latin1.GetBytes(Compat.Latin1.GetString(notXObject).Replace("/Name/Im2", "         ", StringComparison.Ordinal));
+        Assert.IsNotNull(PdfEquivalence.FindDifference(notXObject, notXObjectUnnamed));
+        Assert.IsNotNull(PdfEquivalence.FindDifference(unnamed, input), "A name may not appear.");
+    }
+
     // --- Decoded content deduplication and font program merging ---------------------------
 
     [TestMethod]

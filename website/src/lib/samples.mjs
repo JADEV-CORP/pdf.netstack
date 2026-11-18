@@ -50,7 +50,7 @@ function displayFile({ text, since }) {
       if (!noted) {
         out.push(
           since === 'unreleased' ? '// Not on NuGet yet. Clone' : `// Uses features from ${since}, not on NuGet yet. Clone`,
-          '// https://github.com/jams4code/pdf.netstack next to this file to build against it.',
+          '// https://github.com/JADEV-CORP/pdf.netstack next to this file to build against it.',
         );
         noted = true;
       }
@@ -123,6 +123,8 @@ export function expandSamplesInMarkdown(markdown) {
     const parsed = parseSampleMeta(meta);
     if (!parsed) return whole;
     const { code, title } = renderFence(parsed);
-    return `${indent}\`\`\`${lang}${title ? ` title="${title}"` : ''}\n${code}${indent}\`\`\``;
+    // Keep the fence's own attributes, such as a title given to one region, as the page does.
+    const attributes = [title && `title="${title}"`, parsed.rest].filter(Boolean).join(' ');
+    return `${indent}\`\`\`${lang}${attributes ? ` ${attributes}` : ''}\n${code}${indent}\`\`\``;
   });
 }

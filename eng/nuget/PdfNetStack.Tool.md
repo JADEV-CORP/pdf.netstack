@@ -3,7 +3,7 @@
 `pdfnetstack`: a cross-platform command line tool to compress, optimize, merge, split, rotate,
 encrypt and decrypt PDF files. Lossless by default, every output verified against its source.
 Built on the [PdfNetStack](https://www.nuget.org/packages/PdfNetStack) library by Jamal
-Abdelkhalek at [JADEV](https://github.com/jams4code). MIT licensed, no Ghostscript.
+Abdelkhalek at [JADEV](https://github.com/JADEV-CORP). MIT licensed, no Ghostscript.
 
 ```bash
 dotnet tool install -g PdfNetStack.Tool
@@ -11,7 +11,7 @@ dotnet tool install -g PdfNetStack.Tool
 
 Without .NET installed, download the native executable for your platform (linux-x64, linux-arm64,
 win-x64, osx-x64, osx-arm64) from the
-[GitHub releases](https://github.com/jams4code/pdf.netstack/releases), checked against
+[GitHub releases](https://github.com/JADEV-CORP/pdf.netstack/releases), checked against
 `SHA256SUMS.txt`.
 
 ## Usage
@@ -38,6 +38,6 @@ Run `pdfnetstack --help` for every option. Requires the .NET 8 or later runtime.
 
 ## Links
 
-- [Documentation and source](https://github.com/jams4code/pdf.netstack)
-- [Changelog](https://github.com/jams4code/pdf.netstack/blob/main/CHANGELOG.md)
-- [Report an issue](https://github.com/jams4code/pdf.netstack/issues)
+- [Documentation and source](https://github.com/JADEV-CORP/pdf.netstack)
+- [Changelog](https://github.com/JADEV-CORP/pdf.netstack/blob/main/CHANGELOG.md)
+- [Report an issue](https://github.com/JADEV-CORP/pdf.netstack/issues)

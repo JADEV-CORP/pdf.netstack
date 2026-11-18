@@ -22,14 +22,16 @@ internal static class ImageSamples
 
     /// <summary>The data with general filters undone: a JPEG file for DCTDecode, samples when unencoded.</summary>
     /// <exception cref="PdfFormatException">The data is damaged or exceeds the document's decode limit.</exception>
-    public static byte[] EncodedData(PdfDocument doc, PdfDictionary dict, ReadOnlyMemory<byte> raw)
+    /// <param name="size">The size of raw samples, which sizes the decoder's buffer; 0 when unknown.</param>
+    public static byte[] EncodedData(PdfDocument doc, PdfDictionary dict, ReadOnlyMemory<byte> raw, long size = 0)
     {
         try
         {
             List<FilterSpec> filters = StreamCodec.GetFilters(dict, doc.Resolve);
-            using DecodedStream decoded = StreamCodec.Decode(raw, filters, DecodeDepth.Full, doc.DecodeLimit, doc.Resolve);
+            int hint = size is > 0 and <= Compat.MaxArrayLength ? (int)size : 0;
+            using DecodedStream decoded = StreamCodec.Decode(raw, filters, DecodeDepth.Full, doc.DecodeLimit, doc.Resolve, doc.Budget, hint);
             if (decoded.PendingPredictor is not null) throw new PdfFormatException("Image data has a predictor that cannot be undone.");
-            return decoded.Data.ToArray();
+            return decoded.ToArray();
         }
         catch (StreamDecodeException e)
         {
@@ -38,19 +40,34 @@ internal static class ImageSamples
     }
 
     /// <summary>Gray or RGB pixels, or null for an encoding or color space this does not decode.</summary>
+    /// <param name="ct">Observed between the stages and inside the image codecs and the conversion.</param>
     /// <exception cref="PdfFormatException">The data is damaged or too large.</exception>
-    public static Raster? Decode(PdfDocument doc, PdfDictionary dict, ReadOnlyMemory<byte> raw, PdfDictionary? resources)
+    public static Raster? Decode(PdfDocument doc, PdfDictionary dict, ReadOnlyMemory<byte> raw, PdfDictionary? resources, CancellationToken ct = default)
     {
+        ct.ThrowIfCancellationRequested();
         int width = Int(doc, dict["Width"]), height = Int(doc, dict["Height"]);
         if (width <= 0 || height <= 0 || (long)width * height > doc.MaxImagePixels) throw new PdfFormatException("Image size is invalid or too large.");
         bool mask = doc.Resolve(dict["ImageMask"]) is PdfBoolean { Value: true };
         string? encoding = Encoding(doc, dict);
-        if (encoding == "JPXDecode") return DecodeJpx(doc, dict, raw, resources, mask);
-        if (encoding is not (null or "DCTDecode" or "CCITTFaxDecode" or "JBIG2Decode")) return null;
+        if (encoding is not (null or "JPXDecode" or "DCTDecode" or "CCITTFaxDecode" or "JBIG2Decode")) return null;
 
-        byte[] data = EncodedData(doc, dict, raw);
+        // Every image the document decodes counts against its pixel budget, before any of it is allocated.
+        doc.Budget.ChargeImagePixels((long)width * height);
+        if (encoding == "JPXDecode") return DecodeJpx(doc, dict, raw, resources, mask, ct);
+
         int bpc = mask || encoding is "CCITTFaxDecode" or "JBIG2Decode" ? 1 : encoding == "DCTDecode" ? 8 : Int(doc, dict["BitsPerComponent"]);
         ColorSpace? space = mask ? ColorSpace.Gray : ColorSpace.Read(doc, doc.Resolve(dict["ColorSpace"]), resources, 0);
+        long samples = 0;
+        if (encoding is null)
+        {
+            // Raw samples have a known size: an image over the ceiling is refused before its data
+            // is decoded, and the decoder allocates exactly that size once.
+            if (space is null || bpc is not (1 or 2 or 4 or 8 or 16) || (space.IsIndexed && bpc == 16)) return null;
+            samples = SampleBytes(doc, width, height, bpc, space);
+        }
+
+        byte[] data = EncodedData(doc, dict, raw, samples);
+        ct.ThrowIfCancellationRequested();
 
         if (encoding == "CCITTFaxDecode")
         {
@@ -63,7 +80,7 @@ internal static class ImageSamples
 
             try
             {
-                data = CcittDecoder.Decode(data, parameters, height);
+                data = CcittDecoder.Decode(data, parameters, height, ct);
             }
             catch (ArgumentOutOfRangeException e)
             {
@@ -75,7 +92,7 @@ internal static class ImageSamples
 
         if (encoding == "JBIG2Decode")
         {
-            data = Jbig2(doc, LastParms(doc, dict), data, width, height);
+            data = Jbig2(doc, LastParms(doc, dict), data, width, height, ct);
             space ??= ColorSpace.Gray;
         }
 
@@ -85,7 +102,7 @@ internal static class ImageSamples
             Raster jpeg;
             try
             {
-                jpeg = JpegDecoder.Decode(data, transform, doc.DecodeLimit, doc.MaxImagePixels);
+                jpeg = JpegDecoder.Decode(data, transform, doc.DecodeLimit, doc.MaxImagePixels, ct);
             }
             catch (JpegFormatException e)
             {
@@ -107,13 +124,20 @@ internal static class ImageSamples
 
         if (space is null || bpc is not (1 or 2 or 4 or 8 or 16) || (space.IsIndexed && bpc == 16)) return null;
         double[] decode = DecodeArray(doc, dict, space, bpc, mask);
+        SampleBytes(doc, width, height, bpc, space);
+        return Convert(data, width, height, bpc, (((long)width * space.Components * bpc) + 7) / 8, space, decode, mask, ct);
+    }
 
+    /// <summary>The bytes of the samples, checked with the output against the decode ceiling.</summary>
+    /// <exception cref="PdfFormatException">The samples or the pixels would not fit.</exception>
+    private static long SampleBytes(PdfDocument doc, int width, int height, int bpc, ColorSpace space)
+    {
         // The pixel cap alone allows 32 components of 16 bits: the bytes are what must fit.
         long rowBytes = (((long)width * space.Components * bpc) + 7) / 8;
         long outputBytes = (long)width * height * (space.IsGray ? 1 : 3);
         long ceiling = Math.Min(doc.DecodeLimit, Compat.MaxArrayLength);
         if (rowBytes * height > ceiling || outputBytes > ceiling) throw new PdfFormatException("Image exceeds the decode limit.");
-        return Convert(data, width, height, bpc, rowBytes, space, decode, mask);
+        return rowBytes * height;
     }
 
     /// <summary>
@@ -121,7 +145,7 @@ internal static class ImageSamples
     /// the filter's output is read as samples in which 0 is black, as pdf.js and PDFium read it, so
     /// the bits are inverted (ISO 32000-1, 7.4.7).
     /// </summary>
-    private static byte[] Jbig2(PdfDocument doc, PdfDictionary? parms, byte[] data, int width, int height)
+    private static byte[] Jbig2(PdfDocument doc, PdfDictionary? parms, byte[] data, int width, int height, CancellationToken ct)
     {
         // The work bound scales with the size, so a size over the limit is refused before decoding.
         long ceiling = Math.Min(doc.DecodeLimit, Compat.MaxArrayLength);
@@ -130,7 +154,7 @@ internal static class ImageSamples
         byte[] page;
         try
         {
-            page = Jbig2Decoder.Decode(data, globals, width, height);
+            page = Jbig2Decoder.Decode(data, globals, width, height, ct);
         }
         catch (Jbig2FormatException e)
         {
@@ -146,14 +170,15 @@ internal static class ImageSamples
     /// the data's own size wins over Width and Height. Samples arrive as 8 bits per component.
     /// SMaskInData is not applied: opacity channels in the data are left out.
     /// </summary>
-    private static Raster? DecodeJpx(PdfDocument doc, PdfDictionary dict, ReadOnlyMemory<byte> raw, PdfDictionary? resources, bool mask)
+    private static Raster? DecodeJpx(PdfDocument doc, PdfDictionary dict, ReadOnlyMemory<byte> raw, PdfDictionary? resources, bool mask, CancellationToken ct)
     {
         byte[] data = EncodedData(doc, dict, raw);
+        ct.ThrowIfCancellationRequested();
         ColorSpace? space = mask ? ColorSpace.Gray : ColorSpace.Read(doc, doc.Resolve(dict["ColorSpace"]), resources, 0);
         Raster? jpx;
         try
         {
-            (jpx, space) = Jpeg2000Decoder.DecodeForPdf(data, space, doc.DecodeLimit, maxPixels: doc.MaxImagePixels);
+            (jpx, space) = Jpeg2000Decoder.DecodeForPdf(data, space, doc.DecodeLimit, maxPixels: doc.MaxImagePixels, ct: ct);
         }
         catch (Jpeg2000FormatException e)
         {
@@ -166,7 +191,7 @@ internal static class ImageSamples
 
         // 8 bit gray or RGB read as stored is the decoder's raster itself, with no copy.
         if (!mask && (space == ColorSpace.Gray || space == ColorSpace.Rgb) && decode.Select((d, i) => d == i % 2).All(same => same)) return jpx;
-        return Convert(jpx.Samples, jpx.Width, jpx.Height, 8, (long)jpx.Width * jpx.Channels, space, decode, mask);
+        return Convert(jpx.Samples, jpx.Width, jpx.Height, 8, (long)jpx.Width * jpx.Channels, space, decode, mask, ct);
     }
 
     /// <summary>The decode parameters of the last filter, the image codec.</summary>
@@ -217,16 +242,21 @@ internal static class ImageSamples
     /// Short data is common, and viewers draw what is there: samples past the end read as zero,
     /// without padding the data out to its declared size.
     /// </remarks>
-    private static Raster Convert(byte[] data, int width, int height, int bpc, long rowBytes, ColorSpace space, double[] decode, bool mask)
+    private static Raster Convert(byte[] data, int width, int height, int bpc, long rowBytes, ColorSpace space, double[] decode, bool mask, CancellationToken ct)
     {
         int n = space.Components, channels = space.IsGray ? 1 : 3;
+        long stride = (long)width * n;
+        bool asStored = !mask && bpc == 8 && (space == ColorSpace.Gray || space == ColorSpace.Rgb) && decode.Select((d, i) => d == i % 2).All(same => same);
+
+        // Samples stored exactly as the pixels are the pixels: no second copy of a large image.
+        if (asStored && rowBytes == stride && data.Length == stride * height) return new Raster(width, height, channels, data);
+
         var output = new byte[(long)width * height * channels];
         int max = (1 << bpc) - 1;
 
         // The common case, 8 bit gray or RGB read as stored, needs no arithmetic.
-        if (!mask && bpc == 8 && (space == ColorSpace.Gray || space == ColorSpace.Rgb) && decode.Select((d, i) => d == i % 2).All(same => same))
+        if (asStored)
         {
-            long stride = (long)width * n;
             for (int y = 0; y < height; y++)
             {
                 long from = y * rowBytes;
@@ -259,6 +289,8 @@ internal static class ImageSamples
         Span<byte> rgb = stackalloc byte[3];
         for (int y = 0; y < height; y++)
         {
+            // Converting through a color space costs per pixel: look at the token once a row.
+            ct.ThrowIfCancellationRequested();
             long row = y * rowBytes;
             for (int x = 0; x < width; x++)
             {

@@ -70,12 +70,15 @@ namespace PdfNetStack.Cli
               --min-ssim <0-1>          Perceptual gate: keep any image whose lossy change
                                         falls below this SSIM; verify: accept downsampled
                                         and converted images that meet it
-              --progressive             Write JPEG progressively when that is smaller
+              --sequential              Write JPEG sequentially only; by default an image is
+                                        written progressively when that is smaller
               --no-verify               Skip the equivalence proof (not recommended)
               --allow-incremental       Flatten files with incremental updates
               --allow-repaired          Rewrite damaged files that needed repair
               --strip-thumbnails        Remove page thumbnails (not lossless)
               --strip-pieceinfo         Remove application private data (not lossless)
+              --remove-usage-rights     Rewrite files whose only signature is Adobe Reader
+                                        usage rights (/UR3), removing them
               --min-saving <percent>    Minimum saving to keep a rewrite (default 1)
               --threads <n>             Threads per document (default: all cores)
               --jobs <n>                Documents processed in parallel by batch (default: all cores)
@@ -366,6 +369,7 @@ namespace PdfNetStack.Cli
                 rows.Count(r => r.Disposition == nameof(OptimizationDisposition.Optimized)),
                 rows.Count(r => r.Disposition == nameof(OptimizationDisposition.OriginalRetained)),
                 rows.Count(r => r.Disposition == nameof(OptimizationDisposition.UnsupportedRetained)),
+                rows.Count(r => r.Disposition == nameof(OptimizationDisposition.LimitExceeded)),
                 rows.Count(r => r.Disposition == "Error"),
                 before,
                 after,
@@ -390,6 +394,7 @@ namespace PdfNetStack.Cli
                 Console.WriteLine($"Optimized     {summary.Optimized}");
                 Console.WriteLine($"Retained      {summary.Retained} (saving below threshold or failed checks)");
                 Console.WriteLine($"Unsupported   {summary.Unsupported}");
+                Console.WriteLine($"Over a limit  {summary.LimitExceeded} (input kept: a resource limit was reached)");
                 foreach ((string reason, int count) in summary.UnsupportedReasons.OrderByDescending(p => p.Value))
                 {
                     Console.WriteLine($"  {count,5}  {reason}");
@@ -475,6 +480,7 @@ namespace PdfNetStack.Cli
         int Optimized,
         int Retained,
         int Unsupported,
+        int LimitExceeded,
         int Errors,
         long OriginalBytes,
         long OutputBytes,
@@ -568,11 +574,13 @@ namespace PdfNetStack.Cli
                     case "--preset": o = Preset(o, Value(args, ref i)); break;
                     case "--min-ssim": o = o with { MinImageSsim = double.Parse(Value(args, ref i), CultureInfo.InvariantCulture) }; break;
                     case "--progressive": o = o with { ProgressiveJpeg = true }; break;
+                    case "--sequential": o = o with { ProgressiveJpeg = false }; break;
                     case "--no-verify": o = o with { Verify = false }; break;
                     case "--allow-incremental": o = o with { AllowIncrementalUpdates = true }; break;
                     case "--allow-repaired": o = o with { AllowRepairedFiles = true }; break;
                     case "--strip-thumbnails": o = o with { RemovePageThumbnails = true }; break;
                     case "--strip-pieceinfo": o = o with { RemovePieceInfo = true }; break;
+                    case "--remove-usage-rights": o = o with { RemoveUsageRights = true }; break;
                     case "--min-saving": o = o with { MinSavingPercent = double.Parse(Value(args, ref i), CultureInfo.InvariantCulture) }; break;
                     case "--threads":
                         o = o with { MaxDegreeOfParallelism = int.Parse(Value(args, ref i), CultureInfo.InvariantCulture) };

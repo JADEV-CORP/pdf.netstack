@@ -37,17 +37,17 @@ public static partial class PdfOptimizer
 
         public long Length { get; }
 
-        public PdfFile Open(long decodeLimit) => _stream is null ? PdfFile.Open(_memory, decodeLimit) : PdfFile.Open(_stream, decodeLimit);
+        public PdfFile Open(long decodeLimit, ResourceBudget budget) => _stream is null ? PdfFile.Open(_memory, decodeLimit, budget) : PdfFile.Open(_stream, decodeLimit, budget);
 
-        /// <summary>The file's SHA-256, and whether it holds a signature's /ByteRange, from one read of the file.</summary>
-        public (string Hash, bool Signed) Scan(CancellationToken ct)
+        /// <summary>The file's SHA-256, and how many signature /ByteRange keys it holds, from one read of the file.</summary>
+        public (string Hash, int ByteRanges) Scan(CancellationToken ct)
         {
-            if (_stream is null) return (Sha256Hex(_memory.Span), _memory.Span.IndexOf("/ByteRange"u8) >= 0);
+            if (_stream is null) return (Sha256Hex(_memory.Span), UsageRights.CountByteRanges(_memory.Span));
 
             ReadOnlySpan<byte> marker = "/ByteRange"u8;
             using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
             byte[] buffer = new byte[1 << 20];
-            bool signed = false;
+            int byteRanges = 0;
             int carry = 0;
             _stream.Position = 0;
             while (true)
@@ -57,14 +57,14 @@ public static partial class PdfOptimizer
                 if (read == 0) break;
                 hash.AppendData(buffer, carry, read);
                 int filled = carry + read;
-                signed = signed || buffer.AsSpan(0, filled).IndexOf(marker) >= 0;
+                byteRanges += UsageRights.CountByteRanges(buffer.AsSpan(0, filled));
 
-                // The end of this read may hold the start of the marker.
+                // The end of this read may hold the start of the marker, never a whole one.
                 carry = Math.Min(marker.Length - 1, filled);
                 Buffer.BlockCopy(buffer, filled - carry, buffer, 0, carry);
             }
 
-            return (Compat.ToHex(hash.GetHashAndReset()).ToLowerInvariant(), signed);
+            return (Compat.ToHex(hash.GetHashAndReset()).ToLowerInvariant(), byteRanges);
         }
 
         public void CopyTo(Stream output, CancellationToken ct)
@@ -101,17 +101,20 @@ public static partial class PdfOptimizer
         int PageCount,
         OptimizationStatistics? Statistics,
         string CandidateSha256 = "",
-        long CandidateLength = 0);
+        long CandidateLength = 0)
+    {
+        public IReadOnlyList<PdfDiagnostic> Diagnostics { get; init; } = [];
+    }
 
     /// <summary>Streaming mode for a source in memory or on a seekable stream, to any output.</summary>
     private static PdfOptimizationResult OptimizeStreaming(Source source, Stream output, PdfOptimizerOptions options, CancellationToken ct)
     {
         var clock = Stopwatch.StartNew();
-        (string sourceHash, bool signed) = source.Scan(ct);
+        (string sourceHash, int byteRanges) = source.Scan(ct);
         StreamedOutcome outcome;
         using (FileStream candidate = TemporaryFile())
         {
-            outcome = RunStreaming(source, signed, candidate, options, ct);
+            outcome = RunStreaming(source, byteRanges, candidate, options, ct);
             if (outcome.Rewritten)
             {
                 candidate.Position = 0;
@@ -142,11 +145,11 @@ public static partial class PdfOptimizer
             }
 
             var source = new Source(spool ?? input);
-            (string sourceHash, bool signed) = source.Scan(ct);
+            (string sourceHash, int byteRanges) = source.Scan(ct);
             StreamedOutcome outcome;
             using (FileStream candidate = TemporaryFile())
             {
-                outcome = RunStreaming(source, signed, candidate, options, ct);
+                outcome = RunStreaming(source, byteRanges, candidate, options, ct);
                 if (outcome.Rewritten)
                 {
                     candidate.Position = 0;
@@ -181,8 +184,8 @@ public static partial class PdfOptimizer
             using (var candidate = new FileStream(temp, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None, 1 << 16))
             {
                 var from = new Source(input);
-                (string sourceHash, bool signed) = from.Scan(ct);
-                StreamedOutcome outcome = RunStreaming(from, signed, candidate, options, ct);
+                (string sourceHash, int byteRanges) = from.Scan(ct);
+                StreamedOutcome outcome = RunStreaming(from, byteRanges, candidate, options, ct);
                 if (!outcome.Rewritten)
                 {
                     candidate.SetLength(0);
@@ -205,9 +208,10 @@ public static partial class PdfOptimizer
     private static PdfOptimizationResult StreamedResult(StreamedOutcome outcome, long inputLength, string sourceHash, TimeSpan elapsed)
     {
         OptimizationStatistics stats = (outcome.Statistics ?? OptimizationStatistics.Empty(TimeSpan.Zero)) with { Elapsed = elapsed, Streamed = true };
-        return outcome.Rewritten
+        PdfOptimizationResult result = outcome.Rewritten
             ? new PdfOptimizationResult(outcome.Disposition, inputLength, outcome.CandidateLength, sourceHash, outcome.CandidateSha256, outcome.PageCount, outcome.Reason, stats)
             : new PdfOptimizationResult(outcome.Disposition, inputLength, inputLength, sourceHash, sourceHash, outcome.PageCount, outcome.Reason, stats);
+        return result with { Diagnostics = outcome.Diagnostics };
     }
 
     /// <summary>A temporary file for a spooled input or a rewrite, deleted when closed.</summary>
@@ -220,21 +224,37 @@ public static partial class PdfOptimizer
     /// <paramref name="candidate"/>, an empty, readable and seekable stream, and proven by reading
     /// it back; the outcome says whether it is to be delivered.
     /// </summary>
-    private static StreamedOutcome RunStreaming(Source source, bool signed, Stream candidate, PdfOptimizerOptions options, CancellationToken ct)
+    private static StreamedOutcome RunStreaming(Source source, int byteRanges, Stream candidate, PdfOptimizerOptions options, CancellationToken ct)
     {
         if (source.Length > options.MaxInputBytes)
         {
             return new StreamedOutcome(OptimizationDisposition.UnsupportedRetained, false, "Input exceeds the configured size limit.", 0, null);
         }
 
+        // The rewrite lives in the candidate file, so there is no lossless result to fall back
+        // on: a run out of time writes the input.
+        using var guard = new RunGuard(options.Limits, source.Length, Deadline.Start(options.Limits), ct, options.Workers);
+        StreamedOutcome outcome = RunStreaming(source, byteRanges, candidate, options, guard);
+        return outcome with { Diagnostics = guard.Diagnostics };
+    }
+
+    private static StreamedOutcome RunStreaming(Source source, int byteRanges, Stream candidate, PdfOptimizerOptions options, RunGuard guard)
+    {
+        if (source.Length > options.Limits.MaxInputBytes)
+        {
+            return new StreamedOutcome(OptimizationDisposition.LimitExceeded, false, guard.InputTooLarge(), 0, null);
+        }
+
+        CancellationToken ct = guard.Token;
         PdfFile file;
         try
         {
-            file = source.Open(options.MaxDecodedStreamBytes);
+            file = source.Open(options.MaxDecodedStreamBytes, guard.Budget);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (Exception ex) when (guard.Failure(ex) is { } failure)
         {
-            return new StreamedOutcome(OptimizationDisposition.UnsupportedRetained, false, "Not a readable PDF: " + ex.Message, 0, null);
+            return new StreamedOutcome(failure.Disposition == OptimizationDisposition.OriginalRetained ? OptimizationDisposition.UnsupportedRetained : failure.Disposition, false,
+                failure.Disposition == OptimizationDisposition.OriginalRetained ? "Not a readable PDF: " + ex.Message : failure.Reason, 0, null);
         }
 
         int pageCount = 0;
@@ -242,8 +262,9 @@ public static partial class PdfOptimizer
         var timings = new PhaseTimings();
         try
         {
-            pageCount = CountPages(file);
-            if (Unsupported(file, signed, options) is { } unsupported)
+            pageCount = CountPages(file, guard.Budget.Diagnostics);
+            bool usageRightsRemoved = options.RemoveUsageRights && UsageRights.Remove(file, byteRanges);
+            if (Unsupported(file, byteRanges > 0 && !usageRightsRemoved, options) is { } unsupported)
             {
                 return Retained(OptimizationDisposition.UnsupportedRetained, unsupported);
             }
@@ -255,7 +276,10 @@ public static partial class PdfOptimizer
             }
 
             bool pdfA1 = IsPdfA1(file, options.MaxDecodedStreamBytes);
-            int stripped = graph.StrippedEntries;
+            bool objectStreams = options.UseObjectStreams && !pdfA1;
+            string version = OutputVersion(file.HeaderVersion, objectStreams);
+            bool progressive = options.ProgressiveJpeg && AllowsProgressiveJpeg(version) && (!options.Linearize || AllowsProgressiveJpeg(LinearizedVersion(file.HeaderVersion)));
+            int stripped = graph.StrippedEntries + (usageRightsRemoved ? 1 : 0);
             timings = timings with { Analyze = phase.Elapsed };
             phase.Restart();
 
@@ -285,24 +309,25 @@ public static partial class PdfOptimizer
             var contentKeys = new Dictionary<int, byte[]>();
             if (options.RecompressStreams || compact.Count > 0)
             {
-                JpegSettings? jpeg = options.OptimizeJpegImages ? new JpegSettings(options.JpegQuality, options.ProgressiveJpeg, options.MinImageSsim) : null;
+                JpegSettings? jpeg = options.OptimizeJpegImages ? new JpegSettings(options.JpegQuality, progressive, options.MinImageSsim) : null;
                 ImageSettings? images = options.MaxImageDpi is not null || options.MaxBilevelImageDpi is not null || options.ConvertImagesToJpeg || options.QuantizeImages
-                    ? new ImageSettings(options.MaxImageDpi, options.ConvertImagesToJpeg, options.JpegQuality, options.MinImageSsim, options.ProgressiveJpeg) { Quantize = options.QuantizeImages, MaxBilevelDpi = options.MaxBilevelImageDpi }
+                    ? new ImageSettings(options.MaxImageDpi, options.ConvertImagesToJpeg, options.JpegQuality, options.MinImageSsim, progressive) { Quantize = options.QuantizeImages, MaxBilevelDpi = options.MaxBilevelImageDpi }
                     : null;
-                var scope = new RecompressionScope(options.RecompressStreams, compact, encoded, options.DeduplicateObjects);
+                var scope = new RecompressionScope(options.RecompressStreams, compact, encoded, options.DeduplicateObjects) { KeepMetadataUnfiltered = pdfA1 || options.KeepMetadataUnfiltered };
                 work = StreamRecompressor.Prepare(file, graph, scope, options.ZlibLevel, options.Compression == CompressionEffort.Exhaustive, options.UseImagePredictors,
                     options.OptimizeBilevelImages, jpeg, images, options.MaxDecodedStreamBytes, ct);
-                if (options.DeduplicateObjects) contentKeys = ContentKeys(work, options.MaxDegreeOfParallelism, ct);
+                if (options.DeduplicateObjects) contentKeys = ContentKeys(work, options.Workers, ct);
             }
 
             timings = timings with { Recompress = phase.Elapsed };
             phase.Restart();
 
+            // The obsolete XObject /Name is ignored when merging, unless the output stays PDF 1.0.
             Dictionary<int, int> representative;
-            int merged = 0;
+            int merged = 0, namesRemoved = 0;
             if (options.DeduplicateObjects)
             {
-                (representative, merged) = Deduplicator.Run(file, graph, contentKeys, ct);
+                (representative, merged, namesRemoved) = Deduplicator.Run(file, graph, contentKeys, ignoreXObjectNames: version != "1.0", ct);
             }
             else
             {
@@ -335,16 +360,15 @@ public static partial class PdfOptimizer
 
             if (file.Resolve(file.Trailer["ID"]) is PdfArray id) trailer.Set("ID", id);
 
-            bool objectStreams = options.UseObjectStreams && !pdfA1;
-            var settings = new WriterSettings(objectStreams, options.ObjectsPerStream,
-                OutputVersion(file.HeaderVersion, objectStreams), options.ZlibLevel)
+            var settings = new WriterSettings(objectStreams, options.ObjectsPerStream, version, options.ZlibLevel)
             {
                 Exhaustive = options.Compression == CompressionEffort.Exhaustive,
+                Parallelism = options.Workers,
             };
 
             Func<int, PdfStream, PdfStream>? rewrite = work is null
                 ? null
-                : new BatchedRewrite(work, objects, sourceNumbers, options.MaxDegreeOfParallelism, ct).Rewrite;
+                : new BatchedRewrite(work, objects, sourceNumbers, options.Workers, ct).Rewrite;
             string candidateHash;
             long candidateLength;
             using (var hashing = new HashingStream(candidate))
@@ -402,7 +426,7 @@ public static partial class PdfOptimizer
                 // A second reader over the source that has parsed nothing yet sees the file as it
                 // is, whatever the passes did to this reader's objects.
                 PdfFile reference = file.Fork();
-                PdfFile written = PdfFile.Open(candidate, options.MaxDecodedStreamBytes);
+                PdfFile written = PdfFile.Open(candidate, options.MaxDecodedStreamBytes, guard.Budget);
                 if (written.WasReconstructed || written.LengthsRepaired > 0)
                 {
                     return new StreamedOutcome(OptimizationDisposition.OriginalRetained, false, "Verification failed: output is not well formed.", pageCount, stats);
@@ -411,6 +435,7 @@ public static partial class PdfOptimizer
                 var ignored = new List<string>();
                 if (options.RemovePageThumbnails) ignored.Add("Thumb");
                 if (options.RemovePieceInfo) ignored.Add("PieceInfo");
+                if (usageRightsRemoved) ignored.Add("Perms");
                 var rules = new VerificationRules
                 {
                     IgnoredSourceKeys = ignored,
@@ -421,9 +446,10 @@ public static partial class PdfOptimizer
                     AllowContentCompaction = compact.Count > 0,
                     AllowFontMerging = fontsMerged > 0,
                     AllowBilevelRecoding = recompressed.Group4 > 0,
+                    AllowXObjectNameRemoval = namesRemoved > 0,
                 };
                 string? difference = EquivalenceVerifier.Verify(reference, written, rules, options.MaxDecodedStreamBytes,
-                    options.MaxDegreeOfParallelism, ct, out int compared);
+                    options.Workers, ct, out int compared);
 
                 // Stream lengths are checked as the proof parses each stream of the output.
                 if (difference is null && written.LengthsRepaired > 0) difference = "output is not well formed";
@@ -435,11 +461,13 @@ public static partial class PdfOptimizer
                 stats = stats with { ObjectsVerified = compared, Phases = timings with { Verify = phase.Elapsed } };
             }
 
-            return new StreamedOutcome(OptimizationDisposition.Optimized, true, Reason(options, recompressed), pageCount, stats, candidateHash, candidateLength);
+            string reason = Reason(options, recompressed);
+            if (usageRightsRemoved) reason += " Usage rights removed.";
+            return new StreamedOutcome(OptimizationDisposition.Optimized, true, reason, pageCount, stats, candidateHash, candidateLength);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (Exception ex) when (guard.Failure(ex) is { } failure)
         {
-            return Retained(OptimizationDisposition.OriginalRetained, $"Rewrite failed ({ex.GetType().Name}): {ex.Message}");
+            return Retained(failure.Disposition, failure.Reason);
         }
 
         StreamedOutcome Retained(OptimizationDisposition disposition, string reason) => new(disposition, false, reason, pageCount, null);

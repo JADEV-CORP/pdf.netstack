@@ -110,7 +110,8 @@ public sealed record PdfOptimizerOptions
 
     /// <summary>
     /// Merge identical fonts, images and other resources. Streams are compared by what they decode
-    /// to, so copies encoded differently merge too. Default true.
+    /// to, so copies encoded differently merge too, and so do images and forms that differ only by
+    /// the /Name entry readers have ignored since PDF 1.0. Default true.
     /// </summary>
     public bool DeduplicateObjects { get; init; } = true;
 
@@ -244,10 +245,13 @@ public sealed record PdfOptimizerOptions
     /// <summary>
     /// Also write JPEG images progressively (spectral selection and successive approximation, as
     /// libjpeg's default progression) and keep that coding when it is smaller than optimized
-    /// sequential coding. Applies to every JPEG the optimizer writes, lossless or not. The decoded
-    /// image is the same either way. Default false. Requires <see cref="RecompressStreams"/>.
+    /// sequential coding, as it is for most photographs. Applies to every JPEG the optimizer
+    /// writes, lossless or not. The decoded image is the same either way, and the proof compares
+    /// DCT coefficients. Progressive JPEG needs PDF 1.3, so output that stays at an earlier version
+    /// gets sequential coding only; arithmetic coding, which some readers lack, is never used.
+    /// Has no effect without <see cref="RecompressStreams"/>. Default true.
     /// </summary>
-    public bool ProgressiveJpeg { get; init; }
+    public bool ProgressiveJpeg { get; init; } = true;
 
     /// <summary>
     /// Re-read the candidate and prove it equivalent to the source before returning it.
@@ -276,8 +280,72 @@ public sealed record PdfOptimizerOptions
     /// </summary>
     public bool RemovePieceInfo { get; init; }
 
-    /// <summary>Worker threads for compression and verification. Default: processor count.</summary>
+    /// <summary>
+    /// Remove usage rights (/Perms /UR3, or /UR in older files): the signature with which Adobe
+    /// Reader enables features such as saving filled forms. A rewrite changes the signed bytes, so
+    /// such a file is otherwise left as it is; with this option it is rewritten without them, and
+    /// Reader opens it as a plain PDF instead of warning that the features are no longer available.
+    /// Files that also carry a certification or another signature are still left as they are.
+    /// Default false.
+    /// </summary>
+    public bool RemoveUsageRights { get; init; }
+
+    /// <summary>
+    /// Worker threads for compression and verification, at most. Default: processor count. Fewer
+    /// run when memory is short: each worker can hold several streams of up to
+    /// <see cref="MaxDecodedStreamBytes"/>, so the count is also capped by half the memory the
+    /// runtime reports available (a container's limit included) divided by three such streams.
+    /// </summary>
     public int MaxDegreeOfParallelism { get; init; } = Environment.ProcessorCount;
+
+    /// <summary>
+    /// Ceilings on the work one optimization may cause, all passes together: input size, decoded
+    /// bytes, image pixels, content operators and time. A run that reaches one writes the input
+    /// unchanged with <see cref="OptimizationDisposition.LimitExceeded"/>; when time runs out
+    /// during lossy image work, the lossless rewrite is written instead (in memory; streaming mode
+    /// writes the input). <see cref="MaxInputBytes"/> applies as well. Default <see cref="PdfLimits.Default"/>.
+    /// </summary>
+    public PdfLimits Limits { get; init; } = PdfLimits.Default;
+
+    /// <summary>
+    /// Leave every unfiltered metadata stream unfiltered, not only in PDF/A-1. Set when a document
+    /// is saved as PDF/A, whose XMP packet the archive writer leaves uncompressed on purpose so
+    /// archival tools read it without decoding.
+    /// </summary>
+    internal bool KeepMetadataUnfiltered { get; init; }
+
+    /// <summary>True when some option may change images lossily.</summary>
+    internal bool IsLossy => JpegQuality is not null || MaxImageDpi is not null || MaxBilevelImageDpi is not null || ConvertImagesToJpeg || QuantizeImages;
+
+    /// <summary>These options with every lossy image change turned off.</summary>
+    internal PdfOptimizerOptions Lossless => this with
+    {
+        JpegQuality = null,
+        MaxImageDpi = null,
+        MaxBilevelImageDpi = null,
+        ConvertImagesToJpeg = false,
+        QuantizeImages = false,
+        MinImageSsim = null,
+    };
+
+    /// <summary>
+    /// Workers that fit in memory: half of what the runtime reports available, three streams at
+    /// the decode ceiling each, and never more than asked.
+    /// </summary>
+    internal int Workers
+    {
+        get
+        {
+#if NET8_0_OR_GREATER
+            long available = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes;
+            if (available <= 0) return MaxDegreeOfParallelism;
+            long perWorker = Math.Max(1, 3 * MaxDecodedStreamBytes);
+            return (int)Math.Max(1, Math.Min(MaxDegreeOfParallelism, available / 2 / perWorker));
+#else
+            return MaxDegreeOfParallelism;
+#endif
+        }
+    }
 
     internal CompressionLevel ZlibLevel => Compression switch
     {
@@ -306,10 +374,12 @@ public sealed record PdfOptimizerOptions
         if (MaxImageDpi is not null && !RecompressStreams) throw new ArgumentException("MaxImageDpi needs RecompressStreams enabled.", nameof(MaxImageDpi));
         if (MaxBilevelImageDpi is not null && !RecompressStreams) throw new ArgumentException("MaxBilevelImageDpi needs RecompressStreams enabled.", nameof(MaxBilevelImageDpi));
         if (QuantizeImages && !RecompressStreams) throw new ArgumentException("QuantizeImages needs RecompressStreams enabled.", nameof(QuantizeImages));
-        if (ProgressiveJpeg && !RecompressStreams) throw new ArgumentException("ProgressiveJpeg needs RecompressStreams enabled.", nameof(ProgressiveJpeg));
         if (ConvertImagesToJpeg && (JpegQuality is null || !RecompressStreams))
         {
             throw new ArgumentException("ConvertImagesToJpeg needs JpegQuality set and RecompressStreams enabled.", nameof(ConvertImagesToJpeg));
         }
+
+        if (Limits is null) throw new ArgumentNullException(nameof(Limits));
+        Limits.Validate();
     }
 }

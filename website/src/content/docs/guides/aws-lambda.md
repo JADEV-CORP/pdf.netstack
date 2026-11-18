@@ -23,7 +23,7 @@ the options once and share them: every invocation the instance serves uses them.
 ```
 
 A complete function with an S3 trigger, a function URL and a SAM template is in
-[samples/serverless/aws-lambda](https://github.com/jams4code/pdf.netstack/tree/main/samples/serverless/aws-lambda).
+[samples/serverless/aws-lambda](https://github.com/JADEV-CORP/pdf.netstack/tree/main/samples/serverless/aws-lambda).
 
 ## Native AOT
 
@@ -63,10 +63,15 @@ The library itself writes nothing to disk unless you give it a path or a stream.
 
 - Lambda gives one vCPU at 1,769 MB of memory and more above. The optimizer recompresses streams
   on every core it gets (`MaxDegreeOfParallelism`), so more memory also means shorter runs.
-- With `Streaming`, the optimizer's memory stays flat whatever the file size (a generated 278 MB
-  file peaked at about 460 MB of working set), and `/tmp` holds about three times the file. Check
-  the size in the S3 event before downloading, and set `MaxInputBytes` and `EphemeralStorage` to
-  match. Without `Streaming`, plan for about ten times the file size in memory.
+- With `Streaming`, the file itself stays out of memory (a generated 278 MB file peaked at about
+  460 MB of working set), and `/tmp` holds about three times the file. Memory still follows the
+  objects and the streams being recompressed, so image heavy files need room in that mode too.
+  Check the size in the S3 event before downloading, and set `MaxInputBytes` and
+  `EphemeralStorage` to match. Without `Streaming`, size the function for the document plus
+  about three times the largest decoded stream per worker, see
+  [Memory and performance](/concepts/memory-and-performance/#workers-and-the-decoded-size). From
+  1.3 the optimizer runs fewer workers when the function has little memory, and
+  `PdfLimits.Untrusted` bounds what a file from a user may cost.
 - HTML conversion of invoices and reports fits in 512 MB; 1,024 MB converts faster for the CPU.
   `MaxPages` bounds the output.
 - A synchronous response is at most 6 MB, base64 encoded for binary bodies. Write larger PDFs to

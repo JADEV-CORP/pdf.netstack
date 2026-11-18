@@ -89,6 +89,20 @@ public sealed record PdfLoadOptions
     /// </summary>
     public string? TempDirectory { get; init; }
 
+    /// <summary>
+    /// Ceilings on the work the whole document may cause: input size, decoded bytes and image
+    /// pixels in total, content operators, text per page and time per call. Default
+    /// <see cref="PdfLimits.Default"/>; use <see cref="PdfLimits.Untrusted"/> for files from users of a service.
+    /// </summary>
+    public PdfLimits Limits { get; init; } = PdfLimits.Default;
+
+    /// <summary>
+    /// Called with each warning as it is added to <see cref="PdfDocument.Diagnostics"/>: a limit
+    /// reached, something skipped, a repair. It runs on the thread doing the work, during the
+    /// call that found the problem, and must not throw. Null, the default, only collects them.
+    /// </summary>
+    public Action<PdfDiagnostic>? OnWarning { get; init; }
+
     internal void Validate()
     {
         if (MaxDecodedStreamBytes <= 0) throw new ArgumentOutOfRangeException(nameof(MaxDecodedStreamBytes));
@@ -96,6 +110,8 @@ public sealed record PdfLoadOptions
         if (Mode is not (PdfLoadMode.InMemory or PdfLoadMode.OnDemand)) throw new ArgumentOutOfRangeException(nameof(Mode));
         if (SpoolThreshold < 0) throw new ArgumentOutOfRangeException(nameof(SpoolThreshold));
         if (TempDirectory is { Length: 0 }) throw new ArgumentException("The temporary folder must not be empty; null uses the system's.", nameof(TempDirectory));
+        if (Limits is null) throw new ArgumentNullException(nameof(Limits));
+        Limits.Validate();
     }
 
     // The password stays out of logs that print the options.
@@ -107,6 +123,8 @@ public sealed record PdfLoadOptions
         builder.Append(", Mode = ").Append(Mode);
         builder.Append(", SpoolThreshold = ").Append(SpoolThreshold);
         builder.Append(", TempDirectory = ").Append(TempDirectory ?? "null");
+        builder.Append(", Limits = ").Append(Limits);
+        builder.Append(", OnWarning = ").Append(OnWarning is null ? "null" : "(set)");
         return true;
     }
 }

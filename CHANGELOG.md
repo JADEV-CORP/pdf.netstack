@@ -1,5 +1,121 @@
 # Changelog
 
+## 1.3.0 (unreleased)
+
+- `PdfLimits` bounds the work a whole document may cause; until now every limit applied to one
+  object at a time. It covers the input size, decoded bytes and image pixels in total, content
+  operators, characters per page and time per call. By default the totals scale with the file
+  (1 GiB plus 4096 bytes per input byte decoded, 2^30 pixels plus 4096 per byte) and ordinary
+  documents never reach them. `PdfLimits.Untrusted` is for files from users of a service: 256 MiB
+  of input, 1 GiB decoded, 2^29 pixels, 25 million operators, 250,000 characters a page and 60
+  seconds a call. Set it through `PdfLoadOptions.Limits`, `PdfOptimizerOptions.Limits` and
+  `PdfInspector.Inspect(input, limits)`. Limits are checked before the memory they guard is
+  allocated. An open document spends its budgets over its whole life: text read twice is decoded
+  twice.
+- `PdfDocument.Diagnostics` and `PdfLoadOptions.OnWarning` report limits reached, damaged parts
+  skipped and repairs made. `PdfInspection.Diagnostics` and `PdfOptimizationResult.Diagnostics` do
+  the same. When a budget runs out, a page reads and draws nothing more and an image raises
+  `PdfLimitExceededException`; the diagnostics say which limit was reached.
+- `PdfException` is the base of `PdfFormatException` and `PdfPasswordException`. The new
+  `PdfLimitExceededException` derives from `PdfFormatException` and names the limit in `Limit`.
+- The optimizer adds `OptimizationDisposition.LimitExceeded` and no longer catches
+  `OutOfMemoryException`, which before came back as `OriginalRetained` with a "Rewrite failed"
+  reason. With a `Timeout` and lossy options, the lossless rewrite is kept when time runs out
+  during lossy work.
+- Fixed: content nested past the depth limit took time quadratic in its length (a 940 byte file
+  took 87 s); pages of 128 to 256 MiB of content extracted empty; `PdfInspector.PageCount` and the
+  optimizer trusted `/Count`; a page tree nested thousands deep made the optimizer allocate 95 GB;
+  a raw image over the decode ceiling was decoded before being refused; ToUnicode destinations are
+  cut at 512 bytes.
+- Fixed: saving an object built in code and nested deeper than any reader accepts could overflow
+  the stack. The writer now refuses it with `InvalidOperationException`.
+- Large decode buffers are no longer kept in the shared array pool after a call: an image heavy
+  optimization held 1.3 GB after returning, now 25 MB. The optimizer's default worker count follows
+  the memory the runtime reports, a container's limit included: at most half of it divided by
+  three streams of `MaxDecodedStreamBytes`.
+- `CancellationToken` overloads for `PdfPage.ExtractText`, `GetWords`, `GetLetters`, `GetImages`,
+  `PdfPageImage.Decode`, `Pages.Import`, `PdfDocument.Merge`, `Split`, `FlattenAnnotations`,
+  `Save(Stream)`, `ToArray`, `PdfAcroForm.Flatten`, `PdfSigner.Sign`, `Verify` and
+  `AddValidationData`. The existing overloads behave as before. Content is checked every 256
+  operators and inside the JPEG, JPEG 2000, JBIG2 and CCITT decoders. A cancelled import leaves the
+  target document as it was.
+- `PdfProgress` reports progress through `IProgress<PdfProgress>` from `Merge`, `Split`,
+  `SplitTo`, `FlattenAnnotations` and `MergeAsync`.
+- Merge, split, `ExtractPages` and page import keep tagged PDFs tagged. The structure elements of
+  the copied pages come along with remapped parent tree keys, marked content and object
+  references, and a merged role map, class map and ID tree; clashing names and IDs are renamed.
+  `/MarkInfo` is kept, and `/Lang` goes on the document or on the copied top elements when sources
+  differ. Before, the result was untagged.
+- `PdfDocument.MergeAsync(inputs, output, options, progress, ct)` merges streams holding one input
+  at a time, opened on demand and disposed once read unless `PdfMergeOptions.LeaveInputsOpen` is
+  set.
+- `PdfDocument.SplitTo` and `SplitToAsync` write each page to a stream of the caller's, disposing it
+  before the next. `ExtractPages(start, count)` and, on .NET 8 and later, `ExtractPages(Range)` copy
+  pages into a new document.
+- `PdfAcroForm.Fill(values, flatten)` sets fields by name in one call and checks everything first:
+  unknown names, read only fields and values a field does not take throw one `ArgumentException`
+  listing every problem, and nothing changes. `TryGetField<T>` finds a field of a given kind
+  without a cast.
+- `PdfOptimizerOptions.RemoveUsageRights` and `--remove-usage-rights` rewrite a form whose only
+  signature is Adobe Reader usage rights, and remove them. Off by default.
+- Fixed: a file whose cross-reference stream lists itself at a wrong offset was reported as
+  repaired.
+- XMP metadata is compressed unless the file is PDF/A-1, the only part that forbids a filter on it
+  (ISO 19005-1, 6.7.2). PDF/A that `PdfDocument` saves keeps its XMP uncompressed. A CDC MMWR issue
+  goes from 406 KB to 257 KB.
+- Deduplication ignores the `/Name` of image and form XObjects, which only PDF 1.0 required. Copies
+  that differ only by it merge, and a merged XObject whose copies were named differently is written
+  without it; the proof allows exactly that. qpdf's inline-images test file goes from 270 KB to
+  163 KB.
+- Images that already carry a PNG or TIFF predictor get the smallest of three encodings: the
+  producer's predictor, no predictor, or PNG prediction chosen again row by row.
+- Object streams keep alike objects together and number them in packing order: object streams 6%
+  smaller, the cross-reference stream 27% smaller.
+- `ProgressiveJpeg` now defaults to true: a JPEG is written progressively when that is smaller,
+  with the same coefficients and the same proof. Output below PDF 1.3 stays sequential.
+  `--sequential` or `ProgressiveJpeg = false` turns it off. Without `RecompressStreams` it no
+  longer throws. `--progressive` is still accepted and does nothing.
+- PNG prediction uses 128 bit vectors on .NET 8 and later: the same bytes, 25 to 39 times faster.
+  Predicted rows are deflated as they are made, and object streams are compressed in parallel; the
+  output is the same file.
+- Lossless recompression is bounded by each stream's expected decoded size, and one memory budget,
+  half of what the runtime reports available, bounds every optimization running in the process.
+- `Optimize(byte[])` and `OptimizeAsync` write the rewrite without extra copies.
+- Behaviour changes in the optimizer's output: object numbering in compact files differs from the
+  input order; an XObject `/Name` can disappear; metadata is compressed in PDF/A-2 and later
+  inputs.
+- Library defaults on the public 77 file corpus: {{1.2.0 saving}} before, {{1.3.0 saving}} after,
+  from the 1.3 CI comparison report.
+- `PdfNetStack.Html`: selector matching uses an ancestor Bloom filter, so 313 KB of descendant
+  selectors went from 82 s to 2 s. Custom properties are shared between elements: 4,000 properties
+  on 60,000 elements went from 6.7 GB to 0.3 GB allocated.
+- `HtmlConverterOptions.MaxStyleWork` and `MaxLayoutWork` bound style and layout work, scaled with
+  the input by default; going over raises `HtmlConversionException` naming the option.
+- `HtmlConverter.MaxConcurrentConversions` (default: processor count) bounds conversions running at
+  once; async callers wait without holding a thread and can cancel while waiting.
+- `PdfNetStack.Html`: cancellation overloads, `ConvertToDocumentAsync` and
+  `HtmlConverterOptions.ResourceLoaderAsync`. `ConvertToPdfAsync` now honors its token during
+  layout.
+- Fixed in `PdfNetStack.Html`: relative URLs in linked and imported style sheets resolve against
+  the sheet; a logo with a percentage width in a layout table was 0 px wide; floats of a clearfix
+  row vanished at a page break; right to left tables ran their columns from the left;
+  `align=center` carried into nested tables; percentage columns over 100% pushed a column off the
+  page.
+- Changed in `PdfNetStack.Html`: media queries and viewport units see the page area, as Chrome and
+  wkhtmltopdf do, so Bootstrap's 768 px breakpoints no longer apply on A4.
+- `PdfNetStack.Html` was tested on 20 public wkhtmltopdf era templates against Chrome: 10 render
+  the same, 7 with small differences and 3 cut wide tables, which Chrome shrinks to fit and
+  PdfNetStack does not yet.
+- Releases carry build provenance attestations and a CycloneDX SBOM per package. Actions are pinned
+  to commits with job level permissions. Added CodeQL and OpenSSF Scorecard, and SECURITY.md lists
+  supported versions and the disclosure timeline.
+- Fuzzing: a SharpFuzz and libFuzzer harness with an allocation and time oracle for 13 entry
+  points, on pull requests and nightly.
+- The optimizer comparison uses library defaults, the Native AOT tool on one thread and qpdf 12,
+  and checks PDF/A conformance and usage rights.
+- The repository moved to github.com/JADEV-CORP/pdf.netstack, and the package metadata points
+  there. Maintainers are listed in GOVERNANCE.md.
+
 ## 1.2.0 (2026-11-12)
 
 - `PdfOptimizerOptions.MaxBilevelImageDpi` (`--max-bilevel-dpi`) gives bilevel images (raw, CCITT,

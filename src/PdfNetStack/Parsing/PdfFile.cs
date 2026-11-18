@@ -55,9 +55,10 @@ internal sealed class PdfFile
     private const int WindowMargin = 256;
     private const long MaxWindow = 256L << 20;
 
-    private PdfFile(PdfSource source, long decodeLimit)
+    private PdfFile(PdfSource source, long decodeLimit, ResourceBudget? budget)
     {
         _source = source;
+        Budget = budget;
         if (source is MemorySource memory)
         {
             _data = memory.Data;
@@ -69,6 +70,9 @@ internal sealed class PdfFile
     }
 
     public PdfDictionary Trailer { get; private set; }
+
+    /// <summary>The budget every decode of this file is charged to; null decodes without one.</summary>
+    public ResourceBudget? Budget { get; }
 
     public string HeaderVersion { get; private set; } = "1.4";
 
@@ -98,14 +102,14 @@ internal sealed class PdfFile
     /// </summary>
     public int RevisionCount => Math.Max(1, IsLinearized ? XrefSectionCount - 1 : XrefSectionCount);
 
-    public static PdfFile Open(ReadOnlyMemory<byte> data, long decodeLimit) => Open(new MemorySource(data), decodeLimit);
+    public static PdfFile Open(ReadOnlyMemory<byte> data, long decodeLimit, ResourceBudget? budget = null) => Open(new MemorySource(data), decodeLimit, budget);
 
     /// <summary>Opens a file on a seekable stream, reading only what parsing needs.</summary>
-    public static PdfFile Open(Stream stream, long decodeLimit) => Open(new StreamSource(stream), decodeLimit);
+    public static PdfFile Open(Stream stream, long decodeLimit, ResourceBudget? budget = null) => Open(new StreamSource(stream), decodeLimit, budget);
 
-    private static PdfFile Open(PdfSource source, long decodeLimit)
+    private static PdfFile Open(PdfSource source, long decodeLimit, ResourceBudget? budget)
     {
-        var file = new PdfFile(source, decodeLimit);
+        var file = new PdfFile(source, decodeLimit, budget);
         file.ReadHeader();
         bool loaded = file.TryLoadXref(file.HeaderOffset) || (file.HeaderOffset > 0 && file.TryLoadXref(0));
         if (!loaded) file.Reconstruct();
@@ -491,7 +495,7 @@ internal sealed class PdfFile
     /// </summary>
     public PdfFile Fork()
     {
-        var copy = new PdfFile(_source, _decodeLimit)
+        var copy = new PdfFile(_source, _decodeLimit, Budget)
         {
             Trailer = Trailer,
             HeaderVersion = HeaderVersion,
@@ -583,7 +587,25 @@ internal sealed class PdfFile
 
         UsesXrefStreams = true;
         ReadXrefStream(xs, section);
+        CorrectOwnEntry(offset, section);
         return xs.Dictionary;
+    }
+
+    /// <summary>
+    /// Points the xref stream's entry for itself at the offset it was just read from. Some writers
+    /// get that one entry wrong (qpdf's hybrid-xref test file points it at the catalog). Nothing in
+    /// a document refers to its xref stream, so the wrong offset damages nothing, while validating
+    /// it would rebuild a sound file from a scan and report it as repaired.
+    /// </summary>
+    private void CorrectOwnEntry(long offset, Dictionary<int, XrefEntry> section)
+    {
+        (long number, long generation) = ParseAt(offset, _source.Length, (parser, _) =>
+            parser.TryReadInteger(out long n) && parser.TryReadInteger(out long g) ? (n, g) : (-1L, -1L));
+        if (number is <= 0 or > int.MaxValue || generation is < 0 or > int.MaxValue) return;
+        if (section.TryGetValue((int)number, out XrefEntry own) && own.Type == XrefEntryType.InFile && own.Field1 != offset)
+        {
+            section[(int)number] = new XrefEntry(XrefEntryType.InFile, offset, (int)generation);
+        }
     }
 
     private PdfDictionary ReadXrefTable(PdfParser parser, Dictionary<int, XrefEntry> section)
@@ -635,7 +657,7 @@ internal sealed class PdfFile
         if (rowSize == 0) throw new PdfFormatException("Empty /W.");
 
         List<FilterSpec> filters = StreamCodec.GetFilters(d, Resolve);
-        using DecodedStream decoded = StreamCodec.Decode(xs.Data, filters, DecodeDepth.Full, _decodeLimit, Resolve);
+        using DecodedStream decoded = StreamCodec.Decode(xs.Data, filters, DecodeDepth.Full, _decodeLimit, Resolve, Budget);
         if (decoded.Remaining.Count > 0 || decoded.PendingPredictor is not null) throw new PdfFormatException("Undecodable xref stream.");
         ReadOnlySpan<byte> data = decoded.Data.Span;
 
@@ -1116,7 +1138,7 @@ internal sealed class PdfFile
     {
         PdfDictionary d = st.Dictionary;
         byte[] content;
-        using (DecodedStream decoded = StreamCodec.Decode(st.Data, StreamCodec.GetFilters(d, Resolve), DecodeDepth.Full, _decodeLimit, Resolve))
+        using (DecodedStream decoded = StreamCodec.Decode(st.Data, StreamCodec.GetFilters(d, Resolve), DecodeDepth.Full, _decodeLimit, Resolve, Budget))
         {
             if (decoded.Remaining.Count > 0 || decoded.PendingPredictor is not null) throw new PdfFormatException("Undecodable object stream.");
             content = decoded.Data.ToArray();

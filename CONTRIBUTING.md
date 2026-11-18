@@ -9,8 +9,9 @@ PdfNetStack gives .NET developers a PDF toolkit they can use anywhere without li
 
 - **MIT all the way down.** The core package has no dependencies on modern .NET, and every
   dependency of every package is MIT licensed and checked in CI.
-- **Safe on untrusted input.** Hostile files cannot crash the process, exhaust memory beyond the
-  configured limits, or hang it. Bad input is refused, never half processed.
+- **Bounded on untrusted input.** Hostile files must not crash the process, exhaust memory beyond
+  the configured limits, or hang it; a file that does is a bug, reported as the
+  [security policy](SECURITY.md) says. Bad input is refused, never half processed.
 - **Honest about changes.** Lossless operations are proven lossless. Anything that is not lossless
   is opt-in and documented as such.
 - **Broad reach.** One code base for .NET Framework 4.6.2 and later, Mono, Unity and modern .NET.
@@ -55,7 +56,7 @@ add-ons, such as the ONNX Runtime behind OCR.
 You need the .NET 10 SDK. Tests also run on .NET 8, and on Windows on .NET Framework 4.8.
 
 ```bash
-git clone https://github.com/jams4code/pdf.netstack
+git clone https://github.com/JADEV-CORP/pdf.netstack
 cd pdf.netstack
 dotnet build PdfNetStack.sln -c Release
 dotnet test PdfNetStack.sln -c Release

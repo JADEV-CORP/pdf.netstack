@@ -85,7 +85,7 @@ Every feature on this site is in the 1.2 packages on NuGet. To try what is in th
 before the next release, build against a clone of the repository. You need the .NET 10 SDK.
 
 ```bash
-git clone https://github.com/jams4code/pdf.netstack
+git clone https://github.com/JADEV-CORP/pdf.netstack
 dotnet build pdf.netstack/PdfNetStack.sln -c Release
 ```
 
