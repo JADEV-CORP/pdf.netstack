@@ -23,7 +23,7 @@ the options once and share them: every invocation the instance serves uses them.
 ```
 
 A complete function with an S3 trigger, a function URL and a SAM template is in
-[samples/serverless/aws-lambda](https://github.com/jams4code/pdf.netstack/tree/main/samples/serverless/aws-lambda).
+[samples/serverless/aws-lambda](https://github.com/JADEV-CORP/pdf.netstack/tree/main/samples/serverless/aws-lambda).
 
 ## Native AOT
 

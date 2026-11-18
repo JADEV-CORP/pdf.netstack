@@ -21,7 +21,7 @@ files (569 MiB), PdfNetStack 1.0 with default options optimized 1,003 files from
 
 ## Against qpdf and Ghostscript
 
-[tools/compare_optimizers.py](https://github.com/jams4code/pdf.netstack/blob/main/tools/compare_optimizers.py)
+[tools/compare_optimizers.py](https://github.com/JADEV-CORP/pdf.netstack/blob/main/tools/compare_optimizers.py)
 runs every file of the public corpus through PdfNetStack, qpdf, MuPDF and Ghostscript, and
 scores each output against its original:
 
@@ -84,7 +84,7 @@ python tools/compare_optimizers.py --cache artifacts/corpus/files --tool artifac
 ## Public corpus, every release
 
 CI downloads the documents listed in
-[eng/corpus/manifest.json](https://github.com/jams4code/pdf.netstack/blob/main/eng/corpus/manifest.json):
+[eng/corpus/manifest.json](https://github.com/JADEV-CORP/pdf.netstack/blob/main/eng/corpus/manifest.json):
 public domain and openly licensed PDFs such as NIST and NASA publications, arXiv papers,
 government gazettes and test files from other PDF projects. They are never committed. The run
 happens every week, on demand, and for every version tag, when the report is attached to the
@@ -115,7 +115,7 @@ Release 1.1.0, 5 November 2026, on a 4 core Linux runner:
 Zero failures across the 77 documents. The 12 documents kept as they are were signed or encrypted
 files, which the optimizer never rewrites. The report with every document, its time, memory and
 render result is attached to the
-[1.1.0 release](https://github.com/jams4code/pdf.netstack/releases/tag/v1.1.0) as
+[1.1.0 release](https://github.com/JADEV-CORP/pdf.netstack/releases/tag/v1.1.0) as
 `corpus-report.md` and `corpus-report.json`.
 
 To run it yourself:
@@ -180,7 +180,7 @@ The summary prints documents optimized, retained and unsupported, the sizes, the
 throughput and the peak memory. The CSV has one row per document. See [Command line](/cli/#batch).
 
 Then render both sets with PDFium and compare them. The script is
-[tools/render_compare.py](https://github.com/jams4code/pdf.netstack/blob/main/tools/render_compare.py)
+[tools/render_compare.py](https://github.com/JADEV-CORP/pdf.netstack/blob/main/tools/render_compare.py)
 in the repository; PDFium is a development tool here, not a dependency of any package.
 
 ```bash

@@ -4,7 +4,7 @@
 each page, reads it with the PP-OCRv5 models on ONNX Runtime, and lays the words over it as
 invisible text: the page looks the same, and now selects, copies and searches. Latin and Arabic
 script. Built on [PdfNetStack.Ocr](https://www.nuget.org/packages/PdfNetStack.Ocr) by Jamal
-Abdelkhalek at [JADEV](https://github.com/jams4code). MIT licensed.
+Abdelkhalek at [JADEV](https://github.com/JADEV-CORP). MIT licensed.
 
 ```bash
 dotnet tool install -g PdfNetStack.Ocr.Tool
@@ -42,7 +42,7 @@ in the environment for the runtime to send nothing at all.
 
 ## Links
 
-- [Documentation and source](https://github.com/jams4code/pdf.netstack)
-- [OCR guide](https://github.com/jams4code/pdf.netstack/blob/main/docs/OCR.md)
-- [Changelog](https://github.com/jams4code/pdf.netstack/blob/main/CHANGELOG.md)
-- [Report an issue](https://github.com/jams4code/pdf.netstack/issues)
+- [Documentation and source](https://github.com/JADEV-CORP/pdf.netstack)
+- [OCR guide](https://github.com/JADEV-CORP/pdf.netstack/blob/main/docs/OCR.md)
+- [Changelog](https://github.com/JADEV-CORP/pdf.netstack/blob/main/CHANGELOG.md)
+- [Report an issue](https://github.com/JADEV-CORP/pdf.netstack/issues)

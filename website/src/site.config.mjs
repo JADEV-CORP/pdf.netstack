@@ -16,7 +16,7 @@ export const BASE = process.env.DOCS_BASE ?? '/pdfnetstack';
  */
 export const PRELAUNCH = false;
 
-export const REPO = 'https://github.com/jams4code/pdf.netstack';
+export const REPO = 'https://github.com/JADEV-CORP/pdf.netstack';
 export const NUGET = 'https://www.nuget.org/packages/PdfNetStack';
 export const CORP = 'https://www.jadev-corp.com';
 export const ORG_ID = 'https://www.jadev-corp.com/#organization';

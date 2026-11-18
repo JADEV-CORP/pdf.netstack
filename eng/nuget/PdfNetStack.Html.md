@@ -198,8 +198,8 @@ so no style value stops a conversion.
 
 ## Links
 
-- Project and documentation: https://github.com/jams4code/pdf.netstack
-- Roadmap: https://github.com/jams4code/pdf.netstack/blob/main/docs/ROADMAP.md
-- Changelog: https://github.com/jams4code/pdf.netstack/blob/main/CHANGELOG.md
+- Project and documentation: https://github.com/JADEV-CORP/pdf.netstack
+- Roadmap: https://github.com/JADEV-CORP/pdf.netstack/blob/main/docs/ROADMAP.md
+- Changelog: https://github.com/JADEV-CORP/pdf.netstack/blob/main/CHANGELOG.md
 
 By Jamal Abdelkhalek, [JADEV](https://jadev-corp.com). MIT license.

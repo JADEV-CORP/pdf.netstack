@@ -28,7 +28,7 @@ PdfNetStack is created and maintained by [Jamal Abdelkhalek](https://www.jadev-c
 [JADEV](https://www.jadev-corp.com/en). The packages on NuGet are published by
 the `jadev` account.
 
-- Source and issues: [github.com/jams4code/pdf.netstack](https://github.com/jams4code/pdf.netstack)
+- Source and issues: [github.com/JADEV-CORP/pdf.netstack](https://github.com/JADEV-CORP/pdf.netstack)
 - Packages: [PdfNetStack on NuGet](https://www.nuget.org/packages/PdfNetStack)
 - Company: [jadev-corp.com](https://www.jadev-corp.com/en)
 
@@ -48,13 +48,13 @@ and PDFium also serve as reference implementations in the test suite, where outp
 No source code from any of these projects is included. The few third party data tables the
 library uses, such as the Unicode character data and the Adobe Glyph List, are listed with their
 licenses in
-[THIRD-PARTY-NOTICES.md](https://github.com/jams4code/pdf.netstack/blob/main/THIRD-PARTY-NOTICES.md).
+[THIRD-PARTY-NOTICES.md](https://github.com/JADEV-CORP/pdf.netstack/blob/main/THIRD-PARTY-NOTICES.md).
 Product names are trademarks of their respective owners and are mentioned for reference only,
 without affiliation or endorsement. PdfNetStack is not related to the PDFNet SDK of Apryse.
 
 ## License
 
-MIT. See [LICENSE](https://github.com/jams4code/pdf.netstack/blob/main/LICENSE). On .NET 8 and
+MIT. See [LICENSE](https://github.com/JADEV-CORP/pdf.netstack/blob/main/LICENSE). On .NET 8 and
 later the core package has no dependencies; on .NET Standard 2.0 it uses Microsoft's
 `System.Memory`, also MIT. CI blocks any runtime package that is not on a reviewed license
 allowlist. Runtime dependency licenses are listed in THIRD-PARTY-NOTICES.md.
@@ -64,9 +64,9 @@ allowlist. Runtime dependency licenses are listed in THIRD-PARTY-NOTICES.md.
 Bug reports with a file that is handled wrongly are the most useful contribution. Issues labelled
 `good first issue` and `help wanted` are open to anyone, and roadmap items start with an issue to
 agree on the approach. The rules are in
-[CONTRIBUTING.md](https://github.com/jams4code/pdf.netstack/blob/main/CONTRIBUTING.md), including
+[CONTRIBUTING.md](https://github.com/JADEV-CORP/pdf.netstack/blob/main/CONTRIBUTING.md), including
 the policy for AI assisted contributions. Security issues follow the
-[security policy](https://github.com/jams4code/pdf.netstack/blob/main/SECURITY.md).
+[security policy](https://github.com/JADEV-CORP/pdf.netstack/blob/main/SECURITY.md).
 
 ## This site
 

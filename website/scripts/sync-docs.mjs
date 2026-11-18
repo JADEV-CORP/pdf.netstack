@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 const website = fileURLToPath(new URL('..', import.meta.url));
 const repo = join(website, '..');
 const docs = join(website, 'src/content/docs');
-const GITHUB = 'https://github.com/jams4code/pdf.netstack';
+const GITHUB = 'https://github.com/JADEV-CORP/pdf.netstack';
 
 const SOURCES = [
   {
