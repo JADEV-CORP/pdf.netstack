@@ -101,8 +101,20 @@ internal sealed class PdfSerializer
     /// <summary>Write each reference's own generation, for incremental updates that keep object numbers.</summary>
     public bool KeepGenerations { get; set; }
 
-    public void Write(ByteSink sink, PdfObject obj)
+    public void Write(ByteSink sink, PdfObject obj) => Write(sink, obj, 0);
+
+    /// <summary>
+    /// Writes one object, <paramref name="depth"/> arrays and dictionaries down. Objects built in
+    /// code can nest without bound; past the depth the parser reads, the file could not be read
+    /// back, and the recursion would run out of stack first, so such objects are refused.
+    /// </summary>
+    private void Write(ByteSink sink, PdfObject obj, int depth)
     {
+        if (depth > PdfParser.MaxNesting)
+        {
+            throw new InvalidOperationException($"Objects nest deeper than {PdfParser.MaxNesting} arrays or dictionaries, which no reader accepts.");
+        }
+
         switch (obj)
         {
             case PdfNull:
@@ -122,11 +134,11 @@ internal sealed class PdfSerializer
                 break;
             case PdfArray array:
                 sink.Write((byte)'[');
-                foreach (PdfObject item in array.Items) Write(sink, item);
+                foreach (PdfObject item in array.Items) Write(sink, item, depth + 1);
                 sink.Write((byte)']');
                 break;
             case PdfDictionary dict:
-                WriteDictionary(sink, dict, skipKey: null);
+                WriteDictionary(sink, dict, skipKey: null, depth + 1);
                 break;
             case PdfReference r:
             {
@@ -155,7 +167,9 @@ internal sealed class PdfSerializer
     }
 
     /// <summary>Writes a dictionary, dropping null valued entries, which the specification treats as absent.</summary>
-    public void WriteDictionary(ByteSink sink, PdfDictionary dict, string? skipKey)
+    public void WriteDictionary(ByteSink sink, PdfDictionary dict, string? skipKey) => WriteDictionary(sink, dict, skipKey, 0);
+
+    private void WriteDictionary(ByteSink sink, PdfDictionary dict, string? skipKey, int depth)
     {
         sink.Write("<<"u8);
         for (int i = 0; i < dict.Count; i++)
@@ -164,7 +178,7 @@ internal sealed class PdfSerializer
             if (skipKey is not null && key == skipKey) continue;
             if (IsNullValue(value)) continue;
             WriteName(sink, key);
-            Write(sink, value);
+            Write(sink, value, depth);
         }
 
         sink.Write(">>"u8);
