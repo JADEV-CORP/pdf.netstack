@@ -587,7 +587,25 @@ internal sealed class PdfFile
 
         UsesXrefStreams = true;
         ReadXrefStream(xs, section);
+        CorrectOwnEntry(offset, section);
         return xs.Dictionary;
+    }
+
+    /// <summary>
+    /// Points the xref stream's entry for itself at the offset it was just read from. Some writers
+    /// get that one entry wrong (qpdf's hybrid-xref test file points it at the catalog). Nothing in
+    /// a document refers to its xref stream, so the wrong offset damages nothing, while validating
+    /// it would rebuild a sound file from a scan and report it as repaired.
+    /// </summary>
+    private void CorrectOwnEntry(long offset, Dictionary<int, XrefEntry> section)
+    {
+        (long number, long generation) = ParseAt(offset, _source.Length, (parser, _) =>
+            parser.TryReadInteger(out long n) && parser.TryReadInteger(out long g) ? (n, g) : (-1L, -1L));
+        if (number is <= 0 or > int.MaxValue || generation is < 0 or > int.MaxValue) return;
+        if (section.TryGetValue((int)number, out XrefEntry own) && own.Type == XrefEntryType.InFile && own.Field1 != offset)
+        {
+            section[(int)number] = new XrefEntry(XrefEntryType.InFile, offset, (int)generation);
+        }
     }
 
     private PdfDictionary ReadXrefTable(PdfParser parser, Dictionary<int, XrefEntry> section)

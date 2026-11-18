@@ -53,6 +53,94 @@ public sealed class ReaderTests
         StringAssert.Contains(PageText(file, 5), "(New)");
     }
 
+    /// <summary>
+    /// An xref stream's entry for itself only says where the stream is, which the reader already
+    /// knows. A wrong one (qpdf's hybrid-xref.pdf has one) damages nothing and is no reason to
+    /// rebuild the file from a scan.
+    /// </summary>
+    [TestMethod]
+    [DataRow(true)]
+    [DataRow(false)]
+    public void XrefStreamWithMisplacedOwnEntryIsNotRepaired(bool inMemory)
+    {
+        byte[] pdf = PdfBuilder.Simple("A").BuildWithXrefStream(misplaceOwnEntry: true);
+        PdfFile file = inMemory ? PdfFile.Open(pdf, Limit) : PdfFile.Open(new MemoryStream(pdf), Limit);
+        Assert.IsFalse(file.WasReconstructed);
+        Assert.AreEqual(0, file.LengthsRepaired);
+        StringAssert.Contains(PageText(file, 5), "(A)");
+    }
+
+    /// <summary>
+    /// The shape of qpdf's hybrid-xref.pdf: a classic file, then an update whose classic section is
+    /// empty and names, with /XRefStm, an xref stream that lists every object, its own entry wrong.
+    /// </summary>
+    [TestMethod]
+    [DataRow(true, true)]
+    [DataRow(true, false)]
+    [DataRow(false, true)]
+    public void HybridUpdateIsReadWithoutRepair(bool misplaceOwnEntry, bool inMemory)
+    {
+        byte[] pdf = HybridUpdate(misplaceOwnEntry);
+        PdfFile file = inMemory ? PdfFile.Open(pdf, Limit) : PdfFile.Open(new MemoryStream(pdf), Limit);
+        Assert.IsFalse(file.WasReconstructed);
+        Assert.AreEqual(0, file.LengthsRepaired);
+        Assert.AreEqual(2, file.RevisionCount);
+        StringAssert.Contains(PageText(file, 5), "(New)");
+    }
+
+    [TestMethod]
+    public void OptimizerFlattensHybridUpdateWhenAllowed()
+    {
+        byte[] pdf = HybridUpdate(misplaceOwnEntry: true);
+
+        (byte[] output, PdfOptimizationResult result) = PdfOptimizer.Optimize(pdf, new PdfOptimizerOptions { MinSavingPercent = 0 });
+        Assert.AreEqual(OptimizationDisposition.UnsupportedRetained, result.Disposition);
+        StringAssert.Contains(result.Reason, "incremental updates");
+        CollectionAssert.AreEqual(pdf, output);
+
+        (output, result) = PdfOptimizer.Optimize(pdf, new PdfOptimizerOptions { MinSavingPercent = 0, AllowIncrementalUpdates = true });
+        Assert.AreEqual(OptimizationDisposition.Optimized, result.Disposition, result.Reason);
+        StringAssert.Contains(PdfDocument.Open(output).Pages[0].ExtractText(), "New");
+    }
+
+    /// <summary>
+    /// <see cref="PdfBuilder.Simple"/> with an update that replaces the content stream (object 4)
+    /// through a hybrid section. The uncompressed xref stream is object 6.
+    /// </summary>
+    private static byte[] HybridUpdate(bool misplaceOwnEntry)
+    {
+        byte[] original = PdfBuilder.Simple("Old").Build();
+        string text = Compat.Latin1.GetString(original);
+        long prev = long.Parse(text[(text.LastIndexOf("startxref", StringComparison.Ordinal) + 9)..].Trim().Split('\n')[0], System.Globalization.CultureInfo.InvariantCulture);
+        var offsets = new long[7];
+        for (int n = 1; n <= 5; n++) offsets[n] = text.IndexOf($"\n{n} 0 obj", StringComparison.Ordinal) + 1;
+
+        var ms = new MemoryStream();
+        ms.Write(original);
+        offsets[4] = ms.Position;
+        ms.Write(Compat.Latin1.GetBytes("4 0 obj\n<</Length 34>>\nstream\nBT /F1 24 Tf 72 700 Td (New) Tj ET\nendstream\nendobj\n"));
+        offsets[6] = ms.Position;
+        long own = misplaceOwnEntry ? offsets[4] : offsets[6];
+
+        // W [1 4 2], no filter: type, offset, generation.
+        var rows = new byte[7 * 7];
+        for (int n = 1; n <= 6; n++)
+        {
+            long at = n == 6 ? own : offsets[n];
+            rows[n * 7] = 1;
+            for (int i = 0; i < 4; i++) rows[n * 7 + 1 + i] = (byte)(at >> (24 - 8 * i));
+        }
+
+        rows[5] = 0xFF;
+        rows[6] = 0xFF;
+        ms.Write(Compat.Latin1.GetBytes($"6 0 obj\n<</Type/XRef/Size 7/W[1 4 2]/Root 1 0 R/Length {rows.Length}>>\nstream\n"));
+        ms.Write(rows);
+        ms.Write("\nendstream\nendobj\n"u8);
+        long xref = ms.Position;
+        ms.Write(Compat.Latin1.GetBytes($"xref\n0 0\ntrailer\n<</Size 7/Root 1 0 R/Prev {prev}/XRefStm {offsets[6]}>>\nstartxref\n{xref}\n%%EOF\n"));
+        return ms.ToArray();
+    }
+
     [TestMethod]
     public void PrevLoopTerminates()
     {

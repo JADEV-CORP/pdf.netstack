@@ -261,7 +261,9 @@ public static partial class PdfOptimizer
         try
         {
             pageCount = CountPages(file, guard.Budget.Diagnostics);
-            if (Unsupported(file, input.Span.IndexOf("/ByteRange"u8) >= 0, options) is { } unsupported)
+            int byteRanges = UsageRights.CountByteRanges(input.Span);
+            bool usageRightsRemoved = options.RemoveUsageRights && UsageRights.Remove(file, byteRanges);
+            if (Unsupported(file, byteRanges > 0 && !usageRightsRemoved, options) is { } unsupported)
             {
                 return Retained(OptimizationDisposition.UnsupportedRetained, unsupported);
             }
@@ -273,7 +275,7 @@ public static partial class PdfOptimizer
             }
 
             bool pdfA1 = IsPdfA1(file, options.MaxDecodedStreamBytes);
-            int stripped = graph.StrippedEntries;
+            int stripped = graph.StrippedEntries + (usageRightsRemoved ? 1 : 0);
             timings = timings with { Analyze = phase.Elapsed };
             phase.Restart();
 
@@ -421,6 +423,7 @@ public static partial class PdfOptimizer
                 var ignored = new List<string>();
                 if (options.RemovePageThumbnails) ignored.Add("Thumb");
                 if (options.RemovePieceInfo) ignored.Add("PieceInfo");
+                if (usageRightsRemoved) ignored.Add("Perms");
                 var rules = new VerificationRules
                 {
                     IgnoredSourceKeys = ignored,
@@ -442,6 +445,7 @@ public static partial class PdfOptimizer
             }
 
             string reason = Reason(options, recompressed);
+            if (usageRightsRemoved) reason += " Usage rights removed.";
             if (linearized) reason += " The output is linearized.";
             else if (notLinearized is not null) reason += " Not linearized: " + notLinearized + ".";
             return new Outcome(OptimizationDisposition.Optimized, candidate, reason, pageCount, stats);

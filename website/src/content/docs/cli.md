@@ -249,6 +249,7 @@ Optimizer options apply to `optimize`, `batch` and, where they make sense, to `v
 | `--allow-repaired` | Rewrite damaged files that needed repair | `AllowRepairedFiles` |
 | `--strip-thumbnails` | Remove page thumbnails (not lossless) | `RemovePageThumbnails` |
 | `--strip-pieceinfo` | Remove application private data (not lossless) | `RemovePieceInfo` |
+| `--remove-usage-rights` | 1.3. Rewrite files whose only signature is Adobe Reader usage rights (`/UR3`), removing them | `RemoveUsageRights` |
 | `--min-saving <percent>` | Minimum saving to keep a rewrite (default 1) | `MinSavingPercent` |
 | `--threads <n>` | Threads per document (default: all cores) | `MaxDegreeOfParallelism` |
 | `--jobs <n>` | Documents in parallel for `batch` (default: all cores) | |
