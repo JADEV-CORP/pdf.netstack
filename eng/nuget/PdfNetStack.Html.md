@@ -148,8 +148,9 @@ var options = new HtmlConverterOptions
 ```
 
 Parsing, styling and layout are bounded: nesting depth, selector complexity, `var()`
-expansion, table spans and background tiling all have limits, so hostile markup ends in a
-finite document rather than a hang or a crash.
+expansion, table spans and background tiling all have limits. They apply to each construct, not
+to a whole conversion, so give conversions of untrusted HTML a timeout and a memory limit.
+Resource limits for untrusted input are being added in 1.3.
 
 Sizes are bounded too. Computed lengths (margins, padding, borders, widths, line heights, letter
 and word spacing) are clamped to a million px either way, percentages to a million percent,

@@ -51,8 +51,10 @@ the input size. The library itself writes nothing to disk unless you give it a p
 
 - Flex Consumption runs instances of 512 MB, 2,048 MB or 4,096 MB, and runs several invocations
   on one instance. Size memory for the concurrent work. With `Streaming`, each document being
-  optimized takes a few hundred MB whatever its size, and about three times its size in the
-  temporary directory; without it, about ten times the file size in memory.
+  optimized keeps the file itself out of memory and takes a few hundred MB, more for image heavy
+  files, and about three times its size in the temporary directory. Without it, size instances
+  from the [measured numbers](/concepts/memory-and-performance/#measured-memory-use): on 1.2.0 the
+  optimizer peaked at 24 to 60 times the input file.
 - The Consumption plan caps an instance at 1.5 GB for all its concurrent invocations.
 - `maxDegreeOfParallelism` under `extensions.blobs` in `host.json` bounds concurrent blobs per
   instance; `MaxDegreeOfParallelism` in `PdfOptimizerOptions` bounds the threads of one

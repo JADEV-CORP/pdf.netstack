@@ -64,6 +64,7 @@ export default defineConfig({
           label: 'Guides',
           items: [
             'guides/compress-pdf',
+            'guides/migrate-from-pdfsharp',
             'guides/edit-pages',
             'guides/large-files',
             'guides/drawing',

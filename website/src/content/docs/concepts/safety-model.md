@@ -4,8 +4,8 @@ description: Which PDFs the PdfNetStack optimizer refuses to rewrite, how hostil
 sidebar:
   label: Safety model
 faq:
-  - q: Is PdfNetStack safe to run on PDFs from untrusted sources?
-    a: It is built for it. Parsing and decoding are bounded in depth, size and work, damaged objects never crash a run, and the optimizer returns the input unchanged rather than throwing on a file it cannot read.
+  - q: Can PdfNetStack run on PDFs from untrusted sources?
+    a: With care. The optimizer returns encrypted, signed, incrementally updated and damaged files unchanged, proves every rewrite equivalent to its source, and caps nesting depth, each decoded stream and each image. Those limits apply per object, not per document, so run untrusted files in a worker with a memory limit and a timeout. Resource limits for untrusted input are being added in 1.3.
   - q: Will the optimizer ever break a signed PDF?
     a: No. Any file with a signature byte range, a signature dictionary, usage rights or a document security store is returned byte for byte.
 ---
@@ -18,8 +18,9 @@ input, or your input unchanged. This page lists the rules behind that promise.
 Before rewriting, the optimizer checks the file. Encrypted, signed, incrementally updated, damaged
 and oversized files are returned unchanged with the disposition `UnsupportedRetained` and a reason.
 After rewriting, it parses its own output and compares it to the source; any difference returns the
-input with `OriginalRetained`. Every parser and decoder is bounded, so hostile input ends in a
-result, not a hang or a crash.
+input with `OriginalRetained`. Parsers and decoders cap nesting, each decoded stream and each
+image. Those limits apply per object; limits for a whole document, which untrusted input needs,
+are being added in 1.3.
 
 ## Files returned unchanged
 
@@ -39,7 +40,7 @@ reason. The reason says which.
 PDF/A-1 files are detected from their XMP metadata and written with a classic cross-reference table
 and no object streams, because PDF/A-1 predates both.
 
-## Hostile input is bounded
+## Limits on hostile input
 
 | Threat | Bound |
 |---|---|
@@ -51,12 +52,19 @@ and no object streams, because PDF/A-1 predates both.
 | Unreadable objects | Recorded, never thrown out of the optimizer |
 | JPEG data | Oversubscribed Huffman tables are refused, at most 64 scans per image, frames that claim more blocks than their data can code are refused |
 | Content streams | Operations, nesting of forms and graphics states, and decoded bytes are capped |
-| Images | Pixel counts are capped before any buffer is allocated: 2^28 by default, lower per document with `PdfLoadOptions.MaxImagePixels` (1.1) and per image file with `PdfImage.Load(data, page, maxPixels)` |
+| Images | Pixel counts are capped: 2^28 by default, lower per document with `PdfLoadOptions.MaxImagePixels` (1.1) and per image file with `PdfImage.Load(data, page, maxPixels)` |
 | Fonts | Damaged font files raise `FontFormatException`; WOFF and WOFF2 output is capped at 128 MB |
 
 Opening a document for editing applies the same bounds. A file that cannot be read raises
 `PdfFormatException`, the one exception the parser documents for bad data, and decoders such as
 the image, font and SVG readers either raise their documented exception or stop at their limit.
+
+These limits apply to one object, stream or image at a time. Version 1.2.0 has no budget for a
+whole document: total CPU time, total decoded bytes or total memory. Resource limits for
+untrusted input are being added in 1.3. Until then, run files from untrusted sources in a separate
+process or container with a memory limit, and end it after a timeout: most calls do not take a
+cancellation token yet. Size that memory limit from
+[Memory and performance](/concepts/memory-and-performance/).
 
 ## Verification
 

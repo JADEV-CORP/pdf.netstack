@@ -31,17 +31,17 @@ faq:
   - q: Can it make scanned PDFs searchable?
     a: Yes, with the PdfNetStack.Ocr add-on, for Latin and Arabic script. It is a separate package on NuGet, with its models in PdfNetStack.Ocr.Models. The core library also has DrawInvisibleText to lay the words of any OCR engine over a scan.
   - q: How much memory does it use?
-    a: The optimizer holds the whole document in memory. Plan for about 10 times the file size, more for image heavy files, or lower MaxDegreeOfParallelism to cap memory. From version 1.1, PdfDocument.OpenOnDemand reads and edits a file of any size page by page without loading it, and SaveIncremental appends only the changes.
+    a: The optimizer holds the whole document in memory. Measured on 1.2.0 with default options, its peak was 24 to 60 times the input file, and a 5.8 MiB file needed a GC heap limit of 256 MB. Lower MaxDegreeOfParallelism to cut the peak, and see Memory and performance for container sizing. From version 1.1, PdfDocument.OpenOnDemand reads and edits a file of any size page by page without loading it, and SaveIncremental appends only the changes.
   - q: Can it write linearized PDFs for fast web view?
     a: Yes, from version 1.1, with Linearize in PdfOptimizerOptions or pdfnetstack optimize --linearize. The output follows ISO 32000-1 Annex F with hint tables and is verified like any other rewrite.
-  - q: Is it safe to run on files from untrusted sources?
-    a: That is a design goal. Nesting depth, decoded stream sizes, image sizes and loops in the file structure are bounded, and damaged input raises PdfFormatException instead of crashing or hanging. The HTML converter fetches nothing from the network unless you give it a resource loader.
+  - q: Can I run it on files from untrusted sources?
+    a: With care. Today the optimizer returns encrypted, signed, incrementally updated and damaged files unchanged, proves every rewrite equivalent to its source, and caps nesting depth, each decoded stream and each image. The limits apply per object, not per document, so run untrusted files in a worker with a memory limit and a timeout. Resource limits for untrusted input are being added in 1.3. The HTML converter fetches nothing from the network unless you give it a resource loader.
   - q: Which version should I use today?
     a: Version 1.2.0, on NuGet. It has every feature on this site, including the optimizer, editing, drawing, fonts, forms, signatures, PDF/A, extraction, HTML to PDF, OCR and the command line tools.
   - q: Is PdfNetStack related to the PDFNet SDK?
     a: No. PDFNet is a commercial SDK from Apryse. PdfNetStack is an independent open source project by JADEV with no connection to it.
-  - q: Who maintains PdfNetStack?
-    a: Jamal Abdelkhalek at JADEV created it and maintains it. Contributions are welcome under the contribution guide in the repository.
+  - q: Who builds PdfNetStack, and how?
+    a: A small team at JADEV builds it, and Jamal Abdelkhalek, who created it, maintains it. The team develops it with AI. Trust in the output does not rest on who or what wrote a given line. Every rewrite the optimizer makes is read back and proved equivalent to its source, and you get your original bytes when the proof fails. The test suite runs on Windows, Linux and macOS, on .NET Framework 4.8, .NET 8 and .NET 10. A public corpus of 77 openly licensed PDFs runs through PdfNetStack, qpdf, MuPDF and Ghostscript in CI, and anyone can run it again. Fuzz tests feed mutated files to the optimizer on every build. Contributions are welcome under the contribution guide in the repository.
 ---
 
 Short answers to the questions people ask before they adopt PdfNetStack. Each one links to the

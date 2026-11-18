@@ -1,11 +1,18 @@
 # PdfNetStack
 
-Create, edit, compress and sign PDF files in .NET. Pure C#, MIT licensed, no native binaries, no
-Ghostscript. Created and maintained by Jamal Abdelkhalek at [JADEV](https://github.com/jams4code).
+Shrink PDFs on a server without breaking them, in pure C#. Forms, tags, signatures and PDF/A
+survive, and every output is proved equivalent to its input before it is returned. MIT licensed,
+no native binaries, no Ghostscript. Created and maintained by Jamal Abdelkhalek at
+[JADEV](https://github.com/jams4code).
 
 PdfNetStack makes PDFs smaller without changing a single rendered pixel, then proves it: the
 output is re-read and compared to the source object by object before it is returned. If anything
-differs, you get your original bytes back.
+differs, you get your original bytes back. Signed and encrypted files are returned untouched.
+
+For teams leaving PDFsharp, whose 6.5.0 release is AGPL-3.0-only, PdfNetStack draws, edits,
+merges, splits, fills forms and encrypts under MIT. The
+[migration guide](https://www.jadev-corp.com/pdfnetstack/guides/migrate-from-pdfsharp/) maps the
+common PDFsharp 6 calls, with before and after code.
 
 ```csharp
 using PdfNetStack;
@@ -43,8 +50,10 @@ Console.WriteLine($"{result.Disposition}: saved {result.SavingPercent:F1}%");
   links, notes, markup, stamps, ink and shapes; flattening.
 - **Signatures and archiving:** PAdES B-B, B-T, B-LT and B-LTA signing and verification with
   chain, revocation and policy checks; PDF/A-1b to PDF/A-4 output; Factur-X and ZUGFeRD invoices.
-- **Safe on untrusted files:** bounded parsing and decoding, decompression bomb limits, fuzz
-  tested. Signed and encrypted files are never rewritten by the optimizer.
+- **Fails safe:** signed and encrypted files are never rewritten by the optimizer, damaged files
+  only when you allow it. Nesting, each decoded stream and each image are capped, and the
+  optimizer is fuzz tested. Limits for whole documents from untrusted sources are being added in
+  1.3.
 
 ## Editing
 
