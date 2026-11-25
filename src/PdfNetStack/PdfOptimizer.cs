@@ -240,10 +240,12 @@ public static partial class PdfOptimizer
     /// so readers never observe a partial file. Source and destination must differ.
     /// </summary>
     /// <remarks>
-    /// By default the source is read into memory. With <see cref="PdfOptimizerOptions.Streaming"/>
-    /// it is read on demand, and the rewrite is written to the destination's temporary file and
-    /// proven there before it is moved into place; when it is not used, the source is copied there
-    /// instead.
+    /// By default the source is read into memory. A file over <see cref="PdfOptimizerOptions.MaxInputBytes"/>
+    /// or <see cref="PdfLimits.MaxInputBytes"/>, one that grows past them while it is read included,
+    /// is copied to the destination unchanged and never held beyond one chunk past the limit. With
+    /// <see cref="PdfOptimizerOptions.Streaming"/> the source is read on demand, and the rewrite is written
+    /// to the destination's temporary file and proven there before it is moved into place; when it
+    /// is not used, the source is copied there instead.
     /// </remarks>
     /// <param name="sourcePath">The PDF to optimize. It is never modified.</param>
     /// <param name="destinationPath">Receives the optimized PDF, or a copy of the source.</param>
@@ -277,7 +279,20 @@ public static partial class PdfOptimizer
             return await OptimizeFileStreamingAsync(source, destination, options, cancellationToken).ConfigureAwait(false);
         }
 
-        byte[] data = await Compat.ReadAllBytesAsync(source, cancellationToken).ConfigureAwait(false);
+        // The length checked above is only a shortcut, as the file may have grown since: the handle
+        // is read up to the cap like any stream, and closed before the passes run.
+        long cap = InputCap(options);
+        using var data = new MemoryStream();
+        using (var input = new FileStream(source, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16, FileOptions.Asynchronous))
+        {
+            long known = input.CanSeek ? input.Length : 0;
+            if (known <= cap && known <= Compat.MaxArrayLength) data.Capacity = (int)known;
+            if (known > cap || await SpoolAsync(input, data, cap, cancellationToken).ConfigureAwait(false))
+            {
+                return await CopyOverLimitFileAsync(data, input, destination, options, cancellationToken).ConfigureAwait(false);
+            }
+        }
+
         string? directory = Path.GetDirectoryName(destination);
         if (!string.IsNullOrEmpty(directory)) Directory.CreateDirectory(directory);
 
@@ -287,7 +302,7 @@ public static partial class PdfOptimizer
             PdfOptimizationResult result;
             using (var stream = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None, 1 << 16, FileOptions.Asynchronous))
             {
-                result = Optimize(data, stream, options, cancellationToken);
+                result = Optimize(data.GetBuffer().AsMemory(0, (int)data.Length), stream, options, cancellationToken);
                 await stream.FlushAsync(cancellationToken).ConfigureAwait(false);
             }
 
@@ -303,16 +318,25 @@ public static partial class PdfOptimizer
     /// <summary>Copies a file over the input limits to the destination, through a temporary file like any other result.</summary>
     private static async Task<PdfOptimizationResult> CopyOverLimitFileAsync(string source, string destination, PdfOptimizerOptions options, CancellationToken ct)
     {
+        using var input = new FileStream(source, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16, FileOptions.Asynchronous);
+        return await CopyOverLimitFileAsync(null, input, destination, options, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Copies what was taken in of a file over the input limits, if anything, then the rest of
+    /// <paramref name="input"/>, to the destination, through a temporary file like any other result.
+    /// </summary>
+    private static async Task<PdfOptimizationResult> CopyOverLimitFileAsync(Stream? taken, Stream input, string destination, PdfOptimizerOptions options, CancellationToken ct)
+    {
         string? directory = Path.GetDirectoryName(destination);
         if (!string.IsNullOrEmpty(directory)) Directory.CreateDirectory(directory);
         string temp = destination + "." + Guid.NewGuid().ToString("N") + ".tmp";
         try
         {
             long length;
-            using (var input = new FileStream(source, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16, FileOptions.Asynchronous))
             using (var copy = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None, 1 << 16, FileOptions.Asynchronous))
             {
-                length = await PassThroughAsync(null, input, copy, ct).ConfigureAwait(false);
+                length = await PassThroughAsync(taken, input, copy, ct).ConfigureAwait(false);
                 await copy.FlushAsync(ct).ConfigureAwait(false);
             }
 

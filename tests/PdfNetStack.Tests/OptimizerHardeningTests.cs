@@ -1,4 +1,6 @@
+using System.Diagnostics;
 using System.IO.Compression;
+using System.Runtime.InteropServices;
 using System.Text;
 using PdfNetStack.Filters;
 using PdfNetStack.Imaging;
@@ -195,6 +197,58 @@ public sealed class OptimizerHardeningTests
         }
         finally
         {
+            Directory.Delete(directory, true);
+        }
+    }
+
+    [TestMethod]
+    [DoNotParallelize] // measures what the whole process allocates
+    public async Task FileThatGrowsPastTheLimitIsNotReadIntoMemory()
+    {
+        // A named pipe has a length of 0 and then serves whatever its writer sends, as a file that
+        // grows after its length was read would.
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) Assert.Inconclusive("Named pipes in the file system are Unix only.");
+        string directory = Path.Combine(Path.GetTempPath(), "pdfnetstack-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        string source = Path.Combine(directory, "in.pdf");
+        Task? writer = null;
+        try
+        {
+            string destination = Path.Combine(directory, "out.pdf");
+            using (Process mkfifo = Process.Start(new ProcessStartInfo("mkfifo", "\"" + source + "\"") { UseShellExecute = false })!)
+            {
+                mkfifo.WaitForExit();
+                Assert.AreEqual(0, mkfifo.ExitCode);
+            }
+
+            byte[] input = PaddedPdf(16 << 20);
+            writer = Task.Run(() =>
+            {
+                using var pipe = new FileStream(source, FileMode.Open, FileAccess.Write, FileShare.Read, 1);
+                pipe.Write(input, 0, input.Length);
+            });
+            var options = new PdfOptimizerOptions { Limits = new PdfLimits { MaxInputBytes = 256 << 10 } };
+
+#if NET
+            long before = GC.GetTotalAllocatedBytes(true);
+#endif
+            PdfOptimizationResult result = await PdfOptimizer.OptimizeFileAsync(source, destination, options);
+#if NET
+            long allocated = GC.GetTotalAllocatedBytes(true) - before;
+#endif
+            await writer;
+
+            Assert.AreEqual(OptimizationDisposition.LimitExceeded, result.Disposition);
+            Assert.AreEqual(PdfLimitKind.InputBytes, result.Diagnostics.Single().Limit);
+            CollectionAssert.AreEqual(input, File.ReadAllBytes(destination));
+#if NET
+            Assert.IsLessThan(4 << 20, allocated, "The file is read one chunk past the limit at most, then copied through.");
+#endif
+        }
+        finally
+        {
+            // A writer still waiting for a reader is let go before the folder is removed.
+            if (writer is { IsCompleted: false }) new FileStream(source, FileMode.Open, FileAccess.Read).Dispose();
             Directory.Delete(directory, true);
         }
     }
