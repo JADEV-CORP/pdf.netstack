@@ -117,6 +117,12 @@ internal sealed class InlineLayout
         public byte Level { get; } = level;
 
         public List<ShapedGlyph> Glyphs { get; set; } = [];
+
+        /// <summary>
+        /// Whether the glyphs' clusters never decrease, recorded once in <see cref="Shape"/>, so a
+        /// line finds its glyphs by binary search instead of scanning the whole item.
+        /// </summary>
+        public bool Ordered { get; set; }
     }
 
     private sealed class Segment(Item item, int start, int end)
@@ -432,11 +438,52 @@ internal sealed class InlineLayout
                 || _startEdge[i] != 0 || _endEdge[i - 1] != 0 || _span[i] != _span[start];
             if (!split) continue;
             var item = new Item(start, i, _style[start], _font[start], _level[start]);
-            if (!IsAtomic(start) && _text[start] != '\n') item.Glyphs = Shape(item, script[start], shaping);
+            if (!IsAtomic(start) && _text[start] != '\n')
+            {
+                item.Glyphs = Shape(item, script[start], shaping);
+                item.Ordered = ClustersNeverDecrease(item.Glyphs);
+            }
+
             for (int k = start; k < i; k++) _itemAt[k] = _items.Count;
             _items.Add(item);
             start = i;
         }
+    }
+
+    private static bool ClustersNeverDecrease(List<ShapedGlyph> glyphs)
+    {
+        for (int i = 1; i < glyphs.Count; i++)
+        {
+            if (glyphs[i].Cluster < glyphs[i - 1].Cluster) return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>The glyphs of the item whose cluster is in [start, end), in the item's order.</summary>
+    private static void CollectGlyphs(Item item, int start, int end, List<ShapedGlyph> into)
+    {
+        List<ShapedGlyph> glyphs = item.Glyphs;
+        if (!item.Ordered)
+        {
+            foreach (ShapedGlyph g in glyphs)
+            {
+                if (g.Cluster >= start && g.Cluster < end) into.Add(g);
+            }
+
+            return;
+        }
+
+        // First glyph with Cluster >= start; every later one is at least that, so stop at the first at or past end.
+        int low = 0, high = glyphs.Count;
+        while (low < high)
+        {
+            int mid = low + ((high - low) / 2);
+            if (glyphs[mid].Cluster < start) low = mid + 1;
+            else high = mid;
+        }
+
+        for (int i = low; i < glyphs.Count && glyphs[i].Cluster < end; i++) into.Add(glyphs[i]);
     }
 
     private int[] ResolveScripts()
@@ -836,11 +883,7 @@ internal sealed class InlineLayout
             Item item = _items[_itemAt[i]];
             int s = Math.Max(item.Start, start), e = Math.Min(item.End, visibleEnd);
             var glyphs = new List<ShapedGlyph>(Math.Min(item.Glyphs.Count, e - s));
-            foreach (ShapedGlyph g in item.Glyphs)
-            {
-                if (g.Cluster >= s && g.Cluster < e) glyphs.Add(g);
-            }
-
+            CollectGlyphs(item, s, e, glyphs);
             var seg = new Segment(item, s, e) { Glyphs = glyphs };
             seg.Width = Width(s, e);
             segments.Add(seg);
