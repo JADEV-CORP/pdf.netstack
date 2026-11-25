@@ -657,6 +657,45 @@ public sealed class OptimizerHardeningTests
         }
     }
 
+    /// <summary>The work for a file holding <paramref name="size"/> zeros in a Flate stream that says /DL 1, and that stream.</summary>
+    private static (StreamRecompressor.Work Work, int Stream) UnderstatedWork(int size, long decodeLimit)
+    {
+        PdfBuilder b = PdfBuilder.Simple("x");
+        int zeros = b.AddStream("/Filter/FlateDecode/DL 1", PdfBuilder.Deflate(new byte[size]));
+        b.Set(1, $"<</Type/Catalog/Pages 2 0 R/Zeros {zeros} 0 R>>");
+        PdfFile file = PdfFile.Open(b.Build(), decodeLimit);
+        ObjectGraph graph = ObjectGraph.Collect(file, false, false, CancellationToken.None);
+        StreamRecompressor.Work work = StreamRecompressor.Prepare(file, graph, RecompressionScope.All, CompressionLevel.Fastest, false, true, false, null, null, decodeLimit, CancellationToken.None);
+        return (work, work.IndexOf(zeros));
+    }
+
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public void StreamThatUnderstatesItsLengthWaitsForTheMemoryItDecodesTo(bool contentKey)
+    {
+        // The gate has 1 MiB left; the stream claims one byte and decodes to 4 MiB.
+        const long decodeLimit = 64 << 20;
+        (StreamRecompressor.Work work, int stream) = UnderstatedWork(4 << 20, decodeLimit);
+        long held = work.Gate.Enter((2 * decodeLimit) - (1 << 20), CancellationToken.None);
+        try
+        {
+            Task done = Task.Run(() =>
+            {
+                if (contentKey) work.ContentKey(stream, CancellationToken.None);
+                else work.Execute(stream, false, CancellationToken.None);
+            });
+            Assert.IsFalse(done.Wait(300), "The stream waits until what it decodes to fits.");
+            work.Gate.Exit(held);
+            held = 0;
+            Assert.IsTrue(done.Wait(10_000));
+        }
+        finally
+        {
+            work.Gate.Exit(held);
+        }
+    }
+
     [TestMethod]
     public void WithoutRecompressionAJpegKeepsItsBytes()
     {

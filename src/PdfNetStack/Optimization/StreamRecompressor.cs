@@ -172,6 +172,10 @@ internal static class StreamRecompressor
     /// </summary>
     internal sealed class Work
     {
+        // Below this a stream is admitted for this much, so small streams that claim too little
+        // are not decoded again and again for a few bytes.
+        private const long MinAdmitted = 64 << 10;
+
         private readonly Plan?[] _plans;
         private readonly Flate _flate;
         private readonly bool _imagePredictors;
@@ -186,7 +190,9 @@ internal static class StreamRecompressor
         // Recompressing a stream takes a few times its decoded size in memory, and the lossy pass
         // several times an image's samples; workers share a budget of twice the decode limit, so a
         // document of large images cannot multiply that by the number of threads. The process's
-        // own budget bounds concurrent optimizations together (MemoryGate.ProcessBudget).
+        // own budget bounds concurrent optimizations together (MemoryGate.ProcessBudget). What a
+        // stream decodes to is only known by decoding it, so a stream is admitted for what its
+        // dictionary leads to expect and decoded no further than that (see Admitted).
         private readonly MemoryGate _gate;
 
         internal Work(List<PdfStream> streams, List<int> numbers, Plan?[] plans, Flate flate, bool imagePredictors, long decodeLimit, bool hashContent)
@@ -235,17 +241,26 @@ internal static class StreamRecompressor
         {
             Plan? plan = _plans[i];
             if (plan is null) return null;
-            long weight = _gate.Enter(plan.Image is { } image ? LossyImages.Footprint(image) : plan.Footprint, ct);
             Result? result;
             bool rejected;
-            try
+            for (long admitted = Admitted(plan); ; admitted = Larger(admitted))
             {
-                result = Recompress(Streams[i], plan, _flate, _imagePredictors, _decodeLimit, Budget,
-                    reportHash && _hashContent ? hash => _hashes[i] = hash : null, out rejected);
-            }
-            finally
-            {
-                _gate.Exit(weight);
+                // Its decoded data and two working copies, or what the lossy pass holds for an image.
+                long weight = _gate.Enter(plan.Image is { } image ? Math.Max(LossyImages.Footprint(image), 3 * admitted) : 3 * admitted, ct);
+                try
+                {
+                    result = Recompress(Streams[i], plan, _flate, _imagePredictors, admitted, _decodeLimit, Budget,
+                        reportHash && _hashContent ? hash => _hashes[i] = hash : null, out rejected);
+                    break;
+                }
+                catch (StreamDecodeException e) when (e.IsLimit && admitted < _decodeLimit)
+                {
+                    // It decodes to more than it was admitted for: it waits for room for more.
+                }
+                finally
+                {
+                    _gate.Exit(weight);
+                }
             }
 
             if (rejected) Interlocked.Increment(ref _keptByGate);
@@ -326,35 +341,53 @@ internal static class StreamRecompressor
         public byte[]? ContentKey(int i, CancellationToken ct)
         {
             if (_plans[i] is not { } plan) return null;
-
-            // Only the decoded data is held, a third of what the whole recompression takes.
-            long weight = _gate.Enter(plan.Footprint / 3, ct);
-            try
+            for (long admitted = Admitted(plan); ; admitted = Larger(admitted))
             {
-                DecodedStream decoded;
+                // Only the decoded data is held, a third of what the whole recompression takes.
+                long weight = _gate.Enter(admitted, ct);
                 try
                 {
-                    decoded = StreamCodec.Decode(Streams[i].Data, plan.Filters, DecodeDepth.CompressionOnly, _decodeLimit, static o => o, Budget);
-                }
-                catch (StreamDecodeException)
-                {
-                    return null;
-                }
+                    DecodedStream decoded;
+                    try
+                    {
+                        decoded = StreamCodec.Decode(Streams[i].Data, plan.Filters, DecodeDepth.CompressionOnly, admitted, static o => o, Budget);
+                    }
+                    catch (StreamDecodeException e) when (e.IsLimit && admitted < _decodeLimit)
+                    {
+                        continue;
+                    }
+                    catch (StreamDecodeException)
+                    {
+                        return null;
+                    }
 
-                using (decoded)
-                {
-                    byte[] content = ContentHash(decoded.Data.Span, decoded.PendingPredictor, decoded.Remaining);
+                    using (decoded)
+                    {
+                        byte[] content = ContentHash(decoded.Data.Span, decoded.PendingPredictor, decoded.Remaining);
 
-                    // Whether the stream may be compacted, requantized or resampled, and to what size.
-                    string what = FormattableString.Invariant($"{plan.Compact}|{plan.Recompress}|{plan.Jpeg?.Quality}|{plan.Image?.Target}|{plan.Image?.MayConvert}|{plan.Image?.PaletteBase is not null}");
-                    return Compat.Sha256([.. content, .. System.Text.Encoding.ASCII.GetBytes(what)]);
+                        // Whether the stream may be compacted, requantized or resampled, and to what size.
+                        string what = FormattableString.Invariant($"{plan.Compact}|{plan.Recompress}|{plan.Jpeg?.Quality}|{plan.Image?.Target}|{plan.Image?.MayConvert}|{plan.Image?.PaletteBase is not null}");
+                        return Compat.Sha256([.. content, .. System.Text.Encoding.ASCII.GetBytes(what)]);
+                    }
                 }
-            }
-            finally
-            {
-                _gate.Exit(weight);
+                finally
+                {
+                    _gate.Exit(weight);
+                }
             }
         }
+
+        /// <summary>
+        /// The decoded bytes a stream is first admitted for: what its dictionary leads to expect,
+        /// at least <see cref="MinAdmitted"/>. /DL, an image's size and a compression ratio are
+        /// claims, so the stream is decoded no further than that; one that decodes to more is
+        /// admitted again for four times as much (<see cref="Larger"/>), up to the decode limit.
+        /// A stream whose claim holds decodes once; one that lies pays a decode per step and
+        /// waits for the memory it really takes.
+        /// </summary>
+        private long Admitted(Plan plan) => Math.Min(_decodeLimit, Math.Max(MinAdmitted, plan.ExpectedDecoded));
+
+        private long Larger(long admitted) => Math.Min(_decodeLimit, 4 * admitted);
 
         /// <summary>
         /// The tally so far. Given the representative of each object the deduplicator merged,
@@ -468,8 +501,12 @@ internal static class StreamRecompressor
         /// <summary>Set for a bilevel image that may become Group 4.</summary>
         public BilevelPlan? Bilevel { get; init; }
 
-        /// <summary>Bytes the lossless work on the stream holds at once, about: its decoded data and two working copies.</summary>
-        public long Footprint { get; init; }
+        /// <summary>
+        /// Bytes the stream should decode to, from its dictionary (see <see cref="DecodedSize"/>).
+        /// A claim, not a bound: work on it holds about three times that, its decoded data and two
+        /// working copies.
+        /// </summary>
+        public long ExpectedDecoded { get; init; }
     }
 
     /// <summary>A bilevel image the Group 4 pass may re-encode.</summary>
@@ -575,7 +612,7 @@ internal static class StreamRecompressor
         return new Plan(resolved, probe.Length, layout, jpegPlan, imagePlan, images)
         {
             Bilevel = bilevel,
-            Footprint = 3 * DecodedSize(file, d, layout, stream.EncodedLength, decodeLimit),
+            ExpectedDecoded = DecodedSize(file, d, layout, stream.EncodedLength, decodeLimit),
         };
     }
 
@@ -665,13 +702,14 @@ internal static class StreamRecompressor
 
     /// <summary>
     /// What a stream decodes to, as far as its dictionary tells before decoding: an image's
-    /// samples, or the length /DL states; otherwise four times its encoded length, about what
-    /// Flate achieves on content and fonts. Never more than the decode limit.
+    /// samples with a PNG predictor's byte per row, or the length /DL states; otherwise four times
+    /// its encoded length, about what Flate achieves on content and fonts. Never more than the
+    /// decode limit. A file can state anything here, so this is an estimate, never trusted as a bound.
     /// </summary>
     private static long DecodedSize(PdfFile file, PdfDictionary d, PredictorParams? layout, int encodedLength, long decodeLimit)
     {
         long size = layout is { RowBytes: > 0 } rows && IntOf(file, d["Height"]) is > 0 and var height
-            ? (long)rows.RowBytes * height
+            ? (long)(rows.RowBytes + 1) * height
             : IntOf(file, d["DL"]) is > 0 and var stated ? stated : 4L * encodedLength;
         return Math.Min(size, decodeLimit);
     }
@@ -732,7 +770,9 @@ internal static class StreamRecompressor
     private static int IntOf(PdfFile file, PdfObject? o) =>
         file.Resolve(o) is PdfNumber { IsInteger: true } n && n.IntegerValue is > 0 and < int.MaxValue ? (int)n.IntegerValue : 0;
 
-    private static Result? Recompress(PdfStream stream, Plan plan, Flate level, bool imagePredictors, long decodeLimit, ResourceBudget? budget, Action<byte[]>? reportHash, out bool rejected)
+    /// <param name="admitted">The decoded bytes the stream was admitted for; past them it is not decoded.</param>
+    /// <exception cref="StreamDecodeException">With <see cref="StreamDecodeException.IsLimit"/>: the stream decodes past <paramref name="admitted"/>, which is less than <paramref name="decodeLimit"/>.</exception>
+    private static Result? Recompress(PdfStream stream, Plan plan, Flate level, bool imagePredictors, long admitted, long decodeLimit, ResourceBudget? budget, Action<byte[]>? reportHash, out bool rejected)
     {
         rejected = false;
 
@@ -742,9 +782,9 @@ internal static class StreamRecompressor
         DecodedStream decoded;
         try
         {
-            decoded = StreamCodec.Decode(data, plan.Filters, DecodeDepth.CompressionOnly, decodeLimit, static o => o, budget);
+            decoded = StreamCodec.Decode(data, plan.Filters, DecodeDepth.CompressionOnly, admitted, static o => o, budget);
         }
-        catch (StreamDecodeException)
+        catch (StreamDecodeException e) when (!e.IsLimit || admitted >= decodeLimit)
         {
             return null;
         }
