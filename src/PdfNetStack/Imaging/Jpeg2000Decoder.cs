@@ -182,14 +182,16 @@ internal static class Jpeg2000Decoder
     /// <param name="bandRows">Rows reconstructed together, or 0 to choose by width.</param>
     /// <param name="maxPixels">Ceiling for the image area.</param>
     /// <param name="ct">Observed before each tile and each band of rows.</param>
+    /// <param name="onSize">Told the image's area in pixels once the header is read, before any sample is allocated; it may throw to refuse the image.</param>
     /// <exception cref="Jpeg2000FormatException">The data is damaged, too large or unsupported.</exception>
-    public static (Raster? Raster, ColorSpace? Space) DecodeForPdf(byte[] data, ColorSpace? space, long byteLimit, int bandRows = 0, long maxPixels = ImageSamples.MaxPixels, CancellationToken ct = default) =>
-        Guarded(() => Pdf(data, space, byteLimit, bandRows, maxPixels, ct));
+    public static (Raster? Raster, ColorSpace? Space) DecodeForPdf(byte[] data, ColorSpace? space, long byteLimit, int bandRows = 0, long maxPixels = ImageSamples.MaxPixels, Action<long>? onSize = null, CancellationToken ct = default) =>
+        Guarded(() => Pdf(data, space, byteLimit, bandRows, maxPixels, onSize, ct));
 
-    private static (Raster? Raster, ColorSpace? Space) Pdf(byte[] data, ColorSpace? space, long byteLimit, int bandRows, long maxPixels, CancellationToken ct)
+    private static (Raster? Raster, ColorSpace? Space) Pdf(byte[] data, ColorSpace? space, long byteLimit, int bandRows, long maxPixels, Action<long>? onSize, CancellationToken ct)
     {
         bool keepIndexes = space?.IsIndexed == true, indexed = keepIndexes;
         (Jpeg2000Codestream stream, Jp2Header? header) = Open(data, maxPixels);
+        onSize?.Invoke((long)(stream.X1 - stream.X0) * (stream.Y1 - stream.Y0));
         Jpeg2000Image image = Assemble(stream, null, header, applyPalette: !indexed);
         int colors = image.Channels.Count(c => !c.Opacity);
         List<Jpeg2000Channel> ordered = [.. image.Channels.Where(c => !c.Opacity), .. image.Channels.Where(c => c.Opacity)];
