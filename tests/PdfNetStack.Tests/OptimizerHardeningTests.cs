@@ -293,4 +293,32 @@ public sealed class OptimizerHardeningTests
         Assert.ThrowsExactly<OperationCanceledException>(() => LinearizedWriter.Write(objects, trailer, map, settings, Cancelled()));
         Assert.IsGreaterThan(0, PdfDocumentWriter.Write(objects, trailer, map, settings).Length);
     }
+
+    private static PdfDocument TwoImages(string dictionary, byte[] first, byte[] second, PdfLimits limits)
+    {
+        var b = new PdfBuilder();
+        b.Set(1, "<</Type/Catalog/Pages 2 0 R>>");
+        b.Set(2, "<</Type/Pages/Kids[3 0 R]/Count 1>>");
+        b.Set(3, "<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]/Resources<</XObject<</A 5 0 R/B 6 0 R>>>>/Contents 4 0 R>>");
+        b.SetStream(4, "", "q 100 0 0 100 0 0 cm /A Do Q q 100 0 0 100 0 0 cm /B Do Q"u8.ToArray());
+        b.SetStream(5, dictionary, first);
+        b.SetStream(6, dictionary, second);
+        return PdfDocument.Open(b.Build(), new PdfLoadOptions { Limits = limits });
+    }
+
+    [TestMethod]
+    public void DecodedImagesSpendTheDecodedByteBudget()
+    {
+        // 3 MiB of samples each, decoded into the array that becomes the pixels. The array is not
+        // given back to the budget when it is handed on, so the second image does not fit in 4 MiB.
+        byte[] samples = new byte[1024 * 1024 * 3];
+        using PdfDocument doc = TwoImages("/Type/XObject/Subtype/Image/Width 1024/Height 1024/ColorSpace/DeviceRGB/BitsPerComponent 8/Filter/FlateDecode",
+            PdfBuilder.Deflate(samples), PdfBuilder.Deflate(samples), PdfLimits.Default with { MaxTotalDecodedBytes = 4 << 20 });
+        IReadOnlyList<PdfPageImage> images = doc.Pages[0].GetImages();
+
+        Assert.IsNotNull(images[0].Decode());
+        PdfLimitExceededException e = Assert.ThrowsExactly<PdfLimitExceededException>(() => images[1].Decode());
+
+        Assert.AreEqual(PdfLimitKind.TotalDecodedBytes, e.Limit);
+    }
 }
