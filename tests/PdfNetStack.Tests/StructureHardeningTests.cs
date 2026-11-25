@@ -50,6 +50,50 @@ public sealed class StructureHardeningTests
         return b.Build();
     }
 
+    /// <summary>
+    /// A page with a table whose data cell, written as <paramref name="cell"/>, names its header
+    /// cell through the attribute class Cell.
+    /// </summary>
+    private static byte[] ClassAttributeTable(string cell)
+    {
+        var b = new PdfBuilder();
+        b.Set(1, "<</Type/Catalog/Pages 2 0 R/StructTreeRoot 20 0 R/MarkInfo<</Marked true>>>>");
+        b.Set(2, "<</Type/Pages/Kids[5 0 R]/Count 1>>");
+        b.Set(3, FontObject);
+        b.SetStream(4, "", Ascii("/TH <</MCID 0>> BDC BT /F1 12 Tf 72 700 Td (Name) Tj ET EMC /TD <</MCID 1>> BDC BT /F1 12 Tf 72 680 Td (Ada) Tj ET EMC"));
+        b.Set(5, "<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]/Resources<</Font<</F1 3 0 R>>>>/Contents 4 0 R/StructParents 0>>");
+        b.Set(20, "<</Type/StructTreeRoot/K 21 0 R/ParentTree 30 0 R/ParentTreeNextKey 1/IDTree<</Names[(th1) 23 0 R]>>/ClassMap<</Cell<</O/Table/Headers[(th1)]>>>>>>");
+        b.Set(21, "<</Type/StructElem/S/Document/P 20 0 R/K 22 0 R>>");
+        b.Set(22, "<</Type/StructElem/S/Table/P 21 0 R/Pg 5 0 R/K[23 0 R 24 0 R]>>");
+        b.Set(23, "<</Type/StructElem/S/TH/P 22 0 R/Pg 5 0 R/ID(th1)/K 0>>");
+        b.Set(24, "<</Type/StructElem/S/TD/P 22 0 R/Pg 5 0 R" + cell + "/K 1>>");
+        b.Set(30, "<</Nums[0[23 0 R 24 0 R]]>>");
+        return b.Build();
+    }
+
+    /// <summary>
+    /// The first header ID a cell names: from its own attribute objects, which take precedence,
+    /// else from its classes (ISO 32000-1, 14.7.5.2).
+    /// </summary>
+    private static string? HeaderOf(PdfDocument doc, PdfDictionary cell)
+    {
+        static IEnumerable<PdfObject> Items(PdfDocument doc, PdfObject? value) => doc.Resolve(value) switch
+        {
+            PdfArray array => array,
+            PdfObject single => [single],
+            null => [],
+        };
+
+        PdfDictionary classMap = doc.ResolveDictionary(doc.ResolveDictionary(doc.Catalog["StructTreeRoot"])!["ClassMap"]) ?? new PdfDictionary();
+        IEnumerable<PdfObject> attributes = Items(doc, cell["A"]).Concat(Items(doc, cell["C"]).OfType<PdfName>().SelectMany(c => Items(doc, classMap[c.Value])));
+        foreach (PdfObject attribute in attributes)
+        {
+            if (doc.ResolveDictionary(attribute)?["Headers"] is PdfObject headers) return ((PdfString)((PdfArray)doc.Resolve(headers)!)[0]).ToText();
+        }
+
+        return null;
+    }
+
     /// <summary>A paragraph with a /Ref to the table that follows it.</summary>
     private static byte[] ReferenceToLaterSibling()
     {
@@ -373,42 +417,99 @@ public sealed class StructureHardeningTests
         Assert.AreEqual("th1,th1_2", string.Join(",", headers));
     }
 
-    [TestMethod]
-    public void CellsSharingOneAttributeObjectRenameItsHeadersOnce()
+    private const int ManyCells = 4000;
+
+    /// <summary>
+    /// A table of <see cref="ManyCells"/> header cells, each with an ID, and as many data cells
+    /// that all name every header through one attribute object 31, written into each data cell
+    /// as <paramref name="cell"/>, or through a class of the root's <paramref name="root"/>.
+    /// </summary>
+    private static byte[] ManyCellsSharingHeaders(string cell, string root = "")
     {
-        const int Cells = 4000;
-        const int Headers = 4000;
         var b = new PdfBuilder();
         b.Set(1, "<</Type/Catalog/Pages 2 0 R/StructTreeRoot 20 0 R>>");
         b.Set(2, "<</Type/Pages/Kids[5 0 R]/Count 1>>");
         b.Set(5, "<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]>>");
-        b.Set(20, "<</Type/StructTreeRoot/K 21 0 R/ParentTree 30 0 R>>");
-        string kids = string.Join(" ", Enumerable.Range(10_000, Headers).Concat(Enumerable.Range(300, Cells)).Select(n => n + " 0 R"));
+        b.Set(20, "<</Type/StructTreeRoot/K 21 0 R/ParentTree 30 0 R" + root + ">>");
+        string kids = string.Join(" ", Enumerable.Range(10_000, ManyCells).Concat(Enumerable.Range(300, ManyCells)).Select(n => n + " 0 R"));
         b.Set(21, "<</Type/StructElem/S/Table/P 20 0 R/K[" + kids + "]>>");
         b.Set(30, "<</Nums[]>>");
-        b.Set(31, "<</O/Table/Headers[" + string.Join(" ", Enumerable.Range(0, Headers).Select(i => "(h" + i + ")")) + "]>>");
-        for (int i = 0; i < Headers; i++) b.Set(10_000 + i, "<</Type/StructElem/S/TH/P 21 0 R/Pg 5 0 R/ID(h" + i + ")/K 0>>");
-        for (int i = 0; i < Cells; i++) b.Set(300 + i, "<</Type/StructElem/S/TD/P 21 0 R/Pg 5 0 R/A 31 0 R/K 0>>");
+        b.Set(31, "<</O/Table/Headers[" + string.Join(" ", Enumerable.Range(0, ManyCells).Select(i => "(h" + i + ")")) + "]>>");
+        for (int i = 0; i < ManyCells; i++) b.Set(10_000 + i, "<</Type/StructElem/S/TH/P 21 0 R/Pg 5 0 R/ID(h" + i + ")/K 0>>");
+        for (int i = 0; i < ManyCells; i++) b.Set(300 + i, "<</Type/StructElem/S/TD/P 21 0 R/Pg 5 0 R" + cell + "/K 0>>");
+        return b.Build();
+    }
 
-        PdfDocument source = PdfDocument.Open(b.Build());
-        PdfDocument target = PdfDocument.Create();
+    /// <summary>Imports <paramref name="source"/> twice, so the second copy finds every header ID taken, and returns its data cells.</summary>
+    private static List<PdfDictionary> ImportTwiceRenamingEveryHeader(PdfDocument source, PdfDocument target)
+    {
         target.Pages.Import(source.Pages);
-
-        // The second copy finds every header ID taken, so each is renamed.
 #if NET
         long before = GC.GetAllocatedBytesForCurrentThread();
 #endif
         target.Pages.Import(source.Pages);
 #if NET
         long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
-        Assert.IsLessThan(64L * 1024 * 1024, allocated, "a shared attribute object is renamed once, not once per cell");
+        Assert.IsLessThan(64L * 1024 * 1024, allocated, "shared headers are renamed once, not once per cell");
 #endif
         List<PdfDictionary> cells = [.. StructureImportTests.Elements(target).Where(e => e.GetName("S") == "TD")];
-        Assert.HasCount(2 * Cells, cells);
-        string FirstHeader(PdfDictionary cell) => ((PdfString)((PdfArray)target.Resolve(target.ResolveDictionary(cell["A"])!["Headers"])!)[0]).ToText();
-        Assert.AreEqual("h0", FirstHeader(cells[0]));
-        Assert.AreEqual("h0_2", FirstHeader(cells[Cells]));
-        Assert.AreSame(target.ResolveDictionary(cells[Cells]["A"]), target.ResolveDictionary(cells[^1]["A"]), "the second copy's cells share one renamed attribute object");
+        Assert.HasCount(2 * ManyCells, cells);
+        return cells;
+    }
+
+    [TestMethod]
+    public void CellsSharingOneAttributeObjectRenameItsHeadersOnce()
+    {
+        PdfDocument target = PdfDocument.Create();
+        List<PdfDictionary> cells = ImportTwiceRenamingEveryHeader(PdfDocument.Open(ManyCellsSharingHeaders("/A 31 0 R")), target);
+
+        Assert.AreEqual("h0", HeaderOf(target, cells[0]));
+        Assert.AreEqual("h0_2", HeaderOf(target, cells[ManyCells]));
+        Assert.AreSame(target.ResolveDictionary(cells[ManyCells]["A"]), target.ResolveDictionary(cells[^1]["A"]), "the second copy's cells share one renamed attribute object");
+    }
+
+    [TestMethod]
+    public void CellsSharingOneClassShareOneHeaderOverride()
+    {
+        PdfDocument target = PdfDocument.Create();
+        List<PdfDictionary> cells = ImportTwiceRenamingEveryHeader(PdfDocument.Open(ManyCellsSharingHeaders("/C/Cell", "/ClassMap<</Cell 31 0 R>>")), target);
+
+        Assert.AreEqual("h0", HeaderOf(target, cells[0]));
+        Assert.AreEqual("h0_2", HeaderOf(target, cells[ManyCells]));
+        Assert.AreSame(target.ResolveDictionary(cells[ManyCells]["A"]), target.ResolveDictionary(cells[^1]["A"]), "the second copy's cells share one override");
+    }
+
+    [TestMethod]
+    public void ACellNamingItsHeaderThroughAClassFollowsTheRenamedHeader()
+    {
+        PdfDocument a = PdfDocument.Open(ClassAttributeTable("/C/Cell"));
+        PdfDocument merged = StructureImportTests.Saved(PdfDocument.Merge([a, a]));
+        StructureImportTests.CheckStructure(merged);
+
+        List<PdfDictionary> cells = [.. StructureImportTests.Elements(merged).Where(e => e.GetName("S") == "TD")];
+        Assert.AreEqual("th1,th1_2", string.Join(",", cells.Select(c => HeaderOf(merged, c))));
+        Assert.IsNull(cells[0]["A"], "the first copy needs no attribute of its own");
+        PdfDictionary classMap = merged.ResolveDictionary(merged.ResolveDictionary(merged.Catalog["StructTreeRoot"])!["ClassMap"])!;
+        Assert.AreEqual("th1", ((PdfString)((PdfArray)merged.Resolve(merged.ResolveDictionary(classMap["Cell"])!["Headers"])!)[0]).ToText(), "the class keeps its meaning");
+    }
+
+    [TestMethod]
+    public void AClassHeaderOverrideKeepsTheCellsAttributesAndRevision()
+    {
+        PdfDocument a = PdfDocument.Open(ClassAttributeTable("/C[/Cell 2]/R 2/A<</O/Layout/TextAlign/Center>>"));
+        PdfDocument merged = StructureImportTests.Saved(PdfDocument.Merge([a, a]));
+        StructureImportTests.CheckStructure(merged);
+
+        List<PdfDictionary> cells = [.. StructureImportTests.Elements(merged).Where(e => e.GetName("S") == "TD")];
+        Assert.AreEqual("th1,th1_2", string.Join(",", cells.Select(c => HeaderOf(merged, c))));
+        Assert.AreEqual("Layout", merged.ResolveDictionary(cells[0]["A"])!.GetName("O"), "the first copy's own attribute is untouched");
+
+        // The cell's own attribute stays first, and the override takes the class's revision.
+        var attributes = (PdfArray)merged.Resolve(cells[1]["A"])!;
+        Assert.HasCount(3, attributes);
+        Assert.AreEqual("Layout", merged.ResolveDictionary(attributes[0])!.GetName("O"));
+        Assert.AreEqual("Table", merged.ResolveDictionary(attributes[1])!.GetName("O"));
+        Assert.AreEqual(2, ((PdfNumber)attributes[2]).IntegerValue);
     }
 
     [TestMethod]

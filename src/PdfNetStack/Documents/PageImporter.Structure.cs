@@ -661,9 +661,11 @@ internal sealed partial class PageImporter
     private void RewriteHeaders(StructureCopy copy, CancellationToken ct)
     {
         var rewrite = new HeaderRewrite(copy, ct);
+        PdfDictionary? classes = _target.ResolveDictionary(_target.ResolveDictionary(_target.Catalog["StructTreeRoot"])?["ClassMap"]);
         foreach (PdfDictionary element in copy.Elements)
         {
             if (element["A"] is PdfObject attributes && RenamedAttributes(attributes, rewrite) is PdfObject renamed) element.Set("A", renamed);
+            if (classes is not null && element["C"] is PdfObject names && !rewrite.Refused) OverrideClassHeaders(element, names, classes, rewrite);
             if (rewrite.Refused)
             {
                 _source.Budget.Diagnostics.Skipped(Compat.Format("A copy of the structure tree stopped after {0} children and references; the rest of its table cells keep the header IDs they had.", StructureIndex.MaxKids));
@@ -671,6 +673,95 @@ internal sealed partial class PageImporter
             }
         }
     }
+
+    /// <summary>
+    /// Gives an element whose /Headers come from an attribute class (ISO 32000-1, 14.7.5.2) an
+    /// attribute object of its own with the renamed IDs, as attributes in /A take precedence over
+    /// those of the classes. The class itself is left as it is: the copies of earlier imports use
+    /// it with the IDs it names. No order is defined among an element's classes, so the first
+    /// that gives /Headers is the one followed.
+    /// </summary>
+    private void OverrideClassHeaders(PdfDictionary element, PdfObject names, PdfDictionary classes, HeaderRewrite rewrite)
+    {
+        // /C holds a class name, or class names each optionally followed by a revision number.
+        PdfDictionary? attribute = null;
+        PdfNumber? revision = null;
+        PdfArray list = names as PdfArray ?? PdfArray.Of(names);
+        for (int i = 0; i < list.Count && attribute is null; i++)
+        {
+            if (list[i] is not PdfName name) continue;
+            attribute = ClassHeaders(name.Value, classes, rewrite);
+            revision = i + 1 < list.Count ? list[i + 1] as PdfNumber : null;
+        }
+
+        if (attribute is null || _target.Resolve(attribute["O"]) is not PdfName owner) return;
+        if (!rewrite.Overrides.TryGetValue(attribute, out PdfReference? reference))
+        {
+            PdfObject? headers = Shared(attribute["Headers"]!, rewrite.Headers, resolved => resolved is PdfArray h ? RenamedHeaders(h, rewrite) : null);
+            reference = headers is null ? null : _target.AddObject(new PdfDictionary { ["O"] = owner, ["Headers"] = headers });
+            rewrite.Overrides[attribute] = reference;
+        }
+
+        if (reference is null) return;
+
+        // The element's own /Headers for that owner win over the class's: nothing to override.
+        // Otherwise its attribute objects stay, and the override goes at the end (14.7.5.1).
+        var items = new List<PdfObject>();
+        PdfObject? current = element["A"];
+        switch (_target.Resolve(current))
+        {
+            case PdfDictionary single:
+                if (GivesHeaders(single, owner)) return;
+                items.Add(current!);
+                break;
+            case PdfArray array:
+                foreach (PdfObject item in array)
+                {
+                    if (!rewrite.Charge()) return;
+                    if (_target.ResolveDictionary(item) is PdfDictionary own && GivesHeaders(own, owner)) return;
+                    items.Add(item);
+                }
+
+                break;
+        }
+
+        // The override repeats the class's attributes, so it keeps the class's revision number
+        // (14.7.5.3): current, or out of date, as the class was for this element.
+        items.Add(reference);
+        if (revision is { IsInteger: true, IntegerValue: not 0 }) items.Add(revision);
+        element.Set("A", items.Count == 1 ? reference : new PdfArray(items));
+    }
+
+    /// <summary>The first attribute object of a class that gives /Headers, looked up once a round; null when it gives none.</summary>
+    private PdfDictionary? ClassHeaders(string name, PdfDictionary classes, HeaderRewrite rewrite)
+    {
+        if (rewrite.Classes.TryGetValue(name, out PdfDictionary? known)) return known;
+
+        // A class map value is an attribute object or an array of them (14.7.5.2).
+        PdfObject? value = _target.Resolve(classes[name]);
+        IEnumerable<PdfObject> items = value switch
+        {
+            PdfArray array => array,
+            null => [],
+            _ => [value],
+        };
+
+        PdfDictionary? found = null;
+        foreach (PdfObject item in items)
+        {
+            if (_target.ResolveDictionary(item) is PdfDictionary attribute && attribute.ContainsKey("Headers"))
+            {
+                found = attribute;
+                break;
+            }
+        }
+
+        rewrite.Classes[name] = found;
+        return found;
+    }
+
+    private bool GivesHeaders(PdfDictionary attribute, PdfName owner) =>
+        attribute.ContainsKey("Headers") && _target.Resolve(attribute["O"]) is PdfName o && o.Value == owner.Value;
 
     /// <summary>An element's /A, one attribute object or an array of them each optionally followed by a revision number, with renamed header IDs.</summary>
     private PdfObject? RenamedAttributes(PdfObject value, HeaderRewrite rewrite) => _target.Resolve(value) switch
@@ -806,6 +897,12 @@ internal sealed partial class PageImporter
         public Dictionary<PdfObject, PdfObject?> Attributes { get; } = new(ReferenceEqualityComparer.Instance);
 
         public Dictionary<PdfObject, PdfObject?> Headers { get; } = new(ReferenceEqualityComparer.Instance);
+
+        /// <summary>Class name to its first attribute object that gives /Headers.</summary>
+        public Dictionary<string, PdfDictionary?> Classes { get; } = new(StringComparer.Ordinal);
+
+        /// <summary>Class attribute object to the override that elements using it get, null when it names no renamed ID.</summary>
+        public Dictionary<PdfDictionary, PdfReference?> Overrides { get; } = new(ReferenceEqualityComparer.Instance);
 
         /// <summary>True once the round's work ran out: the rewrite stops there.</summary>
         public bool Refused { get; private set; }
