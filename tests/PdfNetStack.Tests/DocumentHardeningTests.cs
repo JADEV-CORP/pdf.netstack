@@ -365,6 +365,53 @@ public sealed class DocumentHardeningTests
         Assert.IsFalse(File.Exists(path), "No handle is left on the file.");
     }
 
+    /// <summary>A form of <paramref name="fields"/> text fields whose widgets name page <paramref name="pageOf"/> by /P and are on no page's /Annots.</summary>
+    private static byte[] FormWithPageReferences(int pages, int fields, Func<int, int> pageOf)
+    {
+        PdfBuilder b = PdfBuilder.Simple([.. Enumerable.Range(1, pages).Select(i => "P" + i)]);
+        int firstField = b.NextNumber;
+        var refs = new List<string>();
+        for (int i = 0; i < fields; i++)
+        {
+            int page = 5 + (pageOf(i) * 2);
+            b.Set(firstField + i, $"<</FT/Tx/T(f{i})/Subtype/Widget/Rect[0 0 10 10]/P {page} 0 R>>");
+            refs.Add($"{firstField + i} 0 R");
+        }
+
+        b.Set(1, $"<</Type/Catalog/Pages 2 0 R/AcroForm<</Fields[{string.Join(" ", refs)}]>>>>");
+        return b.Build();
+    }
+
+    [TestMethod]
+    public void TheFieldsOfAFormAreGatheredUnderTheCallersToken()
+    {
+        using PdfDocument doc = PdfDocument.Open(FormWithPageReferences(1, 3, _ => 0));
+
+        Assert.ThrowsExactly<OperationCanceledException>(() => doc.Form.Collect(Cancelled()));
+        Assert.HasCount(3, doc.Form.Collect(CancellationToken.None));
+    }
+
+    [TestMethod]
+    public void AWidgetFindsItsPageThroughPWhenNoPageListsIt()
+    {
+        using PdfDocument doc = PdfDocument.Open(FormWithPageReferences(4, 8, i => i % 4));
+
+        PdfPage?[] pages = [.. doc.Form.Fields.Select(f => f.Widgets[0].Page)];
+
+        CollectionAssert.AreEqual(new[] { 0, 1, 2, 3, 0, 1, 2, 3 }, pages.Select(p => doc.Pages.ToList().IndexOf(p!)).ToArray());
+    }
+
+    [TestMethod]
+    public void FlatteningAFormWithManyFieldsStopsWhenCancelledWhileGathering()
+    {
+        using PdfDocument doc = PdfDocument.Open(FormWithPageReferences(50, 20_000, i => i % 50));
+        using var source = new CancellationTokenSource();
+        source.CancelAfter(1);
+
+        Assert.ThrowsExactly<OperationCanceledException>(() => doc.Form.Flatten(source.Token));
+        Assert.IsTrue(doc.Form.Exists, "A cancelled flatten leaves the form in place.");
+    }
+
     private sealed class TempFolder : IDisposable
     {
         public TempFolder()

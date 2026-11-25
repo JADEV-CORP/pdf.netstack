@@ -63,7 +63,7 @@ public sealed partial class PdfAcroForm
     /// Every terminal field, in tree order, with its fully qualified name. Recomputed on each
     /// call, so it reflects fields added or removed through the object model.
     /// </summary>
-    public IReadOnlyList<PdfField> Fields => Collect();
+    public IReadOnlyList<PdfField> Fields => Collect(CancellationToken.None);
 
     /// <summary>When true, viewers rebuild field appearances themselves. Values set here always come with appearances.</summary>
     public bool NeedAppearances
@@ -220,8 +220,9 @@ public sealed partial class PdfAcroForm
         if (Dictionary is null) return;
         var widgets = new HashSet<int>();
         var byPage = new Dictionary<PdfPage, List<PdfWidget>>();
-        foreach (PdfField field in Fields)
+        foreach (PdfField field in Collect(cancellationToken))
         {
+            cancellationToken.ThrowIfCancellationRequested();
             foreach (PdfWidget w in field.Widgets)
             {
                 if (w.Reference is PdfReference r) widgets.Add(r.Number);
@@ -296,11 +297,17 @@ public sealed partial class PdfAcroForm
         }
     }
 
-    private List<PdfField> Collect()
+    /// <summary>Every terminal field, as <see cref="Fields"/>; a big or hostile field tree stops when the token does.</summary>
+    internal List<PdfField> Collect(CancellationToken cancellationToken)
     {
         var fields = new List<PdfField>();
         if (Dictionary is not PdfDictionary form || _doc.Resolve(form["Fields"]) is not PdfArray roots) return fields;
+        cancellationToken.ThrowIfCancellationRequested();
         Dictionary<int, PdfPage> pages = WidgetPages();
+
+        // Built once: a widget's /P is found here, not by searching the pages for each widget.
+        var pageByNumber = new Dictionary<int, PdfPage>();
+        foreach (PdfPage page in _doc.Pages) pageByNumber.TryAdd(page.Number, page);
         var visited = new HashSet<PdfDictionary>();
         foreach (PdfObject root in roots) Walk(root, [], "", 0);
         return fields;
@@ -308,6 +315,7 @@ public sealed partial class PdfAcroForm
         // Ancestors and names come from the walk, not from /Parent, which files often get wrong.
         void Walk(PdfObject entry, List<PdfDictionary> ancestors, string prefix, int depth)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             if (depth > MaxDepth || visited.Count >= MaxFieldNodes || _doc.Resolve(entry) is not PdfDictionary node || !visited.Add(node)) return;
             string name = _doc.Resolve(node["T"]) is PdfString t ? (prefix.Length == 0 ? t.ToText() : prefix + "." + t.ToText()) : prefix;
             var childFields = new List<PdfObject>();
@@ -316,6 +324,7 @@ public sealed partial class PdfAcroForm
             {
                 foreach (PdfObject kid in kids)
                 {
+                    cancellationToken.ThrowIfCancellationRequested();
                     if (_doc.Resolve(kid) is not PdfDictionary k) continue;
                     if (k["T"] is not null || (k.GetName("Subtype") != "Widget" && k["Kids"] is not null)) childFields.Add(kid);
                     else widgets.Add(kid);
@@ -330,7 +339,7 @@ public sealed partial class PdfAcroForm
             }
 
             if (widgets.Count == 0) widgets.Add(entry);
-            fields.Add(PdfField.Create(this, node, ancestors, name, widgets.Select(w => new PdfWidget(this, w, pages)).ToList()));
+            fields.Add(PdfField.Create(this, node, ancestors, name, widgets.Select(w => new PdfWidget(this, w, pages, pageByNumber)).ToList()));
         }
     }
 
@@ -357,14 +366,14 @@ public sealed class PdfWidget
     private readonly PdfAcroForm _form;
     private readonly PdfObject _entry;
 
-    internal PdfWidget(PdfAcroForm form, PdfObject entry, Dictionary<int, PdfPage> pages)
+    internal PdfWidget(PdfAcroForm form, PdfObject entry, Dictionary<int, PdfPage> pages, Dictionary<int, PdfPage> pageByNumber)
     {
         _form = form;
         _entry = entry;
         PdfDocument doc = form.Document;
         Dictionary = doc.Resolve(entry) as PdfDictionary ?? new PdfDictionary();
         if (entry is PdfReference r && pages.TryGetValue(r.Number, out PdfPage? page)) Page = page;
-        else if (Dictionary["P"] is PdfReference p) Page = doc.Pages.FirstOrDefault(x => x.Number == p.Number);
+        else if (Dictionary["P"] is PdfReference p && pageByNumber.TryGetValue(p.Number, out PdfPage? byReference)) Page = byReference;
     }
 
     /// <summary>The widget annotation dictionary.</summary>
