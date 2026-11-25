@@ -570,10 +570,14 @@ public sealed class PdfDocument : IDisposable
     public static PdfDocument Merge(IEnumerable<PdfDocument> documents, IProgress<PdfProgress>? progress, CancellationToken cancellationToken = default)
     {
         Compat.ThrowIfNull(documents, nameof(documents));
-        List<PdfDocument> sources = [.. documents];
-        int total = sources.Sum(d => d.Pages.Count), done = 0;
+        cancellationToken.ThrowIfCancellationRequested();
+
+        // The total is the only reason to read the whole sequence first; without progress it is
+        // taken one document at a time, so a lazy or huge sequence stops where the token does.
+        List<PdfDocument>? all = progress is null ? null : [.. documents];
+        int total = all?.Sum(d => d.Pages.Count) ?? 0, done = 0;
         PdfDocument result = Create();
-        foreach (PdfDocument source in sources)
+        foreach (PdfDocument source in all ?? documents)
         {
             cancellationToken.ThrowIfCancellationRequested();
             result.Pages.Import(source.Pages, null, cancellationToken);
@@ -661,17 +665,7 @@ public sealed class PdfDocument : IDisposable
         foreach (Stream input in inputs)
         {
             if (input is null) throw new ArgumentException("The inputs hold a null stream.", nameof(inputs));
-            cancellationToken.ThrowIfCancellationRequested();
-            PdfDocument source;
-            try
-            {
-                source = await OpenAsync(input, load, cancellationToken).ConfigureAwait(false);
-            }
-            finally
-            {
-                // Opening reads the input to its end; it is not needed after that.
-                if (!options.LeaveInputsOpen) await DisposeAsync(input).ConfigureAwait(false);
-            }
+            PdfDocument source = await OpenInputAsync(input, load, options.LeaveInputsOpen, cancellationToken).ConfigureAwait(false);
 
             using (source)
             {
@@ -683,9 +677,41 @@ public sealed class PdfDocument : IDisposable
 
             done++;
             progress?.Report(new PdfProgress(done, total));
+            cancellationToken.ThrowIfCancellationRequested();
         }
 
         await result.SaveAsync(output, options.SaveOptions, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>Opens one merge input and disposes its stream, whether opening succeeds, fails or is cancelled.</summary>
+    private static async Task<PdfDocument> OpenInputAsync(Stream input, PdfLoadOptions load, bool leaveOpen, CancellationToken cancellationToken)
+    {
+        PdfDocument source;
+        try
+        {
+            // Inside the try so a cancelled merge still disposes the input it was handed.
+            cancellationToken.ThrowIfCancellationRequested();
+            source = await OpenAsync(input, load, cancellationToken).ConfigureAwait(false);
+        }
+        catch
+        {
+            if (!leaveOpen) await DisposeAsync(input).ConfigureAwait(false);
+            throw;
+        }
+
+        // Opening reads the input to its end; it is not needed after that.
+        if (leaveOpen) return source;
+        try
+        {
+            await DisposeAsync(input).ConfigureAwait(false);
+        }
+        catch
+        {
+            source.Dispose();
+            throw;
+        }
+
+        return source;
     }
 
     private static Task DisposeAsync(Stream stream)
@@ -813,11 +839,11 @@ public sealed class PdfDocument : IDisposable
     /// <exception cref="OperationCanceledException">Cancelled; parts already returned stay the caller's to dispose.</exception>
     public IEnumerable<PdfDocument> Split(IProgress<PdfProgress>? progress, CancellationToken cancellationToken = default)
     {
-        int done = 0;
+        int done = 0, total = Pages.Count;
         foreach (PdfDocument part in SplitParts(cancellationToken))
         {
             done++;
-            progress?.Report(new PdfProgress(done, Pages.Count));
+            progress?.Report(new PdfProgress(done, total));
             yield return part;
         }
     }
@@ -830,8 +856,10 @@ public sealed class PdfDocument : IDisposable
     /// Each part is saved as <see cref="Save(Stream, PdfSaveOptions?)"/> saves, then its stream is
     /// disposed before the next one is asked for, which commits it for streams such as zip
     /// entries, files and blob uploads. A <see cref="MemoryStream"/> still returns its bytes
-    /// through <see cref="MemoryStream.ToArray"/> once disposed. When a part fails or the token
-    /// fires, the stream asked for last is disposed and holds no complete file.
+    /// through <see cref="MemoryStream.ToArray"/> once disposed. <see cref="SplitTo"/> and
+    /// <see cref="SplitToAsync"/> keep the parts written before. When the token fires while a part
+    /// is being written, that part's stream is disposed and holds no complete file; progress
+    /// reports count only complete parts.
     /// </remarks>
     /// <example>
     /// <code>
@@ -848,7 +876,7 @@ public sealed class PdfDocument : IDisposable
     public int SplitTo(Func<int, Stream> createOutput, PdfSaveOptions? options = null, IProgress<PdfProgress>? progress = null, CancellationToken cancellationToken = default)
     {
         Compat.ThrowIfNull(createOutput, nameof(createOutput));
-        int written = 0;
+        int written = 0, total = Pages.Count;
         foreach (PdfDocument part in SplitParts(cancellationToken))
         {
             using (part)
@@ -858,7 +886,7 @@ public sealed class PdfDocument : IDisposable
             }
 
             written++;
-            progress?.Report(new PdfProgress(written, Pages.Count));
+            progress?.Report(new PdfProgress(written, total));
         }
 
         return written;
@@ -878,7 +906,7 @@ public sealed class PdfDocument : IDisposable
     public async Task<int> SplitToAsync(Func<int, Stream> createOutput, PdfSaveOptions? options = null, IProgress<PdfProgress>? progress = null, CancellationToken cancellationToken = default)
     {
         Compat.ThrowIfNull(createOutput, nameof(createOutput));
-        int written = 0;
+        int written = 0, total = Pages.Count;
         foreach (PdfDocument part in SplitParts(cancellationToken))
         {
             using (part)
@@ -895,7 +923,7 @@ public sealed class PdfDocument : IDisposable
             }
 
             written++;
-            progress?.Report(new PdfProgress(written, Pages.Count));
+            progress?.Report(new PdfProgress(written, total));
         }
 
         return written;
@@ -1162,7 +1190,7 @@ public sealed class PdfDocument : IDisposable
         if (inPlace)
         {
             // The stream now holds the update; later saves compare with it and append to it.
-            _baseline = PdfFile.Open(output, DecodeLimit);
+            _baseline = PdfFile.Open(output, DecodeLimit, Budget);
             foreach (int number in update.Keys) _inherited.Remove(number);
             _openedPages = Pages.Select(p => p.Number).ToList();
             _pageTreeMatchesFile = true;
