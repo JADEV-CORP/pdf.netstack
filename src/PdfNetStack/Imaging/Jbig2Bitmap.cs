@@ -47,7 +47,10 @@ internal sealed class Jbig2Bitmap
     public static Jbig2Bitmap Create(long width, long height, Jbig2Budget budget)
     {
         if (width < 0 || height < 0 || width > int.MaxValue - 7 || height > int.MaxValue) throw new Jbig2FormatException("A bitmap size is out of range.");
-        budget.Spend((width * height) + Overhead);
+
+        // A row costs at least one pixel: decoding walks every row, so a bitmap no pixels wide
+        // and two billion rows tall is not free.
+        budget.Spend((Math.Max(width, 1) * height) + Overhead);
         if (((width + 7) >> 3) * height > Compat.MaxArrayLength) throw new Jbig2FormatException("A bitmap size is out of range.");
         return new Jbig2Bitmap((int)width, (int)height);
     }
