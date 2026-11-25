@@ -298,7 +298,14 @@ public sealed class PdfOpenTypeFont : PdfFont
     internal override List<ShapedGlyph> ShapeRun(string text, int start, int end, bool rightToLeft, string script)
     {
         ShapingTables tables = Tables;
-        if (tables.Gsub is null && tables.Gpos is null && tables.Gdef is null) return base.ShapeRun(text, start, end, rightToLeft, script);
+
+        // Without layout tables the plain mapping (which keeps kern table kerning) is enough, unless a
+        // character only maps after normalization, as a decomposed or composed form: Covers accepts
+        // those, and only the shaper normalizes.
+        if (tables.Gsub is null && tables.Gpos is null && tables.Gdef is null && MapsDirectly(text, start, end, rightToLeft))
+        {
+            return base.ShapeRun(text, start, end, rightToLeft, script);
+        }
 
         List<GlyphInfo> infos = new Shaper(tables).Shape(text, start, end, rightToLeft, script);
         var glyphs = new List<ShapedGlyph>(infos.Count);
@@ -316,6 +323,19 @@ public sealed class PdfOpenTypeFont : PdfFont
         }
 
         return glyphs;
+    }
+
+    /// <summary>True when every visible character of the run has a glyph of its own, as <see cref="PdfFont.ShapeRun"/> needs.</summary>
+    private bool MapsDirectly(string text, int start, int end, bool rightToLeft)
+    {
+        for (int i = start; i < end; i += char.IsSurrogatePair(text, i) ? 2 : 1)
+        {
+            if (IsInvisible(text, i)) continue;
+            int codePoint = char.ConvertToUtf32(text, i);
+            if (!(rightToLeft && TryGetGlyph(Text.UnicodeData.Mirror(codePoint), out _)) && !TryGetGlyph(codePoint, out _)) return false;
+        }
+
+        return true;
     }
 
     internal override double GetAdvance(int glyph) => Math.Round(_file.Advance(glyph) * _scale, 2);
