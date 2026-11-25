@@ -284,13 +284,25 @@ internal sealed partial class PageImporter
         {
             // An untagged source: structure keys its XObjects carry index nothing in the target,
             // and would collide with the target's own keys.
-            foreach (int source in newlyShared) DropStructureKeys(_target.Objects[_shared[source]]);
-            CarryLanguage([], targetWasEmpty);
+            DropKeys(newlyShared, targetWasEmpty);
             return;
         }
 
         PdfDictionary? root = _target.Resolve(_target.Catalog["StructTreeRoot"]) as PdfDictionary;
-        int next = root is null ? 0 : NextParentTreeKey(root);
+        long first = root is null ? 0 : NextParentTreeKey(root);
+
+        // Every page, annotation and XObject may take a key. A target whose keys leave no room
+        // below the largest integer gets the pages untagged: Import has no new way to fail.
+        long needed = pageMap.Count + batch.Count + (2L * (newlyShared.Count + _unkeyed.Count));
+        if (first > int.MaxValue - needed)
+        {
+            _target.Budget.Diagnostics.Skipped("The target's parent tree has no keys left for the imported pages; they were copied untagged.");
+            ResetUnmergedRenames();
+            DropKeys(newlyShared, targetWasEmpty);
+            return;
+        }
+
+        int next = (int)first;
         var entries = new List<(int Key, PdfObject Value)>();
 
         foreach ((int source, int target) in pageMap)
@@ -393,20 +405,21 @@ internal sealed partial class PageImporter
 
     /// <summary>
     /// The first parent tree key no entry uses (ISO 32000-1, 14.7.4.4). ParentTreeNextKey is a
-    /// hint files often leave stale, so the keys themselves count too.
+    /// hint files often leave stale, so the keys themselves count too. A long, as a hostile
+    /// target can use keys up to the largest integer.
     /// </summary>
-    private int NextParentTreeKey(PdfDictionary root)
+    private long NextParentTreeKey(PdfDictionary root)
     {
         long next = _target.Resolve(root["ParentTreeNextKey"]) is PdfNumber { IsInteger: true } n && n.IntegerValue is > 0 and < int.MaxValue ? n.IntegerValue : 0;
         if (_target.Resolve(root["ParentTree"]) is PdfDictionary tree)
         {
             foreach ((PdfObject key, PdfObject _) in TreeReader.Entries(_target, tree, "Nums"))
             {
-                if (key is PdfNumber { IsInteger: true } k && k.IntegerValue >= next && k.IntegerValue < int.MaxValue) next = k.IntegerValue + 1;
+                if (key is PdfNumber { IsInteger: true } k && k.IntegerValue >= next && k.IntegerValue < long.MaxValue) next = k.IntegerValue + 1;
             }
         }
 
-        return (int)next;
+        return next;
     }
 
     /// <summary>
@@ -664,6 +677,13 @@ internal sealed partial class PageImporter
 
         // TODO(diagnostics): untagged content imported into a document in another language
         // keeps no record of its own; report it once the diagnostics channel exists.
+    }
+
+    /// <summary>The import brings no structure: the shared XObjects it copied lose their keys, and the language is carried.</summary>
+    private void DropKeys(List<int> newlyShared, bool targetWasEmpty)
+    {
+        foreach (int source in newlyShared) DropStructureKeys(_target.Objects[_shared[source]]);
+        CarryLanguage([], targetWasEmpty);
     }
 
     /// <summary>Removes parent tree keys a copied XObject brought from a source whose tree does not come along.</summary>

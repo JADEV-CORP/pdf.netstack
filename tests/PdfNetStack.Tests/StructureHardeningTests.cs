@@ -88,6 +88,18 @@ public sealed class StructureHardeningTests
         return b.Build();
     }
 
+    /// <summary>A tagged target whose parent tree already uses the last two keys an integer holds.</summary>
+    private static byte[] TargetWithKeysNearTheLimit()
+    {
+        var b = new PdfBuilder();
+        b.Set(1, "<</Type/Catalog/Pages 2 0 R/StructTreeRoot 20 0 R>>");
+        b.Set(2, "<</Type/Pages/Kids[5 0 R]/Count 1>>");
+        b.Set(5, "<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]>>");
+        b.Set(20, "<</Type/StructTreeRoot/ParentTree 30 0 R>>");
+        b.Set(30, "<</Nums[2147483646 null 2147483647 null]>>");
+        return b.Build();
+    }
+
     [TestMethod]
     public void AnImportedPageListedTwiceIsTaggedTwiceWithItsOwnAnnotations()
     {
@@ -243,5 +255,23 @@ public sealed class StructureHardeningTests
 
         PdfDocument saved = StructureImportTests.Saved(target);
         Assert.AreEqual("Document(P,Figure)", StructureImportTests.CheckStructure(saved));
+    }
+
+    [TestMethod]
+    public void ParentTreeKeysNeverPassTheLargestInteger()
+    {
+        PdfDocument target = PdfDocument.Open(TargetWithKeysNearTheLimit());
+        PdfDocument source = PdfDocument.Open(StructureImportTests.Tagged("A"));
+
+        target.Pages.Import(source.Pages);
+
+        for (int i = 1; i < target.Pages.Count; i++)
+        {
+            if (target.Pages[i].Dictionary["StructParents"] is not PdfNumber key) continue;
+            Assert.IsTrue(key.IntegerValue is >= 0 and < int.MaxValue, "the key fits an integer");
+            Assert.AreNotEqual(2147483646L, key.IntegerValue, "the key is not one the target already uses");
+        }
+
+        Assert.IsTrue(target.Diagnostics.Any(d => d.Kind == PdfDiagnosticKind.Skipped), "the untagged copy is reported");
     }
 }
