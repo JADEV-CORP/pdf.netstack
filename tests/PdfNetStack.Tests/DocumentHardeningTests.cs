@@ -272,6 +272,99 @@ public sealed class DocumentHardeningTests
         Assert.HasCount(20_000, PdfDocument.Open(pdf).Pages);
     }
 
+    /// <summary>A stream that cannot seek and hands out one byte per read, slowly.</summary>
+    private sealed class TricklingStream(byte[] data) : Stream
+    {
+        private int _at;
+
+        public override bool CanRead => true;
+
+        public override bool CanSeek => false;
+
+        public override bool CanWrite => false;
+
+        public override long Length => throw new NotSupportedException();
+
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            if (_at >= data.Length || count == 0) return 0;
+            Thread.Sleep(2);
+            buffer[offset] = data[_at++];
+            return 1;
+        }
+
+        public override void Flush()
+        {
+        }
+
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+
+        public override void SetLength(long value) => throw new NotSupportedException();
+
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
+    [TestMethod]
+    [DataRow(PdfLoadMode.InMemory)]
+    [DataRow(PdfLoadMode.OnDemand)]
+    public void TheTimeoutBoundsReadingAStreamThatTrickles(PdfLoadMode mode)
+    {
+        // About 1 KB at 2 ms a byte is two seconds of reading; the limit is a tenth of a second.
+        byte[] pdf = Pdf("A", "B", "C");
+        var options = new PdfLoadOptions { Mode = mode, Limits = PdfLimits.Default with { Timeout = TimeSpan.FromMilliseconds(100) } };
+
+        var e = Assert.ThrowsExactly<PdfLimitExceededException>(() => PdfDocument.Open(new TricklingStream(pdf), options));
+
+        Assert.AreEqual(PdfLimitKind.Timeout, e.Limit);
+    }
+
+    [TestMethod]
+    [DataRow(PdfLoadMode.InMemory)]
+    [DataRow(PdfLoadMode.OnDemand)]
+    public async Task TheTimeoutBoundsReadingAStreamAsynchronouslyToo(PdfLoadMode mode)
+    {
+        byte[] pdf = Pdf("A", "B", "C");
+        var options = new PdfLoadOptions { Mode = mode, Limits = PdfLimits.Default with { Timeout = TimeSpan.FromMilliseconds(100) } };
+
+        PdfLimitExceededException e = await Assert.ThrowsExactlyAsync<PdfLimitExceededException>(() => PdfDocument.OpenAsync(new TricklingStream(pdf), options));
+
+        Assert.AreEqual(PdfLimitKind.Timeout, e.Limit);
+    }
+
+    [TestMethod]
+    public void TheTimeoutBoundsParsingADocumentOpenedOnDemandFromMemory()
+    {
+        byte[] pdf = Pdf("A");
+        var options = new PdfLoadOptions { Mode = PdfLoadMode.OnDemand, Limits = PdfLimits.Default with { Timeout = TimeSpan.FromTicks(1) } };
+
+        var e = Assert.ThrowsExactly<PdfLimitExceededException>(() => PdfDocument.Open(pdf.AsMemory(), options));
+
+        Assert.AreEqual(PdfLimitKind.Timeout, e.Limit);
+    }
+
+    [TestMethod]
+    [DataRow(PdfLoadMode.InMemory)]
+    [DataRow(PdfLoadMode.OnDemand)]
+    public void AFileOverTheInputLimitIsRefusedAndReleased(PdfLoadMode mode)
+    {
+        using var temp = new TempFolder();
+        string path = Path.Combine(temp.Path, "big.pdf");
+        File.WriteAllBytes(path, Pdf("A"));
+        var options = new PdfLoadOptions { Mode = mode, Limits = PdfLimits.Default with { MaxInputBytes = 100 } };
+
+        var e = Assert.ThrowsExactly<PdfLimitExceededException>(() => PdfDocument.Open(path, options));
+
+        Assert.AreEqual(PdfLimitKind.InputBytes, e.Limit);
+        File.Delete(path);
+        Assert.IsFalse(File.Exists(path), "No handle is left on the file.");
+    }
+
     private sealed class TempFolder : IDisposable
     {
         public TempFolder()

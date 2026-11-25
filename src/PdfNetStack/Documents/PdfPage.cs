@@ -95,6 +95,7 @@ public sealed class PdfPage
     /// The images the page draws, in drawing order, with where each lands: image XObjects
     /// (inside forms too) and inline images. Damaged content is read as far as it goes.
     /// </summary>
+    /// <exception cref="PdfLimitExceededException">The call ran past PdfLimits.Timeout.</exception>
     public IReadOnlyList<PdfPageImage> GetImages() => GetImages(CancellationToken.None);
 
     /// <summary>
@@ -103,6 +104,7 @@ public sealed class PdfPage
     /// </summary>
     /// <param name="cancellationToken">Observed while the content is read: before each stream is decoded and every few hundred operators.</param>
     /// <exception cref="OperationCanceledException">Cancelled before the content was read.</exception>
+    /// <exception cref="PdfLimitExceededException">The call ran past PdfLimits.Timeout.</exception>
     public IReadOnlyList<PdfPageImage> GetImages(CancellationToken cancellationToken)
     {
         var finder = new PdfPageImage.Finder(Owner) { Cancellation = cancellationToken };
@@ -138,6 +140,7 @@ public sealed class PdfPage
     /// }
     /// </code>
     /// </example>
+    /// <exception cref="PdfLimitExceededException">The call ran past PdfLimits.Timeout.</exception>
     public string ExtractText() => ExtractText(CancellationToken.None);
 
     /// <summary>
@@ -146,6 +149,7 @@ public sealed class PdfPage
     /// </summary>
     /// <param name="cancellationToken">Observed while the content is read, and before the lines are laid out.</param>
     /// <exception cref="OperationCanceledException">Cancelled before the text was read.</exception>
+    /// <exception cref="PdfLimitExceededException">The call ran past PdfLimits.Timeout.</exception>
     public string ExtractText(CancellationToken cancellationToken)
     {
         IReadOnlyList<PdfLetter> letters = GetLetters(cancellationToken);
@@ -164,6 +168,7 @@ public sealed class PdfPage
     /// CJK CMap other than Identity-H, Identity-V and the Unicode CMaps rely on /ToUnicode for their
     /// text and use the default width for spacing. At most 500,000 letters are read per page.
     /// </remarks>
+    /// <exception cref="PdfLimitExceededException">The call ran past PdfLimits.Timeout.</exception>
     public IReadOnlyList<PdfLetter> GetLetters() => GetLetters(CancellationToken.None);
 
     /// <summary>
@@ -172,6 +177,7 @@ public sealed class PdfPage
     /// </summary>
     /// <param name="cancellationToken">Observed while the content is read: before each stream is decoded and every few hundred operators.</param>
     /// <exception cref="OperationCanceledException">Cancelled before the content was read.</exception>
+    /// <exception cref="PdfLimitExceededException">The call ran past PdfLimits.Timeout.</exception>
     public IReadOnlyList<PdfLetter> GetLetters(CancellationToken cancellationToken)
     {
         var extractor = new Text.Extraction.TextExtractor(Owner) { Cancellation = cancellationToken };
@@ -183,6 +189,7 @@ public sealed class PdfPage
     /// The page's words in reading order, as <see cref="ExtractText()"/> reads them: letters on one
     /// line, split at space characters and at gaps wider than 0.15 times the font size.
     /// </summary>
+    /// <exception cref="PdfLimitExceededException">The call ran past PdfLimits.Timeout.</exception>
     public IReadOnlyList<PdfWord> GetWords() => GetWords(CancellationToken.None);
 
     /// <summary>
@@ -191,6 +198,7 @@ public sealed class PdfPage
     /// </summary>
     /// <param name="cancellationToken">Observed while the content is read, and before the lines are laid out.</param>
     /// <exception cref="OperationCanceledException">Cancelled before the words were read.</exception>
+    /// <exception cref="PdfLimitExceededException">The call ran past PdfLimits.Timeout.</exception>
     public IReadOnlyList<PdfWord> GetWords(CancellationToken cancellationToken)
     {
         IReadOnlyList<PdfLetter> letters = GetLetters(cancellationToken);

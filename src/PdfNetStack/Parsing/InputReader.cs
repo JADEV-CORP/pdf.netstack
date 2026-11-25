@@ -12,7 +12,8 @@ internal static class InputReader
     private const int LargestPiece = 4 << 20;
 
     /// <exception cref="NotSupportedException">The stream holds more than one array can.</exception>
-    public static ReadOnlyMemory<byte> ReadToEnd(Stream stream, long maxBytes = long.MaxValue)
+    /// <exception cref="PdfLimitExceededException">The input is over <paramref name="maxBytes"/>, or <paramref name="deadline"/> passed between reads.</exception>
+    public static ReadOnlyMemory<byte> ReadToEnd(Stream stream, long maxBytes = long.MaxValue, Deadline deadline = default)
     {
         if (Exposed(stream, maxBytes) is { } exposed) return exposed;
 
@@ -21,7 +22,12 @@ internal static class InputReader
         {
             byte[] sized = new byte[Remaining(stream, maxBytes)];
             int total = 0, read;
-            while (total < sized.Length && (read = stream.Read(sized, total, sized.Length - total)) > 0) total += read;
+            while (total < sized.Length && (read = stream.Read(sized, total, sized.Length - total)) > 0)
+            {
+                total += read;
+                deadline.ThrowIfPassed(null);
+            }
+
             if (total < sized.Length) return sized.AsMemory(0, total);
 
             // The stream ended where it said it would, unless it grew meanwhile.
@@ -31,6 +37,7 @@ internal static class InputReader
 
         while (pieces.Fill(stream.Read(pieces.Next(), pieces.Used, pieces.Room)))
         {
+            deadline.ThrowIfPassed(null);
         }
 
         return pieces.Join();
@@ -38,7 +45,7 @@ internal static class InputReader
 
 #pragma warning disable CA1835 // Array overloads keep one code path for .NET Standard 2.0.
     /// <exception cref="NotSupportedException">The stream holds more than one array can.</exception>
-    public static async Task<ReadOnlyMemory<byte>> ReadToEndAsync(Stream stream, CancellationToken cancellationToken, long maxBytes = long.MaxValue)
+    public static async Task<ReadOnlyMemory<byte>> ReadToEndAsync(Stream stream, CancellationToken cancellationToken, long maxBytes = long.MaxValue, Deadline deadline = default)
     {
         if (Exposed(stream, maxBytes) is { } exposed) return exposed;
 
@@ -47,7 +54,12 @@ internal static class InputReader
         {
             byte[] sized = new byte[Remaining(stream, maxBytes)];
             int total = 0, read;
-            while (total < sized.Length && (read = await stream.ReadAsync(sized, total, sized.Length - total, cancellationToken).ConfigureAwait(false)) > 0) total += read;
+            while (total < sized.Length && (read = await stream.ReadAsync(sized, total, sized.Length - total, cancellationToken).ConfigureAwait(false)) > 0)
+            {
+                total += read;
+                deadline.ThrowIfPassed(null);
+            }
+
             if (total < sized.Length) return sized.AsMemory(0, total);
 
             // The stream ended where it said it would, unless it grew meanwhile.
@@ -57,6 +69,7 @@ internal static class InputReader
 
         while (pieces.Fill(await stream.ReadAsync(pieces.Next(), pieces.Used, pieces.Room, cancellationToken).ConfigureAwait(false)))
         {
+            deadline.ThrowIfPassed(null);
         }
 
         return pieces.Join();
