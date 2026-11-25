@@ -104,17 +104,19 @@ public static partial class PdfOptimizer
         long CandidateLength = 0)
     {
         public IReadOnlyList<PdfDiagnostic> Diagnostics { get; init; } = [];
+
+        /// <summary>Lowercase hex SHA-256 of the input; empty when time ran out before it was read through.</summary>
+        public string SourceSha256 { get; init; } = "";
     }
 
     /// <summary>Streaming mode for a source in memory or on a seekable stream, to any output.</summary>
-    private static PdfOptimizationResult OptimizeStreaming(Source source, Stream output, PdfOptimizerOptions options, CancellationToken ct)
+    private static PdfOptimizationResult OptimizeStreaming(Source source, Stream output, PdfOptimizerOptions options, Deadline deadline, CancellationToken ct)
     {
         var clock = Stopwatch.StartNew();
-        (string sourceHash, int byteRanges) = source.Scan(ct);
         StreamedOutcome outcome;
         using (FileStream candidate = TemporaryFile())
         {
-            outcome = RunStreaming(source, byteRanges, candidate, options, ct);
+            outcome = RunStreaming(source, candidate, options, deadline, ct);
             if (outcome.Rewritten)
             {
                 candidate.Position = 0;
@@ -123,11 +125,11 @@ public static partial class PdfOptimizer
         }
 
         if (!outcome.Rewritten) source.CopyTo(output, ct);
-        return StreamedResult(outcome, source.Length, sourceHash, clock.Elapsed);
+        return StreamedResult(outcome, source.Length, clock.Elapsed);
     }
 
     /// <summary>Streaming mode for <see cref="OptimizeAsync"/>: the caller's streams are only read and written asynchronously.</summary>
-    private static async Task<PdfOptimizationResult> OptimizeStreamingAsync(Stream input, Stream output, PdfOptimizerOptions options, CancellationToken ct)
+    private static async Task<PdfOptimizationResult> OptimizeStreamingAsync(Stream input, Stream output, PdfOptimizerOptions options, Deadline deadline, CancellationToken ct)
     {
         var clock = Stopwatch.StartNew();
 
@@ -140,27 +142,30 @@ public static partial class PdfOptimizer
             if (!inPlace)
             {
                 // Only as much as the limits allow is taken in. Past that the input is passed
-                // on as it comes, so an endless one never fills the disk.
+                // on as it comes, so an endless one never fills the disk. Both end at the time
+                // limit, and an input not read in full by then is not drained to be written.
                 long cap = InputCap(options);
                 spool = TemporaryFile();
-                bool tooLong = input.CanSeek && input.Length - input.Position > cap;
-                if (!tooLong) tooLong = await SpoolAsync(input, spool, cap, ct).ConfigureAwait(false);
-                if (tooLong)
+                using (var time = new TimeLimit(deadline, ct))
                 {
-                    long length = await PassThroughAsync(spool, input, output, ct).ConfigureAwait(false);
-                    await output.FlushAsync(ct).ConfigureAwait(false);
-                    return OverLimit(length, options, ct);
+                    bool tooLong = input.CanSeek && input.Length - input.Position > cap;
+                    if (!tooLong) tooLong = await SpoolAsync(input, spool, cap, time).ConfigureAwait(false);
+                    if (tooLong)
+                    {
+                        long length = await PassThroughAsync(spool, input, output, time).ConfigureAwait(false);
+                        await output.FlushAsync(ct).ConfigureAwait(false);
+                        return OverLimit(length, options, ct);
+                    }
                 }
 
                 await spool.FlushAsync(ct).ConfigureAwait(false);
             }
 
             var source = new Source(spool ?? input);
-            (string sourceHash, int byteRanges) = source.Scan(ct);
             StreamedOutcome outcome;
             using (FileStream candidate = TemporaryFile())
             {
-                outcome = RunStreaming(source, byteRanges, candidate, options, ct);
+                outcome = RunStreaming(source, candidate, options, deadline, ct);
                 if (outcome.Rewritten)
                 {
                     candidate.Position = 0;
@@ -170,7 +175,7 @@ public static partial class PdfOptimizer
 
             if (!outcome.Rewritten) await source.CopyToAsync(output, ct).ConfigureAwait(false);
             await output.FlushAsync(ct).ConfigureAwait(false);
-            return StreamedResult(outcome, source.Length, sourceHash, clock.Elapsed);
+            return StreamedResult(outcome, source.Length, clock.Elapsed);
         }
         finally
         {
@@ -179,31 +184,10 @@ public static partial class PdfOptimizer
     }
 
     /// <summary>
-    /// Copies <paramref name="input"/> to <paramref name="spool"/> until it ends, or until it has
-    /// run past <paramref name="cap"/> bytes by up to one chunk, which is then true.
-    /// </summary>
-    private static async Task<bool> SpoolAsync(Stream input, Stream spool, long cap, CancellationToken ct)
-    {
-        byte[] chunk = new byte[OutputStreams.CopyBufferSize];
-        long copied = 0;
-        int read;
-#pragma warning disable CA1835 // Array overloads keep one code path for .NET Standard 2.0.
-        while ((read = await input.ReadAsync(chunk, 0, chunk.Length, ct).ConfigureAwait(false)) > 0)
-        {
-            await spool.WriteAsync(chunk, 0, read, ct).ConfigureAwait(false);
-            copied += read;
-            if (copied > cap) return true;
-        }
-#pragma warning restore CA1835
-
-        return false;
-    }
-
-    /// <summary>
     /// Streaming mode for <see cref="OptimizeFileAsync"/>: the rewrite is written to the
     /// destination's temporary file, proven there, and moved into place.
     /// </summary>
-    private static async Task<PdfOptimizationResult> OptimizeFileStreamingAsync(string source, string destination, PdfOptimizerOptions options, CancellationToken ct)
+    private static async Task<PdfOptimizationResult> OptimizeFileStreamingAsync(string source, string destination, PdfOptimizerOptions options, Deadline deadline, CancellationToken ct)
     {
         var clock = Stopwatch.StartNew();
         string? directory = Path.GetDirectoryName(destination);
@@ -216,8 +200,7 @@ public static partial class PdfOptimizer
             using (var candidate = new FileStream(temp, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None, 1 << 16))
             {
                 var from = new Source(input);
-                (string sourceHash, int byteRanges) = from.Scan(ct);
-                StreamedOutcome outcome = RunStreaming(from, byteRanges, candidate, options, ct);
+                StreamedOutcome outcome = RunStreaming(from, candidate, options, deadline, ct);
                 if (!outcome.Rewritten)
                 {
                     candidate.SetLength(0);
@@ -225,7 +208,7 @@ public static partial class PdfOptimizer
                 }
 
                 await candidate.FlushAsync(ct).ConfigureAwait(false);
-                result = StreamedResult(outcome, from.Length, sourceHash, clock.Elapsed);
+                result = StreamedResult(outcome, from.Length, clock.Elapsed);
             }
 
             Compat.MoveOverwrite(temp, destination);
@@ -237,9 +220,10 @@ public static partial class PdfOptimizer
         }
     }
 
-    private static PdfOptimizationResult StreamedResult(StreamedOutcome outcome, long inputLength, string sourceHash, TimeSpan elapsed)
+    private static PdfOptimizationResult StreamedResult(StreamedOutcome outcome, long inputLength, TimeSpan elapsed)
     {
         OptimizationStatistics stats = (outcome.Statistics ?? OptimizationStatistics.Empty(TimeSpan.Zero)) with { Elapsed = elapsed, Streamed = true };
+        string sourceHash = outcome.SourceSha256;
         PdfOptimizationResult result = outcome.Rewritten
             ? new PdfOptimizationResult(outcome.Disposition, inputLength, outcome.CandidateLength, sourceHash, outcome.CandidateSha256, outcome.PageCount, outcome.Reason, stats)
             : new PdfOptimizationResult(outcome.Disposition, inputLength, inputLength, sourceHash, sourceHash, outcome.PageCount, outcome.Reason, stats);
@@ -252,22 +236,33 @@ public static partial class PdfOptimizer
             FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None, 1 << 16, FileOptions.DeleteOnClose);
 
     /// <summary>
-    /// The passes of <see cref="Run"/> on a file read on demand. The rewrite is written to
-    /// <paramref name="candidate"/>, an empty, readable and seekable stream, and proven by reading
-    /// it back; the outcome says whether it is to be delivered.
+    /// The passes of <see cref="Run"/> on a file read on demand, after one read of it for its hash.
+    /// The rewrite is written to <paramref name="candidate"/>, an empty, readable and seekable
+    /// stream, and proven by reading it back; the outcome says whether it is to be delivered.
     /// </summary>
-    private static StreamedOutcome RunStreaming(Source source, int byteRanges, Stream candidate, PdfOptimizerOptions options, CancellationToken ct)
+    /// <param name="deadline">The call's deadline, started before the input was taken in.</param>
+    private static StreamedOutcome RunStreaming(Source source, Stream candidate, PdfOptimizerOptions options, Deadline deadline, CancellationToken ct)
     {
-        if (source.Length > options.MaxInputBytes)
+        // The rewrite lives in the candidate file, so there is no lossless result to fall back
+        // on: a run out of time writes the input. The scan is part of the run's time.
+        using var guard = new RunGuard(options.Limits, source.Length, deadline, ct, options.Workers);
+        string sourceHash;
+        int byteRanges;
+        try
         {
-            return new StreamedOutcome(OptimizationDisposition.UnsupportedRetained, false, "Input exceeds the configured size limit.", 0, null);
+            (sourceHash, byteRanges) = source.Scan(guard.Token);
+        }
+        catch (OperationCanceledException ex) when (guard.TimedOut)
+        {
+            // The input is all at hand, so it is written unchanged, without its hash.
+            (OptimizationDisposition disposition, string reason) = guard.Failure(ex)!.Value;
+            return new StreamedOutcome(disposition, false, reason, 0, null) { Diagnostics = guard.Diagnostics };
         }
 
-        // The rewrite lives in the candidate file, so there is no lossless result to fall back
-        // on: a run out of time writes the input.
-        using var guard = new RunGuard(options.Limits, source.Length, Deadline.Start(options.Limits), ct, options.Workers);
-        StreamedOutcome outcome = RunStreaming(source, byteRanges, candidate, options, guard);
-        return outcome with { Diagnostics = guard.Diagnostics };
+        StreamedOutcome outcome = source.Length > options.MaxInputBytes
+            ? new StreamedOutcome(OptimizationDisposition.UnsupportedRetained, false, "Input exceeds the configured size limit.", 0, null)
+            : RunStreaming(source, byteRanges, candidate, options, guard);
+        return outcome with { Diagnostics = guard.Diagnostics, SourceSha256 = sourceHash };
     }
 
     private static StreamedOutcome RunStreaming(Source source, int byteRanges, Stream candidate, PdfOptimizerOptions options, RunGuard guard)

@@ -136,7 +136,9 @@ public sealed record PdfLimits
     /// <see cref="PdfPage.GetWords()"/>, <see cref="PdfPage.GetLetters()"/>, <see cref="PdfPage.GetImages()"/>),
     /// one inspection or one optimization. Past it the call raises
     /// <see cref="PdfLimitExceededException"/>, except the optimizer, which writes its lossless
-    /// result when time runs out during lossy work and otherwise the input unchanged.
+    /// result when time runs out during lossy work and otherwise the input unchanged. Reading the
+    /// input counts too: when time runs out before the optimizer has read or passed on all of a
+    /// stream or a file, it raises the exception as well, as it cannot write that input unchanged.
     /// <see cref="System.Threading.Timeout.InfiniteTimeSpan"/>, the default, sets no limit.
     /// </summary>
     public TimeSpan Timeout { get; init; } = System.Threading.Timeout.InfiniteTimeSpan;
