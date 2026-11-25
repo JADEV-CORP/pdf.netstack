@@ -102,6 +102,9 @@ internal sealed class BoundedBuffer : IDisposable
         byte[] whole = _buffer;
         _buffer = [];
         _length = 0;
+
+        // The caller keeps these bytes, so they stay charged: Dispose must not refund them as unwritten.
+        _charged = 0;
         return whole;
     }
 
