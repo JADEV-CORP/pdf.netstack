@@ -628,8 +628,12 @@ public sealed class PdfDocument : IDisposable
     /// <param name="inputs">The PDFs to merge, in order, each read from its position to its end.</param>
     /// <param name="output">Receives the merged PDF from its position. It is flushed, not disposed.</param>
     /// <param name="cancellationToken">Observed while each input is read and copied and while the output is written.</param>
+    /// <exception cref="ArgumentException"><paramref name="inputs"/> or <paramref name="output"/> is null, or <paramref name="inputs"/> holds a null stream or one that cannot be read.</exception>
     /// <exception cref="PdfFormatException">An input is not a readable PDF.</exception>
     /// <exception cref="PdfPasswordException">An input is encrypted and cannot be opened without a password.</exception>
+    /// <exception cref="PdfLimitExceededException">An input reached a limit of <see cref="PdfLimits.Default"/>: it is too long, or decodes more data than its budget allows.</exception>
+    /// <exception cref="NotSupportedException">An input is encrypted with a security handler other than the standard password one, or <paramref name="output"/> cannot be written.</exception>
+    /// <exception cref="InvalidOperationException">The inputs hold no page between them. Nothing is written to <paramref name="output"/>.</exception>
     /// <exception cref="OperationCanceledException">Cancelled; what reached <paramref name="output"/> is not a complete file.</exception>
     public static Task MergeAsync(IEnumerable<Stream> inputs, Stream output, CancellationToken cancellationToken = default) =>
         MergeAsync(inputs, output, null, null, cancellationToken);
@@ -675,9 +679,23 @@ public sealed class PdfDocument : IDisposable
     /// <paramref name="inputs"/> is a collection, else out of an unknown total. May be null.
     /// </param>
     /// <param name="cancellationToken">Observed while each input is read and copied and while the output is written.</param>
-    /// <exception cref="ArgumentException"><paramref name="inputs"/> holds a null stream or one that cannot be read.</exception>
+    /// <exception cref="ArgumentException"><paramref name="inputs"/> or <paramref name="output"/> is null, or <paramref name="inputs"/> holds a null stream or one that cannot be read.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">An option of the load options is out of range.</exception>
     /// <exception cref="PdfFormatException">An input is not a readable PDF.</exception>
     /// <exception cref="PdfPasswordException">An input is encrypted and the load options' password does not open it.</exception>
+    /// <exception cref="PdfLimitExceededException">
+    /// An input reached a limit of the load options: it is too long, decodes more data than its
+    /// budget allows, or takes longer than <see cref="PdfLimits.Timeout"/> to open.
+    /// </exception>
+    /// <exception cref="NotSupportedException">
+    /// An input is encrypted with a security handler other than the standard password one, or,
+    /// opened <see cref="PdfLoadMode.InMemory"/>, holds 2 GiB or more; or <paramref name="output"/>
+    /// cannot be written.
+    /// </exception>
+    /// <exception cref="InvalidOperationException">
+    /// The inputs hold no page between them, or the merged document cannot be saved under the
+    /// save options' <see cref="PdfSaveOptions.Conformance"/>. Nothing is written to <paramref name="output"/>.
+    /// </exception>
     /// <exception cref="OperationCanceledException">Cancelled; what reached <paramref name="output"/> is not a complete file.</exception>
     public static async Task MergeAsync(IEnumerable<Stream> inputs, Stream output, PdfMergeOptions? options, IProgress<PdfProgress>? progress = null, CancellationToken cancellationToken = default)
     {
