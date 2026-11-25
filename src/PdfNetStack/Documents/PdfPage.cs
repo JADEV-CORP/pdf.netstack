@@ -286,30 +286,17 @@ public sealed class PdfPageCollection : IReadOnlyList<PdfPage>
         Compat.ThrowIfGreaterThan((uint)at, (uint)_pages.Count, nameof(index));
 
         // Import per source document, so links between pages of one source resolve, then restore
-        // the caller's order. A page listed twice is copied twice.
+        // the caller's order. A page listed twice is copied twice, by the same call, so a failure
+        // takes back every copy of the source.
         var copies = new Dictionary<PdfPage, Queue<PdfPage>>();
         foreach (IGrouping<PdfDocument, PdfPage> group in source.GroupBy(p => p.Owner))
         {
-            // One call copies a page once, so a page listed again waits for a later round; each
-            // round gets its own page numbers, annotations and structure keys.
-            var rounds = new List<List<PdfPage>>();
-            var occurrences = new Dictionary<PdfPage, int>();
-            foreach (PdfPage page in group)
+            List<PdfPage> originals = [.. group];
+            IReadOnlyList<PdfPage> imported = _owner.ImporterFor(group.Key).Import(originals, cancellationToken);
+            for (int i = 0; i < originals.Count; i++)
             {
-                occurrences.TryGetValue(page, out int round);
-                occurrences[page] = round + 1;
-                if (round == rounds.Count) rounds.Add([]);
-                rounds[round].Add(page);
-            }
-
-            foreach (List<PdfPage> originals in rounds)
-            {
-                IReadOnlyList<PdfPage> imported = _owner.ImporterFor(group.Key).Import(originals, cancellationToken);
-                for (int i = 0; i < originals.Count; i++)
-                {
-                    if (!copies.TryGetValue(originals[i], out Queue<PdfPage>? queue)) copies[originals[i]] = queue = new Queue<PdfPage>();
-                    queue.Enqueue(imported[i]);
-                }
+                if (!copies.TryGetValue(originals[i], out Queue<PdfPage>? queue)) copies[originals[i]] = queue = new Queue<PdfPage>();
+                queue.Enqueue(imported[i]);
             }
         }
 

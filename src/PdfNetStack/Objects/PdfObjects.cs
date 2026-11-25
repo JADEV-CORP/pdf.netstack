@@ -363,6 +363,14 @@ public sealed class PdfDictionary : PdfObject, IEnumerable<KeyValuePair<string, 
     /// <summary>The value of <paramref name="key"/> when it is a direct name, without the slash.</summary>
     public string? GetName(string key) => this[key] is PdfName n ? n.Value : null;
 
+    /// <summary>Removes every entry at once; removing them one by one rebuilds the index each time.</summary>
+    internal void Clear()
+    {
+        _keys.Clear();
+        _values.Clear();
+        _index = null;
+    }
+
     internal KeyValuePair<string, PdfObject> EntryAt(int i) => new(_keys[i], _values[i]);
 
     internal void SetValueAt(int i, PdfObject value) => _values[i] = value;
