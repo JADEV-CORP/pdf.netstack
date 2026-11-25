@@ -48,6 +48,23 @@ public sealed class StructureHardeningTests
         return b.Build();
     }
 
+    /// <summary>A paragraph with a /Ref to the table that follows it.</summary>
+    private static byte[] ReferenceToLaterSibling()
+    {
+        var b = new PdfBuilder();
+        b.Set(1, "<</Type/Catalog/Pages 2 0 R/StructTreeRoot 20 0 R/MarkInfo<</Marked true>>>>");
+        b.Set(2, "<</Type/Pages/Kids[5 0 R]/Count 1>>");
+        b.Set(3, FontObject);
+        b.SetStream(4, "", Ascii("/P <</MCID 0>> BDC BT /F1 12 Tf 72 700 Td (See) Tj ET EMC /Table <</MCID 1>> BDC BT /F1 12 Tf 72 680 Td (Data) Tj ET EMC"));
+        b.Set(5, "<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]/Resources<</Font<</F1 3 0 R>>>>/Contents 4 0 R/StructParents 0>>");
+        b.Set(20, "<</Type/StructTreeRoot/K 21 0 R/ParentTree 30 0 R/ParentTreeNextKey 1>>");
+        b.Set(21, "<</Type/StructElem/S/Document/P 20 0 R/K[22 0 R 23 0 R]>>");
+        b.Set(22, "<</Type/StructElem/S/P/P 21 0 R/Pg 5 0 R/Ref[23 0 R]/K 0>>");
+        b.Set(23, "<</Type/StructElem/S/Table/P 21 0 R/Pg 5 0 R/K 1>>");
+        b.Set(30, "<</Nums[0[22 0 R 23 0 R]]>>");
+        return b.Build();
+    }
+
     [TestMethod]
     public void AnImportedPageListedTwiceIsTaggedTwiceWithItsOwnAnnotations()
     {
@@ -177,5 +194,19 @@ public sealed class StructureHardeningTests
         Assert.HasCount(2, cells);
         string[] headers = [.. cells.Select(c => ((PdfString)((PdfArray)merged.Resolve(merged.ResolveDictionary(c["A"])!["Headers"])!)[0]).ToText())];
         Assert.AreEqual("th1,th1_2", string.Join(",", headers));
+    }
+
+    [TestMethod]
+    public void AReferenceToALaterSiblingFollowsItsCopy()
+    {
+        PdfDocument source = PdfDocument.Open(ReferenceToLaterSibling());
+        PdfDocument target = PdfDocument.Create();
+        target.Pages.Import(source.Pages);
+
+        PdfDocument saved = StructureImportTests.Saved(target);
+        StructureImportTests.CheckStructure(saved);
+        var references = (PdfArray)saved.Resolve(StructureImportTests.Element(saved, "P")["Ref"])!;
+        Assert.HasCount(1, references);
+        Assert.AreSame(StructureImportTests.Element(saved, "Table"), saved.ResolveDictionary(references[0]));
     }
 }

@@ -83,6 +83,8 @@ internal sealed partial class PageImporter
             if (CopyElement(kid, null, 0, copy, pageMap, batch, work, ct) is { } top) copy.Tops.Add(top);
         }
 
+        ResolveReferences(copy);
+
         // Attribute classes travel with the elements that use them; their values may refer to
         // other objects, which the work queue copies.
         if (copy.Tops.Count > 0 && !SameDocument && !_classMapMerged && _source.Resolve(index.Root["ClassMap"]) is PdfDictionary classes)
@@ -165,6 +167,10 @@ internal sealed partial class PageImporter
                 case "S" when !SameDocument && _source.Resolve(value) is PdfName type:
                     result.Set(key, new PdfName(Renamed(_roleRenames, type.Value)));
                     break;
+                case "Ref":
+                    // Names elements that may come later in the tree, so it waits for the full map.
+                    copy.PendingReferences.Add((result, value));
+                    break;
                 case "C" when !SameDocument:
                     result.Set(key, RenamedClasses(_source.Resolve(value)));
                     break;
@@ -193,6 +199,26 @@ internal sealed partial class PageImporter
         }
 
         return (result, copyNumber);
+    }
+
+    /// <summary>
+    /// Points the /Ref of copied elements at the copies of the elements they name (ISO 32000-1,
+    /// Table 323). Runs once every element is copied, as a reference may name a later sibling.
+    /// Elements that were not copied are left out, and so is a /Ref that names none.
+    /// </summary>
+    private void ResolveReferences(StructureCopy copy)
+    {
+        foreach ((PdfDictionary element, PdfObject value) in copy.PendingReferences)
+        {
+            if (_source.Resolve(value) is not PdfArray array) continue;
+            var mapped = new PdfArray();
+            foreach (PdfObject item in array)
+            {
+                if (item is PdfReference r && StructureReference(r) is PdfReference target) mapped.Add(target);
+            }
+
+            if (mapped.Count > 0) element.Set("Ref", mapped);
+        }
     }
 
     /// <summary>
@@ -666,6 +692,9 @@ internal sealed partial class PageImporter
         public PdfDictionary? ClassMap { get; set; }
 
         public int Copied { get; set; }
+
+        /// <summary>Copies whose /Ref is resolved once all elements are copied, with the source's value.</summary>
+        public List<(PdfDictionary Element, PdfObject Value)> PendingReferences { get; } = [];
 
         /// <summary>Elements written in place that were copied, by identity.</summary>
         public HashSet<PdfDictionary> DirectVisited { get; } = new(ReferenceEqualityComparer.Instance);
