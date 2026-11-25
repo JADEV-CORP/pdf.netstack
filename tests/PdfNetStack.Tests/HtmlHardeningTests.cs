@@ -122,13 +122,21 @@ public sealed class HtmlHardeningTests
     }
 
     [TestMethod]
+    [DoNotParallelize] // timing: the token fires from a timer while the parser runs
     public void ParsingTextObservesCancellation()
     {
-        using var cancel = new CancellationTokenSource();
-        cancel.Cancel();
+        // Character references keep the parser in text for a second or more, with no tag to check
+        // the token at, and the token fires once parsing is under way: only the checks made while
+        // reading text, in the body or in RCDATA, can see it.
+        string text = new('&', 2_000_000);
+        AssertCancelledWhileParsing(text);
+        AssertCancelledWhileParsing("<textarea>" + text + "</textarea>");
+    }
 
-        Assert.ThrowsExactly<OperationCanceledException>(() => HtmlParser.Parse(new string('x', 1_000_000), cancel.Token));
-        Assert.ThrowsExactly<OperationCanceledException>(() => HtmlParser.Parse("<textarea>" + new string('&', 1_000_000) + "</textarea>", cancel.Token));
+    private static void AssertCancelledWhileParsing(string html)
+    {
+        using var cancel = new CancellationTokenSource(TimeSpan.FromMilliseconds(50));
+        Assert.ThrowsExactly<OperationCanceledException>(() => HtmlParser.Parse(html, cancel.Token), html.Substring(0, 10));
     }
 
     [TestMethod]
