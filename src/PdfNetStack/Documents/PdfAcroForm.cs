@@ -487,10 +487,16 @@ public abstract class PdfField
     }
 
     /// <summary>Marks the document as changed by filling: drops XFA and records the new value.</summary>
-    internal void SetValue(PdfObject? value)
+    /// <param name="value">The new value, or null to clear the field.</param>
+    /// <param name="empty">
+    /// The field kind's empty value. A cleared field holds it when an ancestor has a value, since
+    /// /V is inherited and removing the field's own would show the ancestor's.
+    /// </param>
+    internal void SetValue(PdfObject? value, PdfObject? empty = null)
     {
         if (ReadOnly) throw new InvalidOperationException($"The field {Name} is read only.");
         Form.DropXfa();
+        if (value is null && empty is not null && _ancestors.Exists(a => a["V"] is not null)) value = empty;
         if (value is null) Dictionary.Remove("V");
         else Dictionary.Set("V", value);
         Dictionary.Remove("RV");
@@ -511,7 +517,10 @@ public sealed class PdfTextField : PdfField
     /// <inheritdoc/>
     public override string? Value => Text;
 
-    /// <summary>The text; setting it redraws the field.</summary>
+    /// <summary>
+    /// The text; setting it redraws the field. Setting null clears it; a field whose parent field
+    /// has a value then holds an empty text, so the parent's value does not show through.
+    /// </summary>
     /// <exception cref="InvalidOperationException">The field is read only.</exception>
     public string? Text
     {
@@ -524,7 +533,7 @@ public sealed class PdfTextField : PdfField
         set
         {
             if (value is not null && MaxLength is int max && value.Length > max) value = value.Substring(0, max);
-            SetValue(value is null ? null : PdfString.FromText(value));
+            SetValue(value is null ? null : PdfString.FromText(value), PdfString.FromText(""));
             foreach (PdfWidget w in Widgets) FieldAppearance.Text(this, w, value ?? "");
         }
     }
@@ -713,7 +722,7 @@ public sealed class PdfChoiceField : PdfField
             0 => null,
             1 => PdfString.FromText(exports[0]),
             _ => new PdfArray([.. exports.Select(e => (PdfObject)PdfString.FromText(e))]),
-        });
+        }, new PdfArray());
         var indices = new PdfArray();
         for (int i = 0; i < options.Count; i++)
         {
