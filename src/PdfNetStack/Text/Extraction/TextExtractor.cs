@@ -29,6 +29,7 @@ internal sealed class TextExtractor(PdfDocument document) : ContentInterpreter(d
     // Characters in Letters, against PdfLimits.MaxTextCharsPerPage.
     private long _chars;
     private bool _full;
+    private long _glyphs;
 
     public List<PdfLetter> Letters { get; } = [];
 
@@ -52,6 +53,8 @@ internal sealed class TextExtractor(PdfDocument document) : ContentInterpreter(d
             ReadOnlySpan<byte> bytes = s.Bytes;
             for (int at = 0; at < bytes.Length;)
             {
+                // One string can hold millions of glyphs, between the operator checks.
+                if ((++_glyphs & 4095) == 0) CheckLimits();
                 int length = font.NextCode(bytes, at, out uint code);
                 at += length;
                 Show(font, code, length);
@@ -144,7 +147,8 @@ internal sealed class TextExtractor(PdfDocument document) : ContentInterpreter(d
     /// </summary>
     private bool Room(int length)
     {
-        if (!_full && _chars + length <= Document.Limits.MaxTextCharsPerPage)
+        // Tested each time: an ActualText span gives its letters back, so room can open again.
+        if (_chars + length <= Document.Limits.MaxTextCharsPerPage)
         {
             _chars += length;
             return true;

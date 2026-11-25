@@ -67,6 +67,33 @@ internal sealed class ResourceBudget
         return false;
     }
 
+    /// <summary>
+    /// Takes up to <paramref name="count"/> content operators before they run; returns how many it
+    /// got, none (reported once) when the budget is spent. Give back what was not used with
+    /// <see cref="RefundOperations"/>.
+    /// </summary>
+    public long ReserveOperations(long count)
+    {
+        while (true)
+        {
+            long left = Interlocked.Read(ref _operationsLeft);
+            if (left <= 0)
+            {
+                Report(PdfLimitKind.OperationsPerDocument, "The document runs more content operators than its limit allows (PdfLimits.MaxOperationsPerDocument); content past it is not read.");
+                return 0;
+            }
+
+            long taken = Math.Min(count, left);
+            if (Interlocked.CompareExchange(ref _operationsLeft, left - taken, left) == left) return taken;
+        }
+    }
+
+    /// <summary>Gives back operators reserved ahead that never ran.</summary>
+    public void RefundOperations(long count)
+    {
+        if (count > 0) Interlocked.Add(ref _operationsLeft, count);
+    }
+
     /// <summary>The exception for a limit reached, reported to the diagnostics first.</summary>
     public PdfLimitExceededException Exceeded(PdfLimitKind limit, string message)
     {
