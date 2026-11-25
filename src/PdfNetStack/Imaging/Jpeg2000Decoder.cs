@@ -169,7 +169,7 @@ internal static class Jpeg2000Decoder
         return Guarded(() =>
         {
             (Jpeg2000Codestream stream, Jp2Header? header) = Open(bytes, maxPixels);
-            return Assemble(stream, Planes(stream, byteLimit, bandRows), header, applyPalette);
+            return Assemble(stream, Planes(stream, byteLimit, bandRows, PaletteBytes(stream, header, applyPalette)), header, applyPalette);
         });
     }
 
@@ -219,7 +219,7 @@ internal static class Jpeg2000Decoder
         if (sycc && !ordered.Take(3).All(c => stream.Components[c.Component].Dx == stream.Components[ordered[0].Component].Dx
             && stream.Components[c.Component].Dy == stream.Components[ordered[0].Component].Dy))
         {
-            int[][] planes = Planes(stream, byteLimit, bandRows, ct);
+            int[][] planes = Planes(stream, byteLimit, bandRows, PaletteBytes(stream, header, !keepIndexes), ct);
             Jpeg2000Image decoded = Assemble(stream, planes, header, applyPalette: !keepIndexes);
             List<Jpeg2000Channel> all = [.. decoded.Channels.Where(c => !c.Opacity), .. decoded.Channels.Where(c => c.Opacity)];
             var whole = new Jpeg2000Image { X0 = image.X0, Y0 = image.Y0, Width = image.Width, Height = image.Height, Channels = all, ColorSpace = image.ColorSpace };
@@ -265,11 +265,12 @@ internal static class Jpeg2000Decoder
         ch.Count >= 3 && ch[0].Width == ch[1].Width && ch[0].Width == ch[2].Width && ch[0].Height == ch[1].Height && ch[0].Height == ch[2].Height;
 
     /// <summary>The image's components as planes at component resolution.</summary>
-    private static int[][] Planes(Jpeg2000Codestream stream, long byteLimit, int bandRows, CancellationToken ct = default)
+    /// <param name="paletteBytes">What <see cref="Assemble"/> then allocates for the channels the palette maps, counted against the limit too.</param>
+    private static int[][] Planes(Jpeg2000Codestream stream, long byteLimit, int bandRows, long paletteBytes, CancellationToken ct = default)
     {
         Jpeg2000Component[] components = stream.Components;
         int n = components.Length;
-        long planeBytes = 0;
+        long planeBytes = paletteBytes;
         for (int c = 0; c < n; c++)
         {
             long w = ComponentWidth(stream, c), h = ComponentHeight(stream, c);
@@ -280,6 +281,23 @@ internal static class Jpeg2000Decoder
         var sink = new PlaneSink(stream);
         Decode(stream, sink, byteLimit, planeBytes, bandRows, sink.Allocate, ct);
         return sink.Planes;
+    }
+
+    /// <summary>
+    /// The bytes <see cref="Assemble"/> allocates when it applies the palette: a plane for each
+    /// channel the component mapping takes through it. The mapping may list one component many
+    /// times, so this can be many times the planes themselves.
+    /// </summary>
+    private static long PaletteBytes(Jpeg2000Codestream stream, Jp2Header? header, bool applyPalette)
+    {
+        if (!applyPalette || header?.Palette is null || header.Mapping is not { Length: > 0 } mapping) return 0;
+        long bytes = 0;
+        foreach ((int component, int type, _) in mapping)
+        {
+            if (type == 1 && component < stream.Components.Length) bytes += 4L * ComponentWidth(stream, component) * ComponentHeight(stream, component);
+        }
+
+        return bytes;
     }
 
     private static int ComponentWidth(Jpeg2000Codestream stream, int c) => Ceil(stream.X1, stream.Components[c].Dx) - Ceil(stream.X0, stream.Components[c].Dx);
