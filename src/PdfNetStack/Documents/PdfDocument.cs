@@ -212,6 +212,7 @@ public sealed class PdfDocument : IDisposable
     /// <param name="password">User or owner password for encrypted files. Null tries the empty user password.</param>
     /// <exception cref="PdfFormatException">The file is not a readable PDF.</exception>
     /// <exception cref="PdfPasswordException">The file is encrypted and the password does not open it.</exception>
+    /// <exception cref="NotSupportedException">The file is encrypted with a security handler other than the standard password one.</exception>
     [OverloadResolutionPriority(1)]
     public static PdfDocument Open(string path, string? password = null) => Open(path, new PdfLoadOptions { Password = password });
 
@@ -231,6 +232,7 @@ public sealed class PdfDocument : IDisposable
     /// <exception cref="ArgumentOutOfRangeException">An option is out of range.</exception>
     /// <exception cref="PdfFormatException">The file is not a readable PDF.</exception>
     /// <exception cref="PdfPasswordException">The file is encrypted and the password does not open it.</exception>
+    /// <exception cref="NotSupportedException">The file is encrypted with a security handler other than the standard password one.</exception>
     public static PdfDocument Open(string path, PdfLoadOptions options)
     {
         Compat.ThrowIfNull(path, nameof(path));
@@ -248,6 +250,7 @@ public sealed class PdfDocument : IDisposable
     /// <param name="password">User or owner password for encrypted files. Null tries the empty user password.</param>
     /// <exception cref="PdfFormatException">The data is not a readable PDF.</exception>
     /// <exception cref="PdfPasswordException">The file is encrypted and the password does not open it.</exception>
+    /// <exception cref="NotSupportedException">The file is encrypted with a security handler other than the standard password one.</exception>
     [OverloadResolutionPriority(1)]
     public static PdfDocument Open(Stream stream, string? password = null) => Open(stream, new PdfLoadOptions { Password = password });
 
@@ -274,7 +277,7 @@ public sealed class PdfDocument : IDisposable
     /// <exception cref="ArgumentOutOfRangeException">An option is out of range.</exception>
     /// <exception cref="PdfFormatException">The data is not a readable PDF.</exception>
     /// <exception cref="PdfPasswordException">The file is encrypted and the password does not open it.</exception>
-    /// <exception cref="NotSupportedException">In memory, the stream holds 2 GiB or more; open it on demand.</exception>
+    /// <exception cref="NotSupportedException">In memory, the stream holds 2 GiB or more (open it on demand), or the file is encrypted with a security handler other than the standard password one.</exception>
     public static PdfDocument Open(Stream stream, PdfLoadOptions options)
     {
         Compat.ThrowIfNull(stream, nameof(stream));
@@ -301,6 +304,7 @@ public sealed class PdfDocument : IDisposable
     /// <param name="maxDecodedStreamBytes">Ceiling for any single decoded stream.</param>
     /// <exception cref="PdfFormatException">The data is not a readable PDF.</exception>
     /// <exception cref="PdfPasswordException">The file is encrypted and the password does not open it.</exception>
+    /// <exception cref="NotSupportedException">The file is encrypted with a security handler other than the standard password one.</exception>
     [OverloadResolutionPriority(1)]
     public static PdfDocument Open(ReadOnlyMemory<byte> data, string? password = null, long maxDecodedStreamBytes = PdfLoadOptions.DefaultMaxDecodedStreamBytes) =>
         Open(data, new PdfLoadOptions { Password = password, MaxDecodedStreamBytes = maxDecodedStreamBytes });
@@ -316,6 +320,7 @@ public sealed class PdfDocument : IDisposable
     /// <exception cref="ArgumentOutOfRangeException">An option is out of range.</exception>
     /// <exception cref="PdfFormatException">The data is not a readable PDF.</exception>
     /// <exception cref="PdfPasswordException">The file is encrypted and the password does not open it.</exception>
+    /// <exception cref="NotSupportedException">The file is encrypted with a security handler other than the standard password one.</exception>
     public static PdfDocument Open(ReadOnlyMemory<byte> data, PdfLoadOptions options)
     {
         Compat.ThrowIfNull(options, nameof(options));
@@ -349,7 +354,7 @@ public sealed class PdfDocument : IDisposable
     /// <exception cref="OperationCanceledException">Cancelled before the document was open.</exception>
     /// <exception cref="PdfFormatException">The data is not a readable PDF.</exception>
     /// <exception cref="PdfPasswordException">The file is encrypted and the password does not open it.</exception>
-    /// <exception cref="NotSupportedException">In memory, the stream holds 2 GiB or more; open it on demand.</exception>
+    /// <exception cref="NotSupportedException">In memory, the stream holds 2 GiB or more (open it on demand), or the file is encrypted with a security handler other than the standard password one.</exception>
     public static async Task<PdfDocument> OpenAsync(Stream stream, PdfLoadOptions? options = null, CancellationToken cancellationToken = default)
     {
         Compat.ThrowIfNull(stream, nameof(stream));
@@ -394,6 +399,7 @@ public sealed class PdfDocument : IDisposable
     /// <exception cref="ArgumentException"><paramref name="stream"/> cannot be read.</exception>
     /// <exception cref="PdfFormatException">The file is not a readable PDF.</exception>
     /// <exception cref="PdfPasswordException">The file is encrypted and the password does not open it.</exception>
+    /// <exception cref="NotSupportedException">The file is encrypted with a security handler other than the standard password one.</exception>
     public static PdfDocument OpenOnDemand(Stream stream, string? password = null, long maxDecodedStreamBytes = PdfLoadOptions.DefaultMaxDecodedStreamBytes) =>
         Open(stream, new PdfLoadOptions { Password = password, MaxDecodedStreamBytes = maxDecodedStreamBytes, Mode = PdfLoadMode.OnDemand });
 
