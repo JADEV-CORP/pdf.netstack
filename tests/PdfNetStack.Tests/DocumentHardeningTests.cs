@@ -219,6 +219,45 @@ public sealed class DocumentHardeningTests
         Assert.AreEqual(PdfLimitKind.Timeout, e.Limit);
     }
 
+    [TestMethod]
+    [DataRow(PdfLoadMode.InMemory)]
+    [DataRow(PdfLoadMode.OnDemand)]
+    public void AMisplacedXrefStreamEntryDoesNotHideARootThatPointsAtIt(PdfLoadMode mode)
+    {
+        // Object 7 is the xref stream; its own entry points at the catalog and /Root names 7.
+        byte[] pdf = PdfBuilder.Simple("A").BuildWithXrefStream(root: 7, misplaceOwnEntry: true);
+
+        using PdfDocument doc = PdfDocument.Open(pdf, new PdfLoadOptions { Mode = mode });
+
+        Assert.AreEqual("A", doc.Pages[0].ExtractText().Trim());
+    }
+
+#if NET
+    [TestMethod]
+    [DoNotParallelize]
+    public void ObjectStreamsClaimingMoreEntriesThanTheyHoldAllocateNothingForThem()
+    {
+        byte[] sound = PdfBuilder.Simple("A").Build();
+        int xref = Compat.Latin1.GetString(sound).LastIndexOf("\nxref", StringComparison.Ordinal);
+        var damaged = new MemoryStream();
+        damaged.Write(sound, 0, xref + 1);
+        for (int n = 10; n < 210; n++)
+        {
+            damaged.Write(Compat.Latin1.GetBytes($"{n} 0 obj\n<</Type/ObjStm/N 1000000/First 0/Length 0>>\nstream\n\nendstream\nendobj\n"));
+        }
+
+        byte[] pdf = damaged.ToArray();
+        PdfDocument.Open(sound);
+
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        using PdfDocument doc = PdfDocument.Open(pdf);
+        long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+
+        Assert.AreEqual("A", doc.Pages[0].ExtractText().Trim());
+        Assert.IsTrue(allocated < 64L << 20, $"Opening allocated {allocated >> 20} MiB.");
+    }
+#endif
+
     private sealed class TempFolder : IDisposable
     {
         public TempFolder()
