@@ -458,6 +458,54 @@ public sealed class DocumentHardeningTests
         Assert.IsNull(a.Dictionary["V"]);
     }
 
+    /// <summary>
+    /// A page tree whose root lists A then X: A leads down a chain of nodes that reaches X one
+    /// level deeper than the tree is read, and X, also the root's own kid, holds the only page.
+    /// </summary>
+    private static byte[] PageTreeReachingANodeTooDeepFirst()
+    {
+        PdfBuilder b = PdfBuilder.Simple("A");
+        const int x = 100, chain = 101;
+        b.Set(x, "<</Type/Pages/Kids[5 0 R]/Count 1>>");
+        for (int i = 0; i < PdfDocument.MaxPageTreeDepth; i++)
+        {
+            int kid = i == PdfDocument.MaxPageTreeDepth - 1 ? x : chain + i + 1;
+            b.Set(chain + i, $"<</Type/Pages/Kids[{kid} 0 R]/Count 1>>");
+        }
+
+        b.Set(5, $"<</Type/Page/Parent {x} 0 R/MediaBox[0 0 612 792]/Resources<</Font<</F1 3 0 R>>>>/Contents 4 0 R>>");
+        b.Set(2, $"<</Type/Pages/Kids[{chain} 0 R {x} 0 R]/Count 1>>");
+        return b.Build();
+    }
+
+    [TestMethod]
+    public void ANodeFirstReachedTooDeepIsStillReadWhereItIsShallow()
+    {
+        byte[] pdf = PageTreeReachingANodeTooDeepFirst();
+
+        using PdfDocument doc = PdfDocument.Open(pdf);
+
+        Assert.HasCount(1, doc.Pages);
+        Assert.AreEqual("A", doc.Pages[0].ExtractText().Trim());
+        Assert.IsFalse(doc.Diagnostics.Any(d => d.Message.Contains("more than once")), "The node was not read twice.");
+        Assert.IsTrue(doc.Diagnostics.Any(d => d.Message.Contains("nests deeper than")));
+        Assert.AreEqual(1, PdfInspector.Inspect(pdf).PageCount, "The inspector counts pages as the document reads them.");
+    }
+
+    [TestMethod]
+    public void APageTreeLoopIsStillReadOnce()
+    {
+        PdfBuilder b = PdfBuilder.Simple("A");
+        b.Set(2, "<</Type/Pages/Kids[2 0 R 5 0 R 2 0 R]/Count 1>>");
+        byte[] pdf = b.Build();
+
+        using PdfDocument doc = PdfDocument.Open(pdf);
+
+        Assert.HasCount(1, doc.Pages);
+        Assert.IsTrue(doc.Diagnostics.Any(d => d.Message.Contains("more than once")));
+        Assert.AreEqual(1, PdfInspector.Inspect(pdf).PageCount);
+    }
+
     private sealed class TempFolder : IDisposable
     {
         public TempFolder()
