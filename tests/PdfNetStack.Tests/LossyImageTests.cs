@@ -525,7 +525,7 @@ public sealed class LossyImageTests
         Assert.IsNull(PdfEquivalence.FindDifference(input, output));
 
         // Output that stays PDF 1.2 keeps sequential coding, which is all that version allows.
-        byte[] old = Compat.Latin1.GetBytes(Compat.Latin1.GetString(input).Replace("%PDF-1.4", "%PDF-1.2", StringComparison.Ordinal));
+        byte[] old = Compat.Latin1.GetBytes(Compat.Latin1.GetString(input).Replace("%PDF-1.4", "%PDF-1.2"));
         (byte[] sequential, PdfOptimizationResult r2) = PdfOptimizer.Optimize(old, NoThreshold with { UseObjectStreams = false });
         Assert.AreEqual(OptimizationDisposition.Optimized, r2.Disposition, r2.Reason);
         StringAssert.StartsWith(Compat.Latin1.GetString(sequential, 0, 8), "%PDF-1.2");
