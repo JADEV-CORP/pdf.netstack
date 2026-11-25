@@ -38,7 +38,8 @@ internal sealed partial class PageImporter
 
     /// <summary>
     /// The source's structure tree, read on first use and reused by every later import from
-    /// this importer. Null when the source is not tagged.
+    /// this importer, or for a document copying its own pages, by the rest of the call. Null when
+    /// the source is not tagged.
     /// </summary>
     internal StructureIndex? SourceStructure(CancellationToken ct)
     {

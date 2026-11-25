@@ -189,6 +189,20 @@ public sealed class StructureHardeningTests
     }
 
     [TestMethod]
+    public void ACopyOfACopyWithinTheDocumentIsTagged()
+    {
+        PdfDocument doc = PdfDocument.Open(StructureImportTests.Tagged("A"));
+        PdfPage copy = doc.Pages.Import([doc.Pages[0]])[0];
+        doc.Pages.Import([copy]);
+
+        PdfDocument saved = StructureImportTests.Saved(doc);
+        Assert.AreEqual(
+            "Document(P(Span),Table(TH,TD),Heading(Link),Figure),Document(P(Span),Table(TH,TD)),Document(P(Span),Table(TH,TD))",
+            StructureImportTests.CheckStructure(saved));
+        Assert.IsNotNull(saved.Pages[3].Dictionary["StructParents"], "the second copy is tagged");
+    }
+
+    [TestMethod]
     public void ACancelledImportOfARepeatedPageLeavesTheTargetAsItWas()
     {
         // The first copy's contents fire the token, so the call stops as it starts the second copy.
