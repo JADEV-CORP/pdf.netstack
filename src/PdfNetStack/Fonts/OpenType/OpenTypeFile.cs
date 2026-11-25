@@ -206,6 +206,7 @@ internal sealed class OpenTypeFile
         {
             case "wOF2":
                 int fonts = Woff2.CountFonts(data, MaxWoffSize);
+                if (fonts == 0) throw new FontFormatException("The font collection holds no fonts.");
                 if (index < 0 || index >= fonts) throw new ArgumentOutOfRangeException(nameof(index), fonts == 1 ? "A WOFF2 file holds one font." : $"The collection holds {fonts} fonts.");
                 byte[] sfnt = Woff2.Decode(data, MaxWoffSize);
                 return new OpenTypeFile(sfnt, Tag(sfnt, 0) == "ttcf" ? Offset32(sfnt, 12 + 4 * index) : 0);
@@ -214,6 +215,9 @@ internal sealed class OpenTypeFile
                 return new OpenTypeFile(DecodeWoff(data), 0);
             case "ttcf":
                 int count = CountFonts(data);
+
+                // An empty collection is damaged data; only an index past a real font is the caller's error.
+                if (count == 0) throw new FontFormatException("The font collection holds no fonts.");
                 if (index < 0 || index >= count) throw new ArgumentOutOfRangeException(nameof(index), $"The collection holds {count} fonts.");
                 return new OpenTypeFile(data, Offset32(data, 12 + 4 * index));
             default:
