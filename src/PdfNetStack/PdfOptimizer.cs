@@ -746,15 +746,16 @@ public static partial class PdfOptimizer
                 continue;
             }
 
-            if (!seen.Add(number))
-            {
-                looped++;
-                continue;
-            }
-
+            // The depth is checked before the node is marked seen, as the document reads the tree.
             if (depth > PdfDocument.MaxPageTreeDepth)
             {
                 tooDeep++;
+                continue;
+            }
+
+            if (!seen.Add(number))
+            {
+                looped++;
                 continue;
             }
 

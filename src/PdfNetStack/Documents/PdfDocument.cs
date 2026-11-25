@@ -1863,15 +1863,17 @@ public sealed class PdfDocument : IDisposable
                 continue;
             }
 
-            if (!seenNodes.Add(number))
-            {
-                looped++;
-                continue;
-            }
-
+            // The depth is checked before the node is marked seen: a node skipped as too deep is
+            // still read where the tree also lists it higher up.
             if (depth > MaxPageTreeDepth)
             {
                 tooDeep++;
+                continue;
+            }
+
+            if (!seenNodes.Add(number))
+            {
+                looped++;
                 continue;
             }
 
