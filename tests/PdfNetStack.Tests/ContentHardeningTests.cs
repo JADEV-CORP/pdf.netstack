@@ -83,8 +83,10 @@ public sealed class ContentHardeningTests
     public void OneHugeTextStringEndsAtTheTimeLimit()
     {
         byte[] input = Page("BT /F1 12 Tf (" + new string('a', 1_000_000) + ") Tj ET");
-        using PdfDocument doc = PdfDocument.Open(input, new PdfLoadOptions { Limits = PdfLimits.Default with { Timeout = TimeSpan.FromTicks(1) } });
+        using PdfDocument doc = PdfDocument.Open(input);
 
+        // Opening is bound by the timeout too, so the document is opened without one and given it after.
+        doc.Budget = new ResourceBudget(PdfLimits.Default with { Timeout = TimeSpan.FromTicks(1) }, input.Length, new PdfDiagnostics());
         PdfLimitExceededException e = Assert.ThrowsExactly<PdfLimitExceededException>(() => doc.Pages[0].ExtractText());
 
         Assert.AreEqual(PdfLimitKind.Timeout, e.Limit);
