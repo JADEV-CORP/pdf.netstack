@@ -29,6 +29,25 @@ public sealed class StructureHardeningTests
         return b.Build();
     }
 
+    /// <summary>A page with a table whose data cell names its header cell through an attribute object shared by reference.</summary>
+    private static byte[] SharedAttributeTable()
+    {
+        var b = new PdfBuilder();
+        b.Set(1, "<</Type/Catalog/Pages 2 0 R/StructTreeRoot 20 0 R/MarkInfo<</Marked true>>>>");
+        b.Set(2, "<</Type/Pages/Kids[5 0 R]/Count 1>>");
+        b.Set(3, FontObject);
+        b.SetStream(4, "", Ascii("/TH <</MCID 0>> BDC BT /F1 12 Tf 72 700 Td (Name) Tj ET EMC /TD <</MCID 1>> BDC BT /F1 12 Tf 72 680 Td (Ada) Tj ET EMC"));
+        b.Set(5, "<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]/Resources<</Font<</F1 3 0 R>>>>/Contents 4 0 R/StructParents 0>>");
+        b.Set(20, "<</Type/StructTreeRoot/K 21 0 R/ParentTree 30 0 R/ParentTreeNextKey 1/IDTree<</Names[(th1) 23 0 R]>>>>");
+        b.Set(21, "<</Type/StructElem/S/Document/P 20 0 R/K 22 0 R>>");
+        b.Set(22, "<</Type/StructElem/S/Table/P 21 0 R/Pg 5 0 R/K[23 0 R 24 0 R]>>");
+        b.Set(23, "<</Type/StructElem/S/TH/P 22 0 R/Pg 5 0 R/ID(th1)/K 0>>");
+        b.Set(24, "<</Type/StructElem/S/TD/P 22 0 R/Pg 5 0 R/A 31 0 R/K 1>>");
+        b.Set(30, "<</Nums[0[23 0 R 24 0 R]]>>");
+        b.Set(31, "<</O/Table/Headers[(th1)]>>");
+        return b.Build();
+    }
+
     [TestMethod]
     public void AnImportedPageListedTwiceIsTaggedTwiceWithItsOwnAnnotations()
     {
@@ -145,5 +164,18 @@ public sealed class StructureHardeningTests
         Task import = Task.Run(() => target.Pages.Import(source.Pages));
         Assert.IsTrue(import.Wait(TimeSpan.FromSeconds(10)), "the import finishes");
         Assert.HasCount(1, target.Pages);
+    }
+
+    [TestMethod]
+    public void MergingASourceTwiceKeepsEachTablesHeaderReference()
+    {
+        PdfDocument a = PdfDocument.Open(SharedAttributeTable());
+        PdfDocument merged = StructureImportTests.Saved(PdfDocument.Merge([a, a]));
+        StructureImportTests.CheckStructure(merged);
+
+        List<PdfDictionary> cells = StructureImportTests.Elements(merged).Where(e => e.GetName("S") == "TD").ToList();
+        Assert.HasCount(2, cells);
+        string[] headers = [.. cells.Select(c => ((PdfString)((PdfArray)merged.Resolve(merged.ResolveDictionary(c["A"])!["Headers"])!)[0]).ToText())];
+        Assert.AreEqual("th1,th1_2", string.Join(",", headers));
     }
 }
