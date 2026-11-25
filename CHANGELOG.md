@@ -29,6 +29,12 @@
   cut at 512 bytes.
 - Fixed: saving an object built in code and nested deeper than any reader accepts could overflow
   the stack. The writer now refuses it with `InvalidOperationException`.
+- Fixed, found by fuzzing: a JBIG2 bitmap with no width and two billion rows cost nothing against
+  the decode budget and took minutes; a 64 byte WebP claiming a 6763 by 16095 frame allocated
+  164 MB before its data ran out, and is now refused first; a UTF-16 CMap code of four bytes that
+  is not a surrogate pair threw `ArgumentOutOfRangeException` and is now unmapped; a font without
+  layout tables threw on text it draws only after normalization, such as a Hangul syllable from
+  its jamo, although it reported covering it.
 - Large decode buffers are no longer kept in the shared array pool after a call: an image heavy
   optimization held 1.3 GB after returning, now 25 MB. The optimizer's default worker count follows
   the memory the runtime reports, a container's limit included: at most half of it divided by
