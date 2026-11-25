@@ -289,13 +289,18 @@ public sealed class CancellationTests
         using PdfDocument middle = doc.ExtractPages(1, 2);
         CollectionAssert.AreEqual(new[] { "P2", "P3" }, middle.Pages.Select(p => p.ExtractText()).ToArray());
 
+#if NET
+        // The Range overload is .NET only.
         using PdfDocument last = doc.ExtractPages(^2..);
         CollectionAssert.AreEqual(new[] { "P3", "P4" }, PdfDocument.Open(last.ToArray(Plain)).Pages.Select(p => p.ExtractText()).ToArray());
+#endif
 
         Assert.HasCount(4, doc.Pages);
         Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => doc.ExtractPages(3, 2));
         Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => doc.ExtractPages(-1, 1));
+#if NET
         Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => doc.ExtractPages(2..9));
+#endif
         Assert.ThrowsExactly<OperationCanceledException>(() => doc.ExtractPages(0, 1, Cancelled()));
     }
 

@@ -483,10 +483,10 @@ public sealed class StructuralOptimizationTests
 
         // An image that drops its /Name proves equal; a stream that is no XObject does not.
         // Blanks of the same length keep the cross-reference offsets right.
-        byte[] unnamed = Compat.Latin1.GetBytes(text.Replace("/Name/Im2", "         ", StringComparison.Ordinal));
+        byte[] unnamed = Compat.Latin1.GetBytes(text.Replace("/Name/Im2", "         "));
         Assert.IsNull(PdfEquivalence.FindDifference(input, unnamed));
         byte[] notXObject = TwoNamedImages("1.4", "/Name/Im1", "/Name/Im2", type: "/Type/Other/Subtype/Image");
-        byte[] notXObjectUnnamed = Compat.Latin1.GetBytes(Compat.Latin1.GetString(notXObject).Replace("/Name/Im2", "         ", StringComparison.Ordinal));
+        byte[] notXObjectUnnamed = Compat.Latin1.GetBytes(Compat.Latin1.GetString(notXObject).Replace("/Name/Im2", "         "));
         Assert.IsNotNull(PdfEquivalence.FindDifference(notXObject, notXObjectUnnamed));
         Assert.IsNotNull(PdfEquivalence.FindDifference(unnamed, input), "A name may not appear.");
     }

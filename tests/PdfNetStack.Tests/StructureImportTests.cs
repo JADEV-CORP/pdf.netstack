@@ -228,7 +228,7 @@ public sealed class StructureImportTests
         try
         {
             File.WriteAllBytes(path, pdf);
-            using var process = Process.Start(new ProcessStartInfo(Qpdf, ["--check", path]) { RedirectStandardOutput = true, RedirectStandardError = true })!;
+            using var process = Process.Start(new ProcessStartInfo(Qpdf, "--check \"" + path + "\"") { RedirectStandardOutput = true, RedirectStandardError = true })!;
             string output = process.StandardOutput.ReadToEnd() + process.StandardError.ReadToEnd();
             process.WaitForExit();
             Assert.AreEqual(0, process.ExitCode, output);
