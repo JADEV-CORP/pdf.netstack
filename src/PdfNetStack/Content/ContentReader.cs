@@ -93,6 +93,7 @@ internal sealed class ContentReader
             catch (PdfFormatException)
             {
                 // An unterminated string or hex string: nothing after it can be read.
+                Charge();
                 return false;
             }
 
@@ -110,7 +111,7 @@ internal sealed class ContentReader
                 if (k.Length == 1 && k[0] is (byte)')' or (byte)'{' or (byte)'}') continue;
                 op.Operator = OperatorName(k);
                 if (op.Operator == "BI") ReadInlineImage(op);
-                return true;
+                return Charge();
             }
 
             _parser.Position = start;
@@ -118,11 +119,21 @@ internal sealed class ContentReader
             {
                 AddOperand(op, _parser.ParseObject());
             }
+            catch (PdfFormatException) when (_parser.TokenLimitExceeded)
+            {
+                // The operand ran into the budget: the page is out of tokens, not damaged.
+                Charge();
+                return false;
+            }
             catch (PdfFormatException) when (_parser.NestingExceeded)
             {
                 // Retrying one bracket further in would parse the same deep run again for every
                 // bracket in it, quadratic in its length: step over the whole run at once.
-                if (!SkipNested(start)) return false;
+                if (!SkipNested(start))
+                {
+                    Charge();
+                    return false;
+                }
             }
             catch (PdfFormatException)
             {
@@ -138,6 +149,9 @@ internal sealed class ContentReader
         if (_budget is null) return true;
         _budget.TokensLeft -= _parser.Tokens - _charged;
         _charged = _parser.Tokens;
+
+        // One more than is left, so reading past the budget leaves it exhausted.
+        _parser.TokenLimit = _budget.Exhausted ? _charged : _charged + _budget.TokensLeft + 1;
         return !_budget.Exhausted;
     }
 
