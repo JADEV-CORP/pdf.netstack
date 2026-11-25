@@ -40,6 +40,40 @@
   raises `FontFormatException`.
 - Fixed: on .NET Framework, a `PdfLimits.Timeout` with under a millisecond left started a timer
   that fired after short work had finished, so the call returned instead of stopping.
+- Fixed: an input over `PdfLimits.MaxInputBytes` or `PdfOptimizerOptions.MaxInputBytes` reached
+  the optimizer's memory or disk before it was refused: a forward-only input was copied in full to
+  a temporary file, `OptimizeAsync` buffered up to 1 GiB, and `OptimizeFileAsync` read the whole
+  file. It is now passed through unchanged, holding at most one chunk past the limit, and reported
+  as `LimitExceeded`. `PdfLimits.Timeout` now also bounds opening, reading the input and, on
+  demand, parsing it.
+- Fixed, budgets that could be bypassed: decoded images handed back were refunded to
+  `MaxTotalDecodedBytes`; JPEG, JPEG 2000 and CCITT images were charged at their dictionary size
+  rather than their own; the optimizer's lossy decodes and undone predictors were not charged; up to
+  1023 content operators ran per page once `MaxOperationsPerDocument` was spent; one operand, such
+  as a long array, was not bounded by the token budget; and the time limit was read every 1024
+  operators, so one long text string ran far past it.
+- Fixed in page import: a structure tree whose `/K` arrays contain themselves made import walk
+  without end, and elements sharing one `/K` array cost their product (gigabytes from a 1.6 MB
+  file); both are read once and bounded. A page listed twice in one import gets its own tags and
+  annotations, a table merged twice keeps each cell's header reference, a `/Ref` to a later element
+  is kept, a shared form keeps its parent tree key when a later import tags it, parent tree keys
+  never pass the largest integer, and a cancelled import removes the objects it copied.
+- Fixed in the HTML converter, work that grew with the square of the input and was not counted
+  against `MaxStyleWork` or `MaxLayoutWork`: pseudo-element and compound selectors, long class
+  lists, line building in long paragraphs, and fixed boxes and running headers repeated on every
+  page. Parsing text observes cancellation.
+- Fixed: `ToArray` without optimization and the optimizer's writer ignored cancellation; a cancelled
+  `MergeAsync` left an opened input stream undisposed; `Merge` read the whole sequence before its
+  first check; `PdfAcroForm.Flatten` did not check while gathering fields and looked up each
+  widget's page in time linear in the page count; split progress counted pages removed meanwhile.
+- Fixed: a damaged file whose catalog shares its object number with the cross-reference stream
+  failed to open, where 1.2 opened it; an object stream claiming more entries than it holds
+  allocated up to 8 MB for each; a page listed many times in the page tree was copied outside the
+  budget; a lossy optimization stopped by a limit other than time came back as the lossless rewrite
+  marked `Optimized`; ActualText crossing `MaxTextCharsPerPage` was dropped with the text after it;
+  a `Timeout` above about 24.8 days threw `ArgumentOutOfRangeException`.
+- `PdfDocument.Open`, `OpenAsync` and page text, letter, word and image extraction document
+  `PdfLimitExceededException`, which they already threw.
 - `PdfDocument.Open` and `OpenOnDemand` document `NotSupportedException` for a file encrypted with
   a security handler other than the standard password one, which they already threw.
 - Large decode buffers are no longer kept in the shared array pool after a call: an image heavy
