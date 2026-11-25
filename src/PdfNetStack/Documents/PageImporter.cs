@@ -63,6 +63,10 @@ internal sealed partial class PageImporter
         var result = new PdfPage[pages.Count];
         _newlyShared = [];
 
+        // A document copying its own pages changes its tree with every call: read it again, as a
+        // page copied earlier, or tagged since, is not in an older reading.
+        if (SameDocument) _sourceStructureRead = false;
+
         // A document still empty takes the source's language as its own.
         bool targetWasEmpty = !SameDocument && _target.Pages.Count == 0;
         FormState form = SaveFormState();
