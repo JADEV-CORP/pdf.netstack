@@ -312,7 +312,9 @@ internal sealed class StyleResolver
         _ancestors.MoveTo(element.ParentElement);
         foreach (Entry entry in Candidates(element, pseudoElement))
         {
-            if (entry.Selector.PseudoElement == pseudoElement && Matches(entry.Selector, element)) return true;
+            // A rule for another pseudo-element is still a candidate that was looked at: counted, as in Matches.
+            if (entry.Selector.PseudoElement != pseudoElement) _budget.Style(1);
+            else if (Matches(entry.Selector, element)) return true;
         }
 
         return false;
@@ -350,7 +352,13 @@ internal sealed class StyleResolver
         _ancestors.MoveTo(element.ParentElement);
         foreach (Entry entry in Candidates(element, pseudoElement))
         {
-            if (entry.Selector.PseudoElement != pseudoElement || !Matches(entry.Selector, element)) continue;
+            if (entry.Selector.PseudoElement != pseudoElement)
+            {
+                _budget.Style(1);
+                continue;
+            }
+
+            if (!Matches(entry.Selector, element)) continue;
             foreach (CssDeclaration d in entry.Declarations)
             {
                 int tier = entry.Origin == CssOrigin.UserAgent ? (d.Important ? 5 : 0) : (d.Important ? 3 : 1);
