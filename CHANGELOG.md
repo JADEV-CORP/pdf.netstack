@@ -34,7 +34,14 @@
   164 MB before its data ran out, and is now refused first; a UTF-16 CMap code of four bytes that
   is not a surrogate pair threw `ArgumentOutOfRangeException` and is now unmapped; a font without
   layout tables threw on text it draws only after normalization, such as a Hangul syllable from
-  its jamo, although it reported covering it.
+  its jamo, although it reported covering it; an encryption dictionary with a revision below 2 or
+  an unknown crypt filter method raised `NotSupportedException` and now raises
+  `PdfFormatException`; an empty font collection raised `ArgumentOutOfRangeException` and now
+  raises `FontFormatException`.
+- Fixed: on .NET Framework, a `PdfLimits.Timeout` with under a millisecond left started a timer
+  that fired after short work had finished, so the call returned instead of stopping.
+- `PdfDocument.Open` and `OpenOnDemand` document `NotSupportedException` for a file encrypted with
+  a security handler other than the standard password one, which they already threw.
 - Large decode buffers are no longer kept in the shared array pool after a call: an image heavy
   optimization held 1.3 GB after returning, now 25 MB. The optimizer's default worker count follows
   the memory the runtime reports, a container's limit included: at most half of it divided by
