@@ -486,13 +486,24 @@ internal sealed class AttributeCondition(string name, string op, string value, b
     {
         string? actual = e.GetAttribute(name);
         if (actual is null) return false;
+
+        // One unit per 256 characters compared: ordinary values cost nothing extra, a long value
+        // tested by many rules does. ~= and *= scan the whole value, the others at most the selector's.
+        int compared = op switch
+        {
+            "" => 0,
+            "~=" or "*=" => actual.Length,
+            _ => Math.Min(actual.Length, value.Length),
+        };
+        budget.Style(compared >> 8);
+
         StringComparison cmp = ignoreCase ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
         return op switch
         {
             "" => true,
             "=" => string.Equals(actual, value, cmp),
-            "~=" => value.Length > 0 && !value.Any(IsSpace) && actual.Split([' ', '\t', '\n', '\r', '\f'], StringSplitOptions.RemoveEmptyEntries).Any(w => string.Equals(w, value, cmp)),
-            "|=" => string.Equals(actual, value, cmp) || actual.StartsWith(value + "-", cmp),
+            "~=" => value.Length > 0 && !value.Any(IsSpace) && ContainsWord(actual, value, cmp),
+            "|=" => string.Equals(actual, value, cmp) || (actual.Length > value.Length && actual[value.Length] == '-' && string.Compare(actual, 0, value, 0, value.Length, cmp) == 0),
             "^=" => value.Length > 0 && actual.StartsWith(value, cmp),
             "$=" => value.Length > 0 && actual.EndsWith(value, cmp),
 #pragma warning disable CA2249 // .NET Standard 2.0 has no Contains overload with a comparison.
@@ -500,6 +511,21 @@ internal sealed class AttributeCondition(string name, string op, string value, b
 #pragma warning restore CA2249
             _ => false,
         };
+    }
+
+    /// <summary>Whether one of the space separated words of <paramref name="list"/> is <paramref name="word"/>, without a string per word.</summary>
+    private static bool ContainsWord(string list, string word, StringComparison cmp)
+    {
+        int i = 0;
+        while (i < list.Length)
+        {
+            while (i < list.Length && IsSpace(list[i])) i++;
+            int start = i;
+            while (i < list.Length && !IsSpace(list[i])) i++;
+            if (i - start == word.Length && string.Compare(list, start, word, 0, word.Length, cmp) == 0) return true;
+        }
+
+        return false;
     }
 
     private static bool IsSpace(char c) => c is ' ' or '\t' or '\n' or '\r' or '\f';

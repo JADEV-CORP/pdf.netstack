@@ -71,6 +71,26 @@ public sealed class HtmlHardeningTests
     }
 
     [TestMethod]
+    public void ScanningALongAttributeValueCountsAsStyleWork()
+    {
+        // 64K words: ~= split them all into strings and *= searched them all, for one unit each.
+        HtmlElement p = HtmlParser.Parse("<p a=\"" + Repeat(65_536, _ => "w ") + "\">x</p>").Body.Descendants().First(e => e.Name == "p");
+        foreach (string selector in new[] { "[a~=none]", "[a*=none]" })
+        {
+            var budget = WorkBudget.Unlimited();
+            Assert.IsFalse(CssSelector.Parse(selector)!.Single().Matches(p, budget), selector);
+            Assert.IsGreaterThanOrEqualTo(256, budget.StyleWork, selector);
+        }
+
+        // Words are separated by any HTML space; |= takes the value alone or before a hyphen.
+        HtmlElement q = HtmlParser.Parse("<p a=\"one\ttwo\n three\" b=\"en-GB\">x</p>").Body.Descendants().First(e => e.Name == "p");
+        string Matching(params string[] selectors) => string.Join(" ", selectors.Where(s => CssSelector.Parse(s)!.Single().Matches(q)));
+        Assert.AreEqual("[a~=one] [a~=two] [a~=three] [a~=TWO i] [b|=en] [b|=en-GB] [b|=EN i]", Matching(
+            "[a~=one]", "[a~=two]", "[a~=three]", "[a~=TWO i]", "[a~=tw]", "[a~=wo]", "[a~=\"one two\"]", "[a~=\"\"]",
+            "[b|=en]", "[b|=en-GB]", "[b|=EN i]", "[b|=e]", "[b|=en-]", "[b|=GB]"));
+    }
+
+    [TestMethod]
     public void ParsingTextObservesCancellation()
     {
         using var cancel = new CancellationTokenSource();
