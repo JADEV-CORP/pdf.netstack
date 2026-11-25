@@ -31,6 +31,9 @@ internal sealed class PdfFile
     private readonly bool _inMemory;
     private readonly long _decodeLimit;
     private readonly Dictionary<int, XrefEntry> _xref = new();
+
+    /// <summary>Object numbers whose entry was repointed at the xref stream that holds it.</summary>
+    private readonly HashSet<int> _correctedEntries = [];
     private readonly Dictionary<int, PdfObject> _cache = new();
     private readonly Dictionary<int, ObjectStreamIndex> _objectStreams = new();
     private readonly HashSet<int> _resolving = new();
@@ -605,6 +608,7 @@ internal sealed class PdfFile
         if (section.TryGetValue((int)number, out XrefEntry own) && own.Type == XrefEntryType.InFile && own.Field1 != offset)
         {
             section[(int)number] = new XrefEntry(XrefEntryType.InFile, offset, (int)generation);
+            _correctedEntries.Add((int)number);
         }
     }
 
@@ -710,6 +714,13 @@ internal sealed class PdfFile
     private bool ValidateXref()
     {
         if (Trailer["Root"] is null) return false;
+
+        // A corrected entry now points at a stream that nothing is meant to reference. If the
+        // trailer names that number, the entry was not just a stray self reference: scan instead.
+        foreach (string key in new[] { "Root", "Info", "Encrypt" })
+        {
+            if (Trailer[key] is PdfReference r && _correctedEntries.Contains(r.Number)) return false;
+        }
 
         // In file order, so a stream source reads the headers front to back.
         foreach ((int num, XrefEntry e) in _xref.Where(x => x.Value.Type == XrefEntryType.InFile).OrderBy(x => x.Value.Field1))
@@ -1146,7 +1157,10 @@ internal sealed class PdfFile
 
         int n = IntOf(d["N"]);
         int first = IntOf(d["First"]);
-        if (n > 1_000_000 || first > content.Length) throw new PdfFormatException("Invalid object stream header.");
+
+        // Each header entry takes at least four bytes ("1 0 "), so a larger /N cannot be true and
+        // is refused before the arrays are sized from it.
+        if (n > 1_000_000 || n > (content.Length + 1) / 4 || first > content.Length) throw new PdfFormatException("Invalid object stream header.");
         var parser = new PdfParser(content);
         var numbers = new int[n];
         var offsets = new int[n];
