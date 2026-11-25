@@ -25,7 +25,7 @@ internal static class Oracle
 
     public static readonly TimeSpan TimeLimit = TimeSpan.FromSeconds(2);
 
-    /// <summary>How long a target may run before it counts as hung; settable for the tests.</summary>
+    /// <summary>How long a target may run before it counts as hung; infinite under libFuzzer, settable for the tests.</summary>
     public static TimeSpan HangLimit { get; internal set; } = TimeSpan.FromSeconds(30);
 
     // The converters run their own deep-stack thread; this one gets room for the targets that do not.
@@ -64,6 +64,13 @@ internal static class Oracle
     /// </summary>
     private static void RunBounded(FuzzTarget target, byte[] input)
     {
+        // Under libFuzzer its own -timeout ends a hung run, and a thread per input would slow it.
+        if (HangLimit == Timeout.InfiniteTimeSpan)
+        {
+            target.Run(input);
+            return;
+        }
+
         Exception? error = null;
         var worker = new Thread(
             () =>
