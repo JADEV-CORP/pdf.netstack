@@ -133,7 +133,7 @@ public sealed class PdfDocument : IDisposable
     /// What is left of the document's <see cref="PdfLimits"/>, spent by every decode, image and
     /// content operator over the document's life, and where its warnings are collected.
     /// </summary>
-    internal ResourceBudget Budget { get; private set; } = new(Built, long.MaxValue, new PdfDiagnostics());
+    internal ResourceBudget Budget { get; set; } = new(Built, long.MaxValue, new PdfDiagnostics());
 
     /// <summary>
     /// The limits of a document built in code: it has no file to scale a budget from, and holds
