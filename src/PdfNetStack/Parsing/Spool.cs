@@ -35,7 +35,8 @@ internal sealed class Spool : IDisposable
     /// <param name="threshold">Bytes kept in memory at most; a longer stream goes to a file.</param>
     /// <param name="directory">Folder for the file; null for the system's temporary folder.</param>
     /// <param name="maxBytes">Longest input accepted; a longer one is refused as it is read.</param>
-    public static Spool Copy(Stream input, long threshold, string? directory, long maxBytes = long.MaxValue)
+    /// <param name="deadline">When the copy must have ended; checked after each read.</param>
+    public static Spool Copy(Stream input, long threshold, string? directory, long maxBytes = long.MaxValue, Deadline deadline = default)
     {
         long total = 0;
         byte[] chunk = new byte[ChunkSize];
@@ -44,6 +45,7 @@ internal sealed class Spool : IDisposable
         while ((read = input.Read(chunk, 0, chunk.Length)) > 0)
         {
             InputReader.CheckLength(total += read, maxBytes);
+            deadline.ThrowIfPassed(null);
             if (memory.Length + read > threshold)
             {
                 (FileStream file, string path) = Create(directory);
@@ -55,7 +57,7 @@ internal sealed class Spool : IDisposable
                     {
                         file.Write(chunk, 0, read);
                     }
-                    while ((read = input.Read(chunk, 0, chunk.Length)) > 0 && Within(total += read, maxBytes));
+                    while ((read = input.Read(chunk, 0, chunk.Length)) > 0 && Within(total += read, maxBytes, deadline));
 
                     file.Flush();
                     file.Position = 0;
@@ -79,7 +81,8 @@ internal sealed class Spool : IDisposable
     /// <param name="threshold">Bytes kept in memory at most; a longer stream goes to a file.</param>
     /// <param name="directory">Folder for the file; null for the system's temporary folder.</param>
     /// <param name="maxBytes">Longest input accepted; a longer one is refused as it is read.</param>
-    public static async Task<Spool> CopyAsync(Stream input, long threshold, string? directory, CancellationToken cancellationToken, long maxBytes = long.MaxValue)
+    /// <param name="deadline">When the copy must have ended; checked after each read.</param>
+    public static async Task<Spool> CopyAsync(Stream input, long threshold, string? directory, CancellationToken cancellationToken, long maxBytes = long.MaxValue, Deadline deadline = default)
     {
         long total = 0;
         byte[] chunk = new byte[ChunkSize];
@@ -88,6 +91,7 @@ internal sealed class Spool : IDisposable
         while ((read = await input.ReadAsync(chunk, 0, chunk.Length, cancellationToken).ConfigureAwait(false)) > 0)
         {
             InputReader.CheckLength(total += read, maxBytes);
+            deadline.ThrowIfPassed(null);
             if (memory.Length + read > threshold)
             {
                 (FileStream file, string path) = Create(directory);
@@ -99,7 +103,7 @@ internal sealed class Spool : IDisposable
                     {
                         await file.WriteAsync(chunk, 0, read, cancellationToken).ConfigureAwait(false);
                     }
-                    while ((read = await input.ReadAsync(chunk, 0, chunk.Length, cancellationToken).ConfigureAwait(false)) > 0 && Within(total += read, maxBytes));
+                    while ((read = await input.ReadAsync(chunk, 0, chunk.Length, cancellationToken).ConfigureAwait(false)) > 0 && Within(total += read, maxBytes, deadline));
 
                     await file.FlushAsync(cancellationToken).ConfigureAwait(false);
                     file.Position = 0;
@@ -124,10 +128,11 @@ internal sealed class Spool : IDisposable
         if (File is not null) Delete(File, Path!);
     }
 
-    /// <summary>True while <paramref name="total"/> is within <paramref name="maxBytes"/>; throws past it.</summary>
-    private static bool Within(long total, long maxBytes)
+    /// <summary>True while <paramref name="total"/> is within <paramref name="maxBytes"/> and the deadline has not passed; throws past either.</summary>
+    private static bool Within(long total, long maxBytes, Deadline deadline)
     {
         InputReader.CheckLength(total, maxBytes);
+        deadline.ThrowIfPassed(null);
         return true;
     }
 

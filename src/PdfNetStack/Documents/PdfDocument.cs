@@ -230,6 +230,7 @@ public sealed class PdfDocument : IDisposable
     /// <param name="path">File to open.</param>
     /// <param name="options">Password, limits and mode.</param>
     /// <exception cref="ArgumentOutOfRangeException">An option is out of range.</exception>
+    /// <exception cref="PdfLimitExceededException">A limit in the options was reached: the input is too long, or opening ran past <see cref="PdfLimits.Timeout"/>.</exception>
     /// <exception cref="PdfFormatException">The file is not a readable PDF.</exception>
     /// <exception cref="PdfPasswordException">The file is encrypted and the password does not open it.</exception>
     /// <exception cref="NotSupportedException">The file is encrypted with a security handler other than the standard password one.</exception>
@@ -238,11 +239,27 @@ public sealed class PdfDocument : IDisposable
         Compat.ThrowIfNull(path, nameof(path));
         Compat.ThrowIfNull(options, nameof(options));
         options.Validate();
-        InputReader.CheckLength(new FileInfo(path).Length, options.Limits.MaxInputBytes);
-        if (options.Mode == PdfLoadMode.InMemory) return Load(File.ReadAllBytes(path), options);
+        var deadline = Deadline.Start(options.Limits);
 
-        var file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 4096, FileOptions.RandomAccess);
-        return OnStream(file, options, owned: file, appendable: false);
+        // One handle for the size check and the read, so a file that grows in between is still held to the limit.
+        var file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 4096,
+            options.Mode == PdfLoadMode.InMemory ? FileOptions.SequentialScan : FileOptions.RandomAccess);
+        if (options.Mode == PdfLoadMode.OnDemand)
+        {
+            try
+            {
+                InputReader.CheckLength(file.Length, options.Limits.MaxInputBytes);
+            }
+            catch
+            {
+                file.Dispose();
+                throw;
+            }
+
+            return OnStream(file, options, owned: file, appendable: false, deadline);
+        }
+
+        using (file) return Load(InputReader.ReadToEnd(file, options.Limits.MaxInputBytes, deadline), options, deadline);
     }
 
     /// <summary>Opens a document from a stream, read into memory from its position to its end.</summary>
@@ -275,6 +292,7 @@ public sealed class PdfDocument : IDisposable
     /// <param name="options">Password, limits and mode.</param>
     /// <exception cref="ArgumentException"><paramref name="stream"/> cannot be read.</exception>
     /// <exception cref="ArgumentOutOfRangeException">An option is out of range.</exception>
+    /// <exception cref="PdfLimitExceededException">A limit in the options was reached: the input is too long, or opening ran past <see cref="PdfLimits.Timeout"/>.</exception>
     /// <exception cref="PdfFormatException">The data is not a readable PDF.</exception>
     /// <exception cref="PdfPasswordException">The file is encrypted and the password does not open it.</exception>
     /// <exception cref="NotSupportedException">In memory, the stream holds 2 GiB or more (open it on demand), or the file is encrypted with a security handler other than the standard password one.</exception>
@@ -285,14 +303,17 @@ public sealed class PdfDocument : IDisposable
         options.Validate();
         if (!stream.CanRead) throw new ArgumentException("The stream must be readable.", nameof(stream));
         long maxBytes = options.Limits.MaxInputBytes;
-        if (options.Mode == PdfLoadMode.InMemory) return Load(InputReader.ReadToEnd(stream, maxBytes), options);
+
+        // Started before the first read: a stream that trickles is part of the time the call may take.
+        var deadline = Deadline.Start(options.Limits);
+        if (options.Mode == PdfLoadMode.InMemory) return Load(InputReader.ReadToEnd(stream, maxBytes, deadline), options, deadline);
         if (stream.CanSeek)
         {
             InputReader.CheckLength(stream.Length - stream.Position, maxBytes);
-            return OnStream(stream, options, owned: null, appendable: true);
+            return OnStream(stream, options, owned: null, appendable: true, deadline);
         }
 
-        return OnSpool(Spool.Copy(stream, options.SpoolThreshold, options.TempDirectory, maxBytes), options);
+        return OnSpool(Spool.Copy(stream, options.SpoolThreshold, options.TempDirectory, maxBytes, deadline), options, deadline);
     }
 
     /// <summary>
@@ -318,6 +339,7 @@ public sealed class PdfDocument : IDisposable
     /// <param name="data">The file's bytes.</param>
     /// <param name="options">Password, limits and mode. The spool settings do not apply.</param>
     /// <exception cref="ArgumentOutOfRangeException">An option is out of range.</exception>
+    /// <exception cref="PdfLimitExceededException">A limit in the options was reached: the input is too long, or opening ran past <see cref="PdfLimits.Timeout"/>.</exception>
     /// <exception cref="PdfFormatException">The data is not a readable PDF.</exception>
     /// <exception cref="PdfPasswordException">The file is encrypted and the password does not open it.</exception>
     /// <exception cref="NotSupportedException">The file is encrypted with a security handler other than the standard password one.</exception>
@@ -325,9 +347,12 @@ public sealed class PdfDocument : IDisposable
     {
         Compat.ThrowIfNull(options, nameof(options));
         options.Validate();
-        if (options.Mode == PdfLoadMode.InMemory) return Load(data, options);
+        var deadline = Deadline.Start(options.Limits);
+        if (options.Mode == PdfLoadMode.InMemory) return Load(data, options, deadline);
         InputReader.CheckLength(data.Length, options.Limits.MaxInputBytes);
-        return OnDemand(PdfFile.Open(data, options.MaxDecodedStreamBytes, NewBudget(options, data.Length)), options, source: null, owned: null, closeOnDispose: false);
+        ResourceBudget budget = NewBudget(options, data.Length);
+        PdfFile file = PdfFile.Open(data, options.MaxDecodedStreamBytes, budget);
+        return OnDemand(file, options, source: null, owned: null, closeOnDispose: false, deadline);
     }
 
     /// <summary>
@@ -351,6 +376,7 @@ public sealed class PdfDocument : IDisposable
     /// <param name="cancellationToken">Stops reading; any temporary copy is deleted.</param>
     /// <exception cref="ArgumentException"><paramref name="stream"/> cannot be read.</exception>
     /// <exception cref="ArgumentOutOfRangeException">An option is out of range.</exception>
+    /// <exception cref="PdfLimitExceededException">A limit in the options was reached: the input is too long, or opening ran past <see cref="PdfLimits.Timeout"/>.</exception>
     /// <exception cref="OperationCanceledException">Cancelled before the document was open.</exception>
     /// <exception cref="PdfFormatException">The data is not a readable PDF.</exception>
     /// <exception cref="PdfPasswordException">The file is encrypted and the password does not open it.</exception>
@@ -361,21 +387,22 @@ public sealed class PdfDocument : IDisposable
         options ??= PdfLoadOptions.Default;
         options.Validate();
         if (!stream.CanRead) throw new ArgumentException("The stream must be readable.", nameof(stream));
+        var deadline = Deadline.Start(options.Limits);
         if (options.Mode == PdfLoadMode.InMemory)
         {
-            ReadOnlyMemory<byte> data = await InputReader.ReadToEndAsync(stream, cancellationToken, options.Limits.MaxInputBytes).ConfigureAwait(false);
+            ReadOnlyMemory<byte> data = await InputReader.ReadToEndAsync(stream, cancellationToken, options.Limits.MaxInputBytes, deadline).ConfigureAwait(false);
             cancellationToken.ThrowIfCancellationRequested();
-            return Load(data, options);
+            return Load(data, options, deadline);
         }
 
-        Spool spool = await Spool.CopyAsync(stream, options.SpoolThreshold, options.TempDirectory, cancellationToken, options.Limits.MaxInputBytes).ConfigureAwait(false);
+        Spool spool = await Spool.CopyAsync(stream, options.SpoolThreshold, options.TempDirectory, cancellationToken, options.Limits.MaxInputBytes, deadline).ConfigureAwait(false);
         if (cancellationToken.IsCancellationRequested)
         {
             spool.Dispose();
             cancellationToken.ThrowIfCancellationRequested();
         }
 
-        return OnSpool(spool, options);
+        return OnSpool(spool, options, deadline);
     }
 
     /// <summary>
@@ -404,13 +431,13 @@ public sealed class PdfDocument : IDisposable
         Open(stream, new PdfLoadOptions { Password = password, MaxDecodedStreamBytes = maxDecodedStreamBytes, Mode = PdfLoadMode.OnDemand });
 
     /// <summary>Parses a file held in memory: every object reachable from the trailer.</summary>
-    private static PdfDocument Load(ReadOnlyMemory<byte> data, PdfLoadOptions options)
+    private static PdfDocument Load(ReadOnlyMemory<byte> data, PdfLoadOptions options, Deadline deadline)
     {
         InputReader.CheckLength(data.Length, options.Limits.MaxInputBytes);
-        var deadline = Deadline.Start(options.Limits);
         long limit = options.MaxDecodedStreamBytes;
         ResourceBudget budget = NewBudget(options, data.Length);
         PdfFile file = PdfFile.Open(data, limit, budget);
+        deadline.ThrowIfPassed(budget);
         if (file.Trailer["Encrypt"] is not null and not PdfNull) file.Unlock(options.Password);
 
         var doc = new PdfDocument(file.HeaderVersion, file.Security) { DecodeLimit = limit, MaxImagePixels = options.MaxImagePixels, _file = file, Budget = budget };
@@ -431,6 +458,7 @@ public sealed class PdfDocument : IDisposable
         doc.NextNumber = (doc.Objects.Count == 0 ? 0 : doc.Objects.Keys.Max()) + 1;
         doc.NextNumber = Math.Max(doc.NextNumber, FirstFreeNumber(file));
         doc.Attach(file);
+        deadline.ThrowIfPassed(budget);
         return doc;
     }
 
@@ -439,12 +467,13 @@ public sealed class PdfDocument : IDisposable
     /// or at once if opening fails. Only the caller's own stream is <paramref name="appendable"/>:
     /// an incremental save given that stream appends to it.
     /// </summary>
-    private static PdfDocument OnStream(Stream stream, PdfLoadOptions options, IDisposable? owned, bool appendable)
+    private static PdfDocument OnStream(Stream stream, PdfLoadOptions options, IDisposable? owned, bool appendable, Deadline deadline)
     {
         try
         {
             ResourceBudget budget = NewBudget(options, stream.Length - stream.Position);
-            return OnDemand(PdfFile.Open(stream, options.MaxDecodedStreamBytes, budget), options, appendable ? stream : null, owned, closeOnDispose: true);
+            PdfFile file = PdfFile.Open(stream, options.MaxDecodedStreamBytes, budget);
+            return OnDemand(file, options, appendable ? stream : null, owned, closeOnDispose: true, deadline);
         }
         catch
         {
@@ -454,14 +483,16 @@ public sealed class PdfDocument : IDisposable
     }
 
     /// <summary>Opens on demand from a private copy, which the document owns from then on.</summary>
-    private static PdfDocument OnSpool(Spool spool, PdfLoadOptions options)
+    private static PdfDocument OnSpool(Spool spool, PdfLoadOptions options, Deadline deadline)
     {
-        if (spool.File is { } file) return OnStream(file, options, owned: spool, appendable: false);
-        return OnDemand(PdfFile.Open(spool.Memory, options.MaxDecodedStreamBytes, NewBudget(options, spool.Memory.Length)), options, source: null, owned: null, closeOnDispose: true);
+        if (spool.File is { } file) return OnStream(file, options, owned: spool, appendable: false, deadline);
+        PdfFile memory = PdfFile.Open(spool.Memory, options.MaxDecodedStreamBytes, NewBudget(options, spool.Memory.Length));
+        return OnDemand(memory, options, source: null, owned: null, closeOnDispose: true, deadline);
     }
 
-    private static PdfDocument OnDemand(PdfFile file, PdfLoadOptions options, Stream? source, IDisposable? owned, bool closeOnDispose)
+    private static PdfDocument OnDemand(PdfFile file, PdfLoadOptions options, Stream? source, IDisposable? owned, bool closeOnDispose, Deadline deadline)
     {
+        deadline.ThrowIfPassed(file.Budget);
         if (file.Trailer["Encrypt"] is not null and not PdfNull) file.Unlock(options.Password);
 
         var doc = new PdfDocument(file.HeaderVersion, file.Security)
@@ -477,6 +508,7 @@ public sealed class PdfDocument : IDisposable
         doc.Objects = new ObjectStore(file);
         doc.NextNumber = FirstFreeNumber(file);
         doc.Attach(file);
+        deadline.ThrowIfPassed(doc.Budget);
         return doc;
     }
 
