@@ -761,12 +761,12 @@ internal static class StreamRecompressor
 
         Result? Reencode(out bool gate)
         {
-            Result? best = Choose(decoded, plan, originalCost, level, imagePredictors, decodeLimit, out gate);
+            Result? best = Choose(decoded, plan, originalCost, level, imagePredictors, decodeLimit, budget, out gate);
             if (plan.Image is null || plan.Images is null) return best;
 
             // Lossy candidates must beat the best lossless (or requantized) encoding by a clear margin.
             int bestCost = best is null ? originalCost : best.Data.Length + Overhead(best.Filter, best.DecodeParms);
-            Result? lossy = ChooseLossy(decoded, plan.Image, plan.Images, bestCost, level, imagePredictors, decodeLimit, out bool lossyRejected);
+            Result? lossy = ChooseLossy(decoded, plan.Image, plan.Images, bestCost, level, imagePredictors, decodeLimit, budget, out bool lossyRejected);
             gate |= lossyRejected && lossy is null;
             return lossy ?? best;
         }
@@ -815,7 +815,7 @@ internal static class StreamRecompressor
         return compacted.Length < originalCost ? new Result(compacted, null, null, Compacted: true) : null;
     }
 
-    private static Result? ChooseLossy(DecodedStream decoded, ImagePlan image, ImageSettings settings, int bestCost, Flate level, bool imagePredictors, long decodeLimit, out bool rejected)
+    private static Result? ChooseLossy(DecodedStream decoded, ImagePlan image, ImageSettings settings, int bestCost, Flate level, bool imagePredictors, long decodeLimit, ResourceBudget? budget, out bool rejected)
     {
         rejected = false;
         ReadOnlyMemory<byte> data = decoded.Data;
@@ -831,12 +831,16 @@ internal static class StreamRecompressor
                 if (decoded.Remaining.Count > 0) return null;
                 if (decoded.PendingPredictor is { } pending)
                 {
-                    if (!Predictors.TryDecode(data.Span, pending, decodeLimit, out unpredicted)) return null;
+                    if (!Predictors.TryDecode(data.Span, pending, decodeLimit, out unpredicted, budget)) return null;
                     data = unpredicted!.Memory;
                 }
             }
 
             if (image.Target is null && bestCost < LossyImages.MinWorthwhileCost) return null;
+
+            // The decoders only read a JPEG or a JPEG 2000 image whose own size is the one the
+            // dictionary gives, so the plan's size is the pixels about to be decoded.
+            budget?.ChargeImagePixels((long)image.Width * image.Height);
 
             Result? best = null;
             int limit = (int)(bestCost * LossyImages.RequiredGain);
@@ -890,7 +894,7 @@ internal static class StreamRecompressor
         return probe.Length;
     }
 
-    private static Result? Choose(DecodedStream decoded, Plan plan, int originalCost, Flate flate, bool imagePredictors, long decodeLimit, out bool rejected)
+    private static Result? Choose(DecodedStream decoded, Plan plan, int originalCost, Flate flate, bool imagePredictors, long decodeLimit, ResourceBudget? budget, out bool rejected)
     {
         rejected = false;
         if (decoded.LayersDecoded == 0 && plan.Filters.Count > 0 && plan.Jpeg is null && plan.Bilevel?.Ccitt is null) return null;
@@ -926,7 +930,7 @@ internal static class StreamRecompressor
                 // Undone exactly, to whole rows, the samples may be predicted afresh or not at all:
                 // the producer's predictor is one choice among three. Otherwise it stays, with the
                 // data recompressed underneath it.
-                if (remaining.Count == 0 && Predictors.TryDecode(decoded.Data.Span, pending, decodeLimit, out samples)
+                if (remaining.Count == 0 && Predictors.TryDecode(decoded.Data.Span, pending, decodeLimit, out samples, budget)
                     && Predictors.IsWholeRows(decoded.Data.Length, samples!.Length, pending))
                 {
                     (byte[] data, PdfDictionary? parms) = ReChoosePredictor(decoded.Data, samples.Memory, pending, flate, imagePredictors);

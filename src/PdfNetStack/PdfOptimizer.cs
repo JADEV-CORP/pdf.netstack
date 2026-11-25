@@ -88,6 +88,10 @@ public static partial class PdfOptimizer
         if (lossless.Disposition == OptimizationDisposition.LimitExceeded) return lossless;
         Outcome lossy = RunOnce(input, options, deadline, ct);
         if (lossy.Disposition == OptimizationDisposition.Optimized) return lossy;
+
+        // Only running out of time falls back to the lossless rewrite. A lossy pass that reached
+        // another limit says so, and the call reports it.
+        if (lossy.Disposition == OptimizationDisposition.LimitExceeded && !lossy.TimedOut) return lossy;
         if (lossless.Disposition != OptimizationDisposition.Optimized && !lossy.TimedOut) return lossy;
         string why = lossy.TimedOut ? "ran out of time (PdfLimits.Timeout)." : "were not kept: " + lossy.Reason;
         return lossless with
@@ -140,48 +144,94 @@ public static partial class PdfOptimizer
         Compat.ThrowIfNull(input, nameof(input));
         Compat.ThrowIfNull(output, nameof(output));
         options ??= PdfOptimizerOptions.Default;
+        options.Validate();
         if (options.Streaming)
         {
-            options.Validate();
             return await OptimizeStreamingAsync(input, output, options, cancellationToken).ConfigureAwait(false);
         }
 
 #pragma warning disable CA1835 // Array overloads keep one code path for .NET Standard 2.0.
-        // Buffer at most MaxInputBytes. Anything larger is streamed through untouched without
-        // ever being held in memory, as the in-memory path would return it unchanged anyway. A
-        // seekable input of known length gets its buffer at once, rather than by doubling.
+        // Buffer at most the smaller of the two input limits. Anything larger is streamed through
+        // untouched without ever being held in memory, as the in-memory path would return it
+        // unchanged anyway. A seekable input of known length gets its buffer at once, rather than
+        // by doubling, or is passed through at once when it is known to be over the limit.
+        long cap = InputCap(options);
         long known = input.CanSeek ? input.Length - input.Position : 0;
-        using var buffer = new MemoryStream(known > 0 && known <= Math.Min(options.MaxInputBytes, Compat.MaxArrayLength) ? (int)known : 0);
+        if (known > cap)
+        {
+            long length = await PassThroughAsync(null, input, output, cancellationToken).ConfigureAwait(false);
+            return OverLimit(length, options, cancellationToken);
+        }
+
+        using var buffer = new MemoryStream(known > 0 && known <= Compat.MaxArrayLength ? (int)known : 0);
         byte[] chunk = new byte[81920];
         int read;
         while ((read = await input.ReadAsync(chunk, 0, chunk.Length, cancellationToken).ConfigureAwait(false)) > 0)
         {
             buffer.Write(chunk, 0, read);
-            if (buffer.Length > options.MaxInputBytes)
+            if (buffer.Length > cap)
             {
-                long total = buffer.Length;
-                buffer.Position = 0;
-                await buffer.CopyToAsync(output, 81920, cancellationToken).ConfigureAwait(false);
-                while ((read = await input.ReadAsync(chunk, 0, chunk.Length, cancellationToken).ConfigureAwait(false)) > 0)
-                {
-                    await output.WriteAsync(chunk, 0, read, cancellationToken).ConfigureAwait(false);
-                    total += read;
-                }
-
-                return new PdfOptimizationResult(OptimizationDisposition.UnsupportedRetained, total, total, "", "", 0,
-                    "Input exceeds the configured size limit.", OptimizationStatistics.Empty(TimeSpan.Zero));
+                long length = await PassThroughAsync(buffer, input, output, cancellationToken).ConfigureAwait(false);
+                return OverLimit(length, options, cancellationToken);
             }
         }
 
 #pragma warning restore CA1835
 
         // The rewrite goes to the output as it lies in memory, without a copy into another stream.
-        options.Validate();
         var clock = Stopwatch.StartNew();
         (ReadOnlyMemory<byte> written, PdfOptimizationResult r) = OptimizeInMemory(buffer.GetBuffer().AsMemory(0, (int)buffer.Length), options, cancellationToken);
         await Compat.WriteAsync(output, written, cancellationToken).ConfigureAwait(false);
         return WithElapsed(r, clock);
     }
+
+    /// <summary>The most input either limit lets a run take in: <see cref="PdfOptimizerOptions.MaxInputBytes"/> and <see cref="PdfLimits.MaxInputBytes"/>.</summary>
+    private static long InputCap(PdfOptimizerOptions options) => Math.Min(options.MaxInputBytes, options.Limits.MaxInputBytes);
+
+    /// <summary>
+    /// The result for an input over <see cref="InputCap"/> that was passed on unchanged and never
+    /// parsed. The option's limit is checked first, as in a run: the input is unsupported, not a
+    /// limit of the library's untrusted-input policy.
+    /// </summary>
+    private static PdfOptimizationResult OverLimit(long length, PdfOptimizerOptions options, CancellationToken ct)
+    {
+        if (length > options.MaxInputBytes)
+        {
+            return new PdfOptimizationResult(OptimizationDisposition.UnsupportedRetained, length, length, "", "", 0,
+                "Input exceeds the configured size limit.", OptimizationStatistics.Empty(TimeSpan.Zero));
+        }
+
+        using var guard = new RunGuard(options.Limits, length, default, ct);
+        string reason = guard.InputTooLarge();
+        return new PdfOptimizationResult(OptimizationDisposition.LimitExceeded, length, length, "", "", 0, reason, OptimizationStatistics.Empty(TimeSpan.Zero))
+        {
+            Diagnostics = guard.Diagnostics,
+        };
+    }
+
+#pragma warning disable CA1835 // Array overloads keep one code path for .NET Standard 2.0.
+    /// <summary>Writes what was taken in so far, if anything, then the rest of <paramref name="input"/>, to <paramref name="output"/>; returns the input's length.</summary>
+    private static async Task<long> PassThroughAsync(Stream? taken, Stream input, Stream output, CancellationToken ct)
+    {
+        long total = 0;
+        if (taken is not null)
+        {
+            total = taken.Length;
+            taken.Position = 0;
+            await taken.CopyToAsync(output, OutputStreams.CopyBufferSize, ct).ConfigureAwait(false);
+        }
+
+        byte[] chunk = new byte[OutputStreams.CopyBufferSize];
+        int read;
+        while ((read = await input.ReadAsync(chunk, 0, chunk.Length, ct).ConfigureAwait(false)) > 0)
+        {
+            await output.WriteAsync(chunk, 0, read, ct).ConfigureAwait(false);
+            total += read;
+        }
+
+        return total;
+    }
+#pragma warning restore CA1835
 
     /// <summary>
     /// Optimizes a file. The destination is written through a temporary file and moved into place,
@@ -210,9 +260,18 @@ public static partial class PdfOptimizer
             throw new ArgumentException("Source and destination must be different files.", nameof(destinationPath));
         }
 
-        if (options is { Streaming: true })
+        options ??= PdfOptimizerOptions.Default;
+        options.Validate();
+
+        // A file over either input limit is copied through without being read into memory.
+        var info = new FileInfo(source);
+        if (info.Exists && info.Length > InputCap(options))
         {
-            options.Validate();
+            return await CopyOverLimitFileAsync(source, destination, options, cancellationToken).ConfigureAwait(false);
+        }
+
+        if (options.Streaming)
+        {
             return await OptimizeFileStreamingAsync(source, destination, options, cancellationToken).ConfigureAwait(false);
         }
 
@@ -232,6 +291,31 @@ public static partial class PdfOptimizer
 
             Compat.MoveOverwrite(temp, destination);
             return result;
+        }
+        finally
+        {
+            if (File.Exists(temp)) File.Delete(temp);
+        }
+    }
+
+    /// <summary>Copies a file over the input limits to the destination, through a temporary file like any other result.</summary>
+    private static async Task<PdfOptimizationResult> CopyOverLimitFileAsync(string source, string destination, PdfOptimizerOptions options, CancellationToken ct)
+    {
+        string? directory = Path.GetDirectoryName(destination);
+        if (!string.IsNullOrEmpty(directory)) Directory.CreateDirectory(directory);
+        string temp = destination + "." + Guid.NewGuid().ToString("N") + ".tmp";
+        try
+        {
+            long length;
+            using (var input = new FileStream(source, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16, FileOptions.Asynchronous))
+            using (var copy = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None, 1 << 16, FileOptions.Asynchronous))
+            {
+                length = await PassThroughAsync(null, input, copy, ct).ConfigureAwait(false);
+                await copy.FlushAsync(ct).ConfigureAwait(false);
+            }
+
+            Compat.MoveOverwrite(temp, destination);
+            return OverLimit(length, options, ct);
         }
         finally
         {
