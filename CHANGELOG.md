@@ -35,8 +35,8 @@
   is not a surrogate pair threw `ArgumentOutOfRangeException` and is now unmapped; a font without
   layout tables threw on text it draws only after normalization, such as a Hangul syllable from
   its jamo, although it reported covering it; an encryption dictionary with a revision below 2 or
-  an unknown crypt filter method raised `NotSupportedException` and now raises
-  `PdfFormatException`; an empty font collection raised `ArgumentOutOfRangeException` and now
+  an unknown crypt filter method raised `NotSupportedException`, and one pairing `/V 5` with a
+  revision below 5 threw `ArgumentOutOfRangeException`: both now raise `PdfFormatException`; an empty font collection raised `ArgumentOutOfRangeException` and now
   raises `FontFormatException`.
 - Fixed: on .NET Framework, a `PdfLimits.Timeout` with under a millisecond left started a timer
   that fired after short work had finished, so the call returned instead of stopping.
