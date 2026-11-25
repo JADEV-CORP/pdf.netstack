@@ -258,6 +258,20 @@ public sealed class DocumentHardeningTests
     }
 #endif
 
+    [TestMethod]
+    public void APageListedManyTimesIsChargedToTheBudgetForEachCopy()
+    {
+        PdfBuilder b = PdfBuilder.Simple("A");
+        b.Set(2, $"<</Type/Pages/Kids[{string.Join(" ", Enumerable.Repeat("5 0 R", 20_000))}]/Count 20000>>");
+        byte[] pdf = b.Build();
+        var limited = new PdfLoadOptions { Limits = PdfLimits.Default with { MaxTotalDecodedBytes = 64 << 10 } };
+
+        var e = Assert.ThrowsExactly<PdfLimitExceededException>(() => PdfDocument.Open(pdf, limited));
+
+        Assert.AreEqual(PdfLimitKind.TotalDecodedBytes, e.Limit);
+        Assert.HasCount(20_000, PdfDocument.Open(pdf).Pages);
+    }
+
     private sealed class TempFolder : IDisposable
     {
         public TempFolder()

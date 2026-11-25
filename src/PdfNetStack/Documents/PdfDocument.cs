@@ -1865,7 +1865,9 @@ public sealed class PdfDocument : IDisposable
             int pageNumber = number;
             if (!used.Add(number))
             {
-                // The same page object listed twice: give the second listing its own object.
+                // The same page object listed twice: give the second listing its own object. A
+                // file can list one page tens of thousands of times, so each copy is charged.
+                Budget.ChargeDecodedBytes(CloneCost(dict));
                 dict = Clone(dict);
                 pageNumber = Add(dict);
                 _pageTreeMatchesFile = false;
@@ -1905,6 +1907,9 @@ public sealed class PdfDocument : IDisposable
             diagnostics.Repaired(Compat.Format("The page tree says it has {0} page(s) but {1} were found; the pages found are used.", count.IntegerValue, Pages.Count));
         }
     }
+
+    /// <summary>What a copy of <paramref name="d"/> holds, roughly: the dictionary and an entry for each key.</summary>
+    private static long CloneCost(PdfDictionary d) => 64L * (d.Count + 1);
 
     internal static PdfDictionary Clone(PdfDictionary d)
     {
