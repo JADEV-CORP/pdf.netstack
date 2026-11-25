@@ -75,7 +75,7 @@ public sealed class OptimizerTests
             streams++;
             using Filters.DecodedStream decoded = Filters.StreamCodec.Decode(stream.Data, Filters.StreamCodec.GetFilters(stream.Dictionary, file.Resolve), Filters.DecodeDepth.Full, 1 << 20, file.Resolve);
             int first = (int)((PdfNumber)stream.Dictionary["First"]!).ToDouble();
-            int[] header = [.. Encoding.ASCII.GetString(decoded.Data.Span[..first]).Split(' ', StringSplitOptions.RemoveEmptyEntries).Select(int.Parse)];
+            int[] header = [.. Encoding.ASCII.GetString(decoded.Data.Span[..first]).Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries).Select(int.Parse)];
             for (int k = 2; k < header.Length; k += 2) Assert.AreEqual(header[k - 2] + 1, header[k]);
         }
 
