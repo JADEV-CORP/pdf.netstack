@@ -18,6 +18,9 @@ internal sealed class HtmlParser
     // second, so cancellation is seen within a fraction of a millisecond.
     private const int CancellationInterval = 1024;
 
+    // Characters between two looks at the token while reading text.
+    private const int TextCheckInterval = 1 << 16;
+
     private static readonly HashSet<string> Void = new(StringComparer.Ordinal)
     {
         "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr", "param", "keygen",
@@ -47,6 +50,7 @@ internal sealed class HtmlParser
     private bool _inBody;
     private int _at;
     private int _markup;
+    private int _nextCheck = TextCheckInterval;
 
     private HtmlParser(string html, CancellationToken cancellationToken)
     {
@@ -68,13 +72,22 @@ internal sealed class HtmlParser
         return parser._doc;
     }
 
+    private void CheckCancellation()
+    {
+        _cancellationToken.ThrowIfCancellationRequested();
+        _nextCheck = _at + TextCheckInterval;
+    }
+
     private HtmlElement Current => _stack.Count > 0 ? _stack[^1] : (_inBody ? _body : _head);
 
     private void Run()
     {
         var text = new StringBuilder();
+        _cancellationToken.ThrowIfCancellationRequested();
         while (_at < _s.Length)
         {
+            // Text and character references advance without passing a tag.
+            if (_at >= _nextCheck) CheckCancellation();
             char c = _s[_at];
             if (c == '<' && _at + 1 < _s.Length)
             {
@@ -304,7 +317,7 @@ internal sealed class HtmlParser
             string close = "</" + name;
             int end = IndexOfIgnoreCase(_s, close, _at);
             string content = _s.Substring(_at, (end < 0 ? _s.Length : end) - _at);
-            if (Rcdata.Contains(name)) content = DecodeText(content);
+            if (Rcdata.Contains(name)) content = DecodeText(content, _cancellationToken);
             if (content.Length > 0) element.Append(new HtmlText(content));
             Current.Append(element);
             _at = end < 0 ? _s.Length : Math.Max(_s.IndexOf('>', end) + 1, end + close.Length);
@@ -394,13 +407,14 @@ internal sealed class HtmlParser
         s.IndexOf(value, start, StringComparison.OrdinalIgnoreCase);
 
     /// <summary>Decodes character references in RCDATA content.</summary>
-    private static string DecodeText(string text)
+    private static string DecodeText(string text, CancellationToken cancellationToken)
     {
         if (text.IndexOf('&') < 0) return text;
-        var parser = new HtmlParser(text, CancellationToken.None);
+        var parser = new HtmlParser(text, cancellationToken);
         var sb = new StringBuilder();
         while (parser._at < parser._s.Length)
         {
+            if (parser._at >= parser._nextCheck) parser.CheckCancellation();
             if (parser._s[parser._at] == '&') sb.Append(parser.CharacterReference(false));
             else sb.Append(parser._s[parser._at++]);
         }

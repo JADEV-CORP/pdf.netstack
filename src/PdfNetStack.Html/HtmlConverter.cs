@@ -184,6 +184,7 @@ public static class HtmlConverter
         List<BoxFragment> fixedAbove = [.. fixedBoxes.Where(f => !(Painter.ZIndex(f) < 0))];
         (CssColor canvas, Box? propagated) = Painter.CanvasBackground(runs[0].Layout);
         var indexes = new Dictionary<PageRun, PaintIndex>();
+        var sizes = new Dictionary<Fragment, long>();
         for (int i = 0; i < pages.Count; i++)
         {
             budget.ThrowIfCancellationRequested();
@@ -205,8 +206,8 @@ public static class HtmlConverter
                 foreach (BoxFragment fixedBox in boxes)
                 {
                     // A fixed box paints again on every page: thousands of them on thousands of
-                    // pages multiply, so each repeat counts as layout work.
-                    budget.Layout(1);
+                    // pages multiply, so each repeat counts as layout work, for its whole subtree.
+                    budget.Layout(SubtreeSize(fixedBox, sizes));
                     using (graphics.Save())
                     {
                         graphics.TranslateTransform(g.Margin.Left * PointsPerPixel, g.Margin.Top * PointsPerPixel);
@@ -238,7 +239,7 @@ public static class HtmlConverter
                 double offset = 0;
                 foreach (Paginator.RepeatedHeader header in slice.Headers)
                 {
-                    budget.Layout(1);
+                    budget.Layout(SubtreeSize(header.Header, sizes));
                     using (graphics.Save())
                     {
                         graphics.TranslateTransform(0, offset - header.Header.Y);
@@ -506,6 +507,13 @@ public static class HtmlConverter
         return slices.Count - 1;
     }
 
+    /// <summary>The fragments under a root, itself included, counted once per root: what each repaint of it costs.</summary>
+    private static long SubtreeSize(Fragment root, Dictionary<Fragment, long> sizes)
+    {
+        if (!sizes.TryGetValue(root, out long size)) sizes[root] = size = Walk(root).Count();
+        return size;
+    }
+
     /// <summary>Every fragment in tree order, depth first, without an iterator per level.</summary>
     private static IEnumerable<Fragment> Walk(Fragment root)
     {
@@ -628,6 +636,7 @@ public static class HtmlConverter
     private sealed class RunningElements(Dictionary<string, Box> unanchored, List<(TextBox Box, string Counter, string Style)> pageCounters, StyleResolver resolver, FontResolver fonts, Func<string, HtmlImage?> images, WorkBudget budget)
     {
         private readonly Dictionary<(Box, double, int), BoxFragment> _laidOut = [];
+        private readonly Dictionary<Fragment, long> _sizes = [];
         private readonly Dictionary<Box, List<(TextBox Box, string Counter, string Style)>> _counters = [];
         private readonly List<(string Name, int Page, Box Box)> _placed = [];
 
@@ -648,6 +657,9 @@ public static class HtmlConverter
             List<CssValue> args = [.. element.Children.Where(c => c.IsToken && c.Token.Type == CssTokenType.Ident)];
             if (args.Count == 0) return;
             string name = args[0].Token.Value, policy = args.Count > 1 ? args[1].Token.Value.ToLowerInvariant() : "first";
+
+            // Choose looks at every anchor, and the element is painted whole on each page that shows it.
+            budget.Layout(1 + _placed.Count);
             Box? box = Choose(name, policy, page);
             if (box is null) return;
 
@@ -664,6 +676,8 @@ public static class HtmlConverter
                 fragment = new LayoutEngine(fonts, budget).Layout(holder, width);
                 _laidOut[key] = fragment;
             }
+
+            budget.Layout(SubtreeSize(fragment, _sizes));
 
             // Vertically centred in its area, as margin boxes are by default.
             using (graphics.Save())

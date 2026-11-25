@@ -123,8 +123,10 @@ internal sealed class CssSelector
     // a selector like "a b c d" against a deep tree does not retry every combination of ancestors.
     private Result Match(int index, HtmlElement element, WorkBudget budget)
     {
-        budget.Style(1);
         CssCompound compound = Compounds[index];
+
+        // A compound of many conditions is that many tests, not one.
+        budget.Style(Math.Max(1, compound.Conditions.Count));
         if (!compound.Matches(element, budget)) return Result.RestartFromLaterSibling;
         if (index == Compounds.Length - 1) return Result.Matched;
 
@@ -405,6 +407,9 @@ internal sealed class ClassCondition(string name) : CssCondition
         // Indexed, not foreach: through the interface each loop would allocate an enumerator, and
         // this is the most frequent test of all.
         IReadOnlyList<string> classes = e.ClassList;
+
+        // One unit per 16 classes: a few classes cost nothing extra, a hostile list does.
+        budget.Style(classes.Count >> 4);
         for (int i = 0; i < classes.Count; i++)
         {
             if (classes[i] == Name) return true;
