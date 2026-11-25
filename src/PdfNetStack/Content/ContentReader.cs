@@ -101,10 +101,23 @@ internal sealed class ContentReader
             if (t.Kind == TokenKind.Keyword)
             {
                 ReadOnlySpan<byte> k = _parser.Span[t.Start..t.End];
-                if (k.SequenceEqual("true"u8) || k.SequenceEqual("false"u8) || k.SequenceEqual("null"u8))
+                // Built from the token already read: parsing it again would take a second token,
+                // which the budget may not have.
+                if (k.SequenceEqual("true"u8))
                 {
-                    _parser.Position = start;
-                    AddOperand(op, _parser.ParseObject());
+                    AddOperand(op, PdfBoolean.True);
+                    continue;
+                }
+
+                if (k.SequenceEqual("false"u8))
+                {
+                    AddOperand(op, PdfBoolean.False);
+                    continue;
+                }
+
+                if (k.SequenceEqual("null"u8))
+                {
+                    AddOperand(op, PdfNull.Instance);
                     continue;
                 }
 
