@@ -501,20 +501,34 @@ internal static class LossyImages
     }
 
     /// <summary>
-    /// Requantized JPEG data against its source, both decoded: whether the gate holds.
+    /// Requantized JPEG data against its source, both decoded: whether the gate holds. Each image
+    /// is charged to <paramref name="budget"/> before it is decoded.
     /// </summary>
-    public static bool RequantizationPasses(ReadOnlySpan<byte> source, ReadOnlySpan<byte> requantized, int? colorTransform, double gate, long decodeLimit)
+    /// <exception cref="PdfLimitExceededException">The document's images have decoded their pixel budget.</exception>
+    public static bool RequantizationPasses(ReadOnlySpan<byte> source, ReadOnlySpan<byte> requantized, int? colorTransform, double gate, long decodeLimit, ResourceBudget? budget)
     {
         try
         {
-            Raster a = JpegDecoder.Decode(source, colorTransform, decodeLimit);
-            Raster b = JpegDecoder.Decode(requantized, colorTransform, decodeLimit);
+            Raster a = DecodeCharged(source, colorTransform, decodeLimit, budget);
+            Raster b = DecodeCharged(requantized, colorTransform, decodeLimit, budget);
             return a.Width == b.Width && a.Height == b.Height && a.Channels == b.Channels && Ssim.Compare(a, b) >= gate;
         }
-        catch (JpegFormatException)
+        catch (Exception e) when (e is JpegFormatException or FormatException)
         {
             return false;
         }
+    }
+
+    /// <summary>
+    /// A JPEG decoded at the size its own frame header gives, which nothing else here states.
+    /// Those pixels are charged first, and the decoder refuses a frame larger than what was charged.
+    /// </summary>
+    private static Raster DecodeCharged(ReadOnlySpan<byte> jpeg, int? colorTransform, long decodeLimit, ResourceBudget? budget)
+    {
+        JpegHeader header = JpegHeader.Read(jpeg);
+        long pixels = (long)header.Width * header.Height;
+        budget?.ChargeImagePixels(pixels);
+        return JpegDecoder.Decode(jpeg, colorTransform, decodeLimit, pixels);
     }
 
     /// <summary>
