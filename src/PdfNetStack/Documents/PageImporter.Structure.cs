@@ -28,6 +28,10 @@ internal sealed partial class PageImporter
     private bool _roleMapMerged;
     private bool _classMapMerged;
 
+    // Source numbers of shared XObjects whose structure key was removed because no element
+    // of the import that copied them tags them. A later import that does gives the key back.
+    private readonly HashSet<int> _unkeyed = [];
+
     // Element IDs of the source that another element of the target already uses, with the
     // unique ID their copies carry. Table header references are rewritten to match.
     private readonly Dictionary<string, string> _idRenames = new(StringComparer.Ordinal);
@@ -310,26 +314,30 @@ internal sealed partial class PageImporter
         }
 
         // XObjects are shared by every import from this source, so only those this call copied
-        // first get keys, mapped to this call's elements.
-        foreach (int source in newlyShared)
+        // first get keys, mapped to this call's elements, and those an earlier call left without.
+        // What an XObject carries is decided by the source: the copy may have lost it.
+        foreach (int source in newlyShared.Concat(_unkeyed).ToList())
         {
             PdfObject target = _target.Objects[_shared[source]];
-            if (_source.Objects.TryGetValue(source, out PdfObject? original) && original is PdfStream stream && target is PdfStream xobject)
+            if (!_source.Objects.TryGetValue(source, out PdfObject? original) || original is not PdfStream stream || target is not PdfStream xobject) continue;
+            bool lost = false;
+            foreach (string key in XObjectStructureKeys)
             {
-                foreach (string key in XObjectStructureKeys)
+                if (!stream.Dictionary.ContainsKey(key)) continue;
+                if (copy.ParentTreeValue(_source, stream.Dictionary[key]) is PdfObject value)
                 {
-                    if (!xobject.Dictionary.ContainsKey(key)) continue;
-                    if (copy.ParentTreeValue(_source, stream.Dictionary[key]) is PdfObject value)
-                    {
-                        entries.Add((next, value));
-                        xobject.Dictionary.Set(key, PdfNumber.FromInteger(next++));
-                    }
-                    else
-                    {
-                        xobject.Dictionary.Remove(key);
-                    }
+                    entries.Add((next, value));
+                    xobject.Dictionary.Set(key, PdfNumber.FromInteger(next++));
+                }
+                else
+                {
+                    xobject.Dictionary.Remove(key);
+                    lost = true;
                 }
             }
+
+            if (lost) _unkeyed.Add(source);
+            else _unkeyed.Remove(source);
         }
 
         if (copy.Tops.Count == 0 && entries.Count == 0)

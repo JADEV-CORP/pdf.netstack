@@ -48,6 +48,7 @@ internal sealed partial class PageImporter
         // Everything this call allocates is numbered from here, so a failure can take it back.
         int firstNumber = _target.NextNumber;
         var idRenames = new Dictionary<string, string>(_idRenames, StringComparer.Ordinal);
+        var unkeyed = new HashSet<int>(_unkeyed);
 
         // Reserve numbers for every page first so links between them can be remapped.
         var pageMap = new Dictionary<int, int>();
@@ -80,6 +81,8 @@ internal sealed partial class PageImporter
             RestoreFormState(form);
             _structure = null;
             ResetUnmergedRenames();
+            _unkeyed.Clear();
+            _unkeyed.UnionWith(unkeyed);
             _idRenames.Clear();
             foreach (KeyValuePair<string, string> rename in idRenames) _idRenames[rename.Key] = rename.Value;
             for (int number = firstNumber; number < _target.NextNumber; number++) _target.Objects.Remove(number);

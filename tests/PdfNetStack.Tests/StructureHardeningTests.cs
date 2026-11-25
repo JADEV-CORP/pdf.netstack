@@ -65,6 +65,29 @@ public sealed class StructureHardeningTests
         return b.Build();
     }
 
+    /// <summary>
+    /// Two pages paint the same form. The first does not tag it; the second tags it through a
+    /// marked content reference.
+    /// </summary>
+    private static byte[] FormTaggedOnSecondPage()
+    {
+        var b = new PdfBuilder();
+        b.Set(1, "<</Type/Catalog/Pages 2 0 R/StructTreeRoot 20 0 R/MarkInfo<</Marked true>>>>");
+        b.Set(2, "<</Type/Pages/Kids[5 0 R 7 0 R]/Count 2>>");
+        b.Set(3, FontObject);
+        b.SetStream(4, "", Ascii("q 1 0 0 1 72 400 cm /X0 Do Q"));
+        b.Set(5, "<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]/Resources<</XObject<</X0 8 0 R>>>>/Contents 4 0 R>>");
+        b.SetStream(6, "", Ascii("/P <</MCID 0>> BDC BT /F1 12 Tf 72 700 Td (text) Tj ET EMC q 1 0 0 1 72 400 cm /X0 Do Q"));
+        b.Set(7, "<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]/Resources<</Font<</F1 3 0 R>>/XObject<</X0 8 0 R>>>>/Contents 6 0 R/StructParents 0>>");
+        b.SetStream(8, "/Type/XObject/Subtype/Form/BBox[0 0 100 100]/StructParents 1/Resources<<>>", Ascii("/Figure <</MCID 0>> BDC 0 0 50 50 re f EMC"));
+        b.Set(20, "<</Type/StructTreeRoot/K 21 0 R/ParentTree 30 0 R/ParentTreeNextKey 2>>");
+        b.Set(21, "<</Type/StructElem/S/Document/P 20 0 R/K[22 0 R 25 0 R]>>");
+        b.Set(22, "<</Type/StructElem/S/P/P 21 0 R/Pg 7 0 R/K 0>>");
+        b.Set(25, "<</Type/StructElem/S/Figure/P 21 0 R/Alt(Logo)/K<</Type/MCR/Pg 7 0 R/Stm 8 0 R/MCID 0>>>>");
+        b.Set(30, "<</Nums[0[22 0 R] 1[25 0 R]]>>");
+        return b.Build();
+    }
+
     [TestMethod]
     public void AnImportedPageListedTwiceIsTaggedTwiceWithItsOwnAnnotations()
     {
@@ -208,5 +231,17 @@ public sealed class StructureHardeningTests
         var references = (PdfArray)saved.Resolve(StructureImportTests.Element(saved, "P")["Ref"])!;
         Assert.HasCount(1, references);
         Assert.AreSame(StructureImportTests.Element(saved, "Table"), saved.ResolveDictionary(references[0]));
+    }
+
+    [TestMethod]
+    public void AFormTaggedByALaterImportGetsItsParentTreeKeyBack()
+    {
+        PdfDocument source = PdfDocument.Open(FormTaggedOnSecondPage());
+        PdfDocument target = PdfDocument.Create();
+        target.Pages.Import([source.Pages[0]]);
+        target.Pages.Import([source.Pages[1]]);
+
+        PdfDocument saved = StructureImportTests.Saved(target);
+        Assert.AreEqual("Document(P,Figure)", StructureImportTests.CheckStructure(saved));
     }
 }
