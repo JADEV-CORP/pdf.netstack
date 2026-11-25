@@ -2,7 +2,9 @@ using System.IO.Compression;
 using System.Text;
 using PdfNetStack.Filters;
 using PdfNetStack.Optimization;
+using PdfNetStack.Objects;
 using PdfNetStack.Parsing;
+using PdfNetStack.Writing;
 
 namespace PdfNetStack.Tests;
 
@@ -172,13 +174,16 @@ public sealed class OptimizerHardeningTests
             await File.WriteAllBytesAsync(source, input);
             var options = new PdfOptimizerOptions { Limits = new PdfLimits { MaxInputBytes = 1024 } };
 
+            // Only the part before the first suspension runs on this thread, and it is where a read
+            // of the whole file would allocate its buffer.
 #if NET
             long before = GC.GetAllocatedBytesForCurrentThread();
 #endif
-            PdfOptimizationResult result = await PdfOptimizer.OptimizeFileAsync(source, destination, options);
+            Task<PdfOptimizationResult> running = PdfOptimizer.OptimizeFileAsync(source, destination, options);
 #if NET
             long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
 #endif
+            PdfOptimizationResult result = await running;
 
             Assert.AreEqual(OptimizationDisposition.LimitExceeded, result.Disposition);
             Assert.AreEqual(PdfLimitKind.InputBytes, result.Diagnostics.Single().Limit);
@@ -264,5 +269,28 @@ public sealed class OptimizerHardeningTests
         PdfLimitExceededException exceeded = Assert.ThrowsExactly<PdfLimitExceededException>(() => work.Execute(image, false, CancellationToken.None));
 
         Assert.AreEqual(PdfLimitKind.TotalDecodedBytes, exceeded.Limit);
+    }
+
+    /// <summary>The objects of a one page file, numbered as the writers take them.</summary>
+    private static (List<PdfObject> Objects, PdfDictionary Trailer, Func<PdfReference, int> Map) WriterInput()
+    {
+        PdfFile file = PdfFile.Open(PdfBuilder.Simple("x").Build(), 64 << 20);
+        ObjectGraph graph = ObjectGraph.Collect(file, false, false, CancellationToken.None);
+        var index = new Dictionary<int, int>();
+        for (int i = 0; i < graph.Order.Count; i++) index[graph.Order[i]] = i + 1;
+        var trailer = new PdfDictionary();
+        trailer.Set("Root", file.Trailer["Root"]!);
+        return ([.. graph.Order.Select(file.GetObject)], trailer, r => index.TryGetValue(r.Number, out int n) ? n : -1);
+    }
+
+    [TestMethod]
+    public void WritersStopWhenCancelled()
+    {
+        (List<PdfObject> objects, PdfDictionary trailer, Func<PdfReference, int> map) = WriterInput();
+        var settings = new WriterSettings(false, 200, "1.7", CompressionLevel.Optimal);
+
+        Assert.ThrowsExactly<OperationCanceledException>(() => PdfDocumentWriter.Write(objects, trailer, map, settings, Cancelled()));
+        Assert.ThrowsExactly<OperationCanceledException>(() => LinearizedWriter.Write(objects, trailer, map, settings, Cancelled()));
+        Assert.IsGreaterThan(0, PdfDocumentWriter.Write(objects, trailer, map, settings).Length);
     }
 }

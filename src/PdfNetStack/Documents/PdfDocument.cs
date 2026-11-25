@@ -1426,8 +1426,9 @@ public sealed class PdfDocument : IDisposable
     /// <summary>The whole file in memory: written, then optimized and encrypted as the options say.</summary>
     private byte[] Build(PdfSaveOptions options, CancellationToken ct)
     {
+        ct.ThrowIfCancellationRequested();
         SavePlan plan = PlanSave(options);
-        byte[] written = PdfDocumentWriter.Write(plan.Objects, plan.Trailer, plan.Map, plan.Settings).ToArray();
+        byte[] written = PdfDocumentWriter.Write(plan.Objects, plan.Trailer, plan.Map, plan.Settings, ct).ToArray();
         if (!options.Optimize) return written;
 
         var optimizerOptions = new PdfOptimizerOptions
@@ -1439,7 +1440,7 @@ public sealed class PdfDocument : IDisposable
             KeepMetadataUnfiltered = options.Conformance != PdfConformance.None,
         };
         (written, _) = PdfOptimizer.Optimize(written, optimizerOptions, ct);
-        return Security.Target is { } encryption ? Encrypted(written, encryption, plan.Settings.UseObjectStreams, plan.Settings.CompressionLevel) : written;
+        return Security.Target is { } encryption ? Encrypted(written, encryption, plan.Settings.UseObjectStreams, plan.Settings.CompressionLevel, ct) : written;
     }
 
     /// <summary>What a full save writes: the objects in output order, the trailer, and how to write them.</summary>
@@ -1655,10 +1656,10 @@ public sealed class PdfDocument : IDisposable
     /// Encryption is the last step: the finished, optimized and verified plain file is re-read and
     /// written once more with every string and stream encrypted.
     /// </summary>
-    private static byte[] Encrypted(byte[] plain, StandardSecurity encryption, bool objectStreams, CompressionLevel level)
+    private static byte[] Encrypted(byte[] plain, StandardSecurity encryption, bool objectStreams, CompressionLevel level, CancellationToken ct)
     {
         PdfFile file = PdfFile.Open(plain, 1L << 30);
-        ObjectGraph graph = ObjectGraph.Collect(file, stripThumbnails: false, stripPieceInfo: false, CancellationToken.None);
+        ObjectGraph graph = ObjectGraph.Collect(file, stripThumbnails: false, stripPieceInfo: false, ct);
         var objects = graph.Order.Select(file.GetObject).ToList();
         var index = new Dictionary<int, int>();
         for (int i = 0; i < graph.Order.Count; i++) index[graph.Order[i]] = i + 1;
@@ -1682,7 +1683,7 @@ public sealed class PdfDocument : IDisposable
             Encryption = encryption,
             EncryptionDictionaryNumber = encryptNumber,
         };
-        return PdfDocumentWriter.Write(objects, trailer, Map, settings).ToArray();
+        return PdfDocumentWriter.Write(objects, trailer, Map, settings, ct).ToArray();
     }
 
     /// <summary>The first /ID entry, creating the ID when the document has none. Key derivation for AES-128 needs it.</summary>

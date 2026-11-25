@@ -46,10 +46,11 @@ internal static class LinearizedWriter
     /// <param name="trailer">Root, Info and ID.</param>
     /// <param name="mapReference">Maps any reference in the objects to its object's number, or -1.</param>
     /// <param name="settings">Version and compression; object streams and encryption are not used.</param>
-    public static ReadOnlyMemory<byte>? Write(IReadOnlyList<PdfObject> objects, PdfDictionary trailer, Func<PdfReference, int> mapReference, WriterSettings settings)
+    /// <param name="ct">Observed before each object is written.</param>
+    public static ReadOnlyMemory<byte>? Write(IReadOnlyList<PdfObject> objects, PdfDictionary trailer, Func<PdfReference, int> mapReference, WriterSettings settings, CancellationToken ct = default)
     {
         var layout = Layout.Build(objects, trailer, mapReference);
-        return layout is null ? null : Assemble(layout, objects, trailer, mapReference, settings);
+        return layout is null ? null : Assemble(layout, objects, trailer, mapReference, settings, ct);
     }
 
     /// <summary>Which objects go where, in the numbering of the input.</summary>
@@ -391,7 +392,7 @@ internal static class LinearizedWriter
         }
     }
 
-    private static ReadOnlyMemory<byte> Assemble(Layout layout, IReadOnlyList<PdfObject> objects, PdfDictionary trailer, Func<PdfReference, int> mapReference, WriterSettings settings)
+    private static ReadOnlyMemory<byte> Assemble(Layout layout, IReadOnlyList<PdfObject> objects, PdfDictionary trailer, Func<PdfReference, int> mapReference, WriterSettings settings, CancellationToken ct)
     {
         // Numbers: parts 7, 8 and 9 from 1 in file order, then the linearization dictionary,
         // part 4, part 6 and the hint stream, which the first page's cross-reference section covers.
@@ -413,6 +414,7 @@ internal static class LinearizedWriter
         var sink = new ByteSink(4096);
         foreach ((int old, int number) in renumber)
         {
+            ct.ThrowIfCancellationRequested();
             sink.Clear();
             PdfDocumentWriter.WriteIndirect(sink, serializer, number, objects[old - 1], plain);
             bodies[old] = sink.ToArray();

@@ -411,6 +411,7 @@ public sealed class CancellationTests
         Assert.ThrowsExactly<OperationCanceledException>(() => doc.Save(new MemoryStream(), Plain, Cancelled()));
         Assert.ThrowsExactly<OperationCanceledException>(() => doc.Save(new MemoryStream(), null, Cancelled()));
         Assert.ThrowsExactly<OperationCanceledException>(() => doc.ToArray(null, Cancelled()));
+        Assert.ThrowsExactly<OperationCanceledException>(() => doc.ToArray(Plain, Cancelled()));
 
         using var stream = new MemoryStream();
         doc.Save(stream, Plain, CancellationToken.None);
