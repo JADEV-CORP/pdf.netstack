@@ -50,6 +50,18 @@ internal static class Vp8Decoder
     {
         (width, height) = Size(data);
         DecodedImage.CheckSize(width, height, 4, "WebP", maxPixels);
+
+        // Every macroblock spends more than one bit of the first partition on its modes: the key
+        // frame probabilities of the subblock and chroma mode flags are fixed near one half. A first
+        // partition shorter than one bit per macroblock cannot describe the frame, so a few bytes
+        // claiming a huge size are refused here, before the planes are allocated.
+        int firstSize = (data[0] | data[1] << 8 | data[2] << 16) >> 5;
+        long macroblocks = (long)((width + 15) >> 4) * ((height + 15) >> 4);
+        if (firstSize > data.Length - 10 || firstSize * 8L < macroblocks)
+        {
+            throw new FormatException($"VP8 data is too short for a {width} by {height} frame.");
+        }
+
         Frame frame = new Frame(data.ToArray(), width, height);
         frame.Decode();
         return frame.ToRgb();
