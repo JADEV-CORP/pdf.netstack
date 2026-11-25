@@ -25,7 +25,7 @@ public sealed class StructureImportTests
     /// a link annotation through an object reference, and a figure drawn by a form XObject,
     /// tagged through a marked content reference.
     /// </summary>
-    private static byte[] Tagged(string text, string language = "en-US", string headingRole = "H1", string id = "p1")
+    internal static byte[] Tagged(string text, string language = "en-US", string headingRole = "H1", string id = "p1")
     {
         var b = new PdfBuilder();
         b.Set(1, $"<</Type/Catalog/Pages 2 0 R/StructTreeRoot 20 0 R/MarkInfo<</Marked true>>/Lang({language})>>");
@@ -56,7 +56,7 @@ public sealed class StructureImportTests
         return b.Build();
     }
 
-    private static PdfDocument Saved(PdfDocument doc)
+    internal static PdfDocument Saved(PdfDocument doc)
     {
         byte[] bytes = doc.ToArray(Plain);
         QpdfCheck(bytes);
@@ -70,7 +70,7 @@ public sealed class StructureImportTests
     /// element through the parent tree, which holds nothing else. Returns the tree as types and
     /// children, such as Document(P(Span),H1).
     /// </summary>
-    private static string CheckStructure(PdfDocument doc)
+    internal static string CheckStructure(PdfDocument doc)
     {
         var rootReference = (PdfReference)doc.Catalog["StructTreeRoot"]!;
         PdfDictionary root = doc.ResolveDictionary(rootReference)!;
@@ -201,9 +201,9 @@ public sealed class StructureImportTests
         return shape;
     }
 
-    private static PdfDictionary Element(PdfDocument doc, string type) => Elements(doc).First(e => e.GetName("S") == type);
+    internal static PdfDictionary Element(PdfDocument doc, string type) => Elements(doc).First(e => e.GetName("S") == type);
 
-    private static List<PdfDictionary> Elements(PdfDocument doc)
+    internal static List<PdfDictionary> Elements(PdfDocument doc)
     {
         var all = new List<PdfDictionary>();
         void Walk(PdfObject? node)
