@@ -292,6 +292,32 @@ public sealed class OptimizerHardeningTests
         Assert.AreEqual(OptimizationDisposition.LimitExceeded, result.Disposition, result.Reason);
     }
 
+    /// <summary>A one page file whose catalog also holds <paramref name="size"/> zeros in one Flate stream.</summary>
+    private static byte[] ZerosPdf(int size)
+    {
+        PdfBuilder b = PdfBuilder.Simple("x");
+        int zeros = b.AddStream("/Filter/FlateDecode", PdfBuilder.Deflate(new byte[size]));
+        b.Set(1, $"<</Type/Catalog/Pages 2 0 R/Zeros {zeros} 0 R>>");
+        return b.Build();
+    }
+
+    [TestMethod]
+    public void LosslessAndLossyPassesShareOneBudget()
+    {
+        // A pass decodes the 4 MiB stream three times: to recompress it, and on both sides of the
+        // proof. One pass fits in 16 MiB; the lossless pass a time limit runs first does not fit
+        // beside it.
+        byte[] input = ZerosPdf(4 << 20);
+        var options = new PdfOptimizerOptions { MinSavingPercent = 0, JpegQuality = 80, Limits = new PdfLimits { MaxTotalDecodedBytes = 16 << 20 } };
+
+        (_, PdfOptimizationResult once) = PdfOptimizer.Optimize(input, options);
+        (_, PdfOptimizationResult twice) = PdfOptimizer.Optimize(input, options with { Limits = options.Limits with { Timeout = TimeSpan.FromMinutes(5) } });
+
+        Assert.AreEqual(OptimizationDisposition.Optimized, once.Disposition, once.Reason);
+        Assert.AreEqual(OptimizationDisposition.LimitExceeded, twice.Disposition, twice.Reason);
+        Assert.AreEqual(PdfLimitKind.TotalDecodedBytes, twice.Diagnostics.Single().Limit);
+    }
+
     [TestMethod]
     public void RequantizationGateSpendsTheImagePixelBudget()
     {
