@@ -544,29 +544,54 @@ internal sealed partial class PageImporter
     /// Table cells name their header cells by ID (/Headers, ISO 32000-1, 14.8.5.7). Where an ID
     /// was renamed, the copied attributes follow it. Runs once the attribute objects are copied.
     /// </summary>
+    /// <remarks>
+    /// Attribute objects are shared by every copy of the source that refers to them, so a renamed
+    /// one goes on the element as a copy of its own, never written in place.
+    /// </remarks>
     private void RewriteHeaders(List<PdfDictionary> elements)
     {
         foreach (PdfDictionary element in elements)
         {
-            IEnumerable<PdfObject> attributes = _target.Resolve(element["A"]) switch
+            switch (_target.Resolve(element["A"]))
             {
-                PdfArray array => array,
-                PdfDictionary single => [single],
-                _ => [],
-            };
-
-            foreach (PdfObject attribute in attributes)
-            {
-                if (_target.Resolve(attribute) is not PdfDictionary a || _target.Resolve(a["Headers"]) is not PdfArray headers) continue;
-                for (int i = 0; i < headers.Count; i++)
-                {
-                    if (_target.Resolve(headers[i]) is PdfString h && _idRenames.TryGetValue(Compat.Latin1.GetString(h.Value), out string? renamed))
+                case PdfDictionary single:
+                    if (WithRenamedHeaders(single) is { } renamed) element.Set("A", renamed);
+                    break;
+                case PdfArray array:
+                    PdfArray? rewritten = null;
+                    for (int i = 0; i < array.Count; i++)
                     {
-                        headers.Items[i] = new PdfString(Compat.Latin1.GetBytes(renamed));
+                        if (_target.Resolve(array[i]) is PdfDictionary attribute && WithRenamedHeaders(attribute) is { } copy)
+                        {
+                            rewritten ??= new PdfArray([.. array.Items]);
+                            rewritten.Items[i] = copy;
+                        }
                     }
-                }
+
+                    if (rewritten is not null) element.Set("A", rewritten);
+                    break;
             }
         }
+    }
+
+    /// <summary>A copy of <paramref name="attribute"/> whose /Headers use the renamed IDs, or null when none of them was renamed.</summary>
+    private PdfDictionary? WithRenamedHeaders(PdfDictionary attribute)
+    {
+        if (_target.Resolve(attribute["Headers"]) is not PdfArray headers) return null;
+        PdfArray? rewritten = null;
+        for (int i = 0; i < headers.Count; i++)
+        {
+            if (_target.Resolve(headers[i]) is PdfString h && _idRenames.TryGetValue(Compat.Latin1.GetString(h.Value), out string? renamed))
+            {
+                rewritten ??= new PdfArray([.. headers.Items]);
+                rewritten.Items[i] = new PdfString(Compat.Latin1.GetBytes(renamed));
+            }
+        }
+
+        if (rewritten is null) return null;
+        PdfDictionary copy = PdfDocument.Clone(attribute);
+        copy.Set("Headers", rewritten);
+        return copy;
     }
 
     /// <summary>The target is tagged once tagged content arrives (ISO 32000-1, 14.7.1), and suspect when any source was.</summary>
