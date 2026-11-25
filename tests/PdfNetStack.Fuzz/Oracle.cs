@@ -26,18 +26,26 @@ internal static class Oracle
     public static long Budget(int inputLength) => (AllocationFactor * (long)inputLength) + AllocationBase;
 
     /// <summary>
-    /// Runs the target once on an empty input and ignores the result, so that loading code and
-    /// static tables is not charged to the first real input.
+    /// Runs the target on an empty input, then on <paramref name="first"/> when given, and ignores
+    /// the results, so that loading code and static tables is not charged to a real input. An
+    /// empty input does not reach fonts, shaping tables or layout code: on a slow runner the first
+    /// real HTML input took 2.7 s for that alone. A real hang still shows when it is measured.
     /// </summary>
-    public static void WarmUp(FuzzTarget target)
+    public static void WarmUp(FuzzTarget target, byte[]? first = null)
     {
-        try
+        Run([]);
+        if (first is not null) Run(first);
+
+        void Run(byte[] input)
         {
-            target.Run([]);
-        }
-        catch (Exception ex) when (ex is not OutOfMemoryException)
-        {
-            // Only the side effects of the first call matter here.
+            try
+            {
+                target.Run(input);
+            }
+            catch (Exception ex) when (ex is not OutOfMemoryException)
+            {
+                // Only the side effects of the call matter here.
+            }
         }
     }
 

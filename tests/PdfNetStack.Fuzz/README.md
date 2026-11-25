@@ -35,6 +35,7 @@ Fuzz with libFuzzer (Linux), as `.github/workflows/fuzz.yml` does:
 
 ```bash
 dotnet publish tests/PdfNetStack.Fuzz -c Release -f net10.0 -o fuzz
+dotnet fuzz/PdfNetStack.Fuzz.dll seeds open tests/PdfNetStack.Tests/Fixtures corpus
 dotnet tool install SharpFuzz.CommandLine --version 2.3.0 --tool-path .tools
 .tools/sharpfuzz fuzz/PdfNetStack.dll && .tools/sharpfuzz fuzz/PdfNetStack.Html.dll
 PDFNETSTACK_FUZZ_TARGET=open ./libfuzzer-dotnet --target_path=dotnet --target_arg=fuzz/PdfNetStack.Fuzz.dll \
@@ -42,4 +43,9 @@ PDFNETSTACK_FUZZ_TARGET=open ./libfuzzer-dotnet --target_path=dotnet --target_ar
 ```
 
 `libfuzzer-dotnet` is the release binary of [Metalnem/libfuzzer-dotnet](https://github.com/Metalnem/libfuzzer-dotnet).
-`FuzzHarnessTests` replays every target's seeds through the oracle on each test run.
+Write the seeds before instrumenting: some targets build them through the library, and instrumented
+code run outside libFuzzer has no coverage map and crashes with an access violation.
+
+`FuzzHarnessTests` replays every target's seeds through the oracle on each test run, and every input
+under `tests/PdfNetStack.Tests/Fixtures/Fuzz/<target>/`. Fix a finding by adding its input there
+first, so the test fails, then fixing the library.

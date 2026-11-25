@@ -1,0 +1,10 @@
+<!DOCTYPE html><html><head><style>
+body { font-family: Helvetica; margin: 20mm } h1 { color: #1E3A8A }
+table { border-collapse: collapse } td { border: 1px solid #999; padding: 4px }
+.row { display: flex; gap: 8px } .row div { flex: 1; background: #EFF6FF }
+@page { size: A4; @bottom-center { content: counter(page) } }
+</style></head><body>
+<h1>Invoice</h1><p dir="rtl">مرحبا</p><ul><li>One</li><li>Two</li></ul>
+<table><tr><td>Item</td><td>12.00</td></tr><tr><td colspan="2">Total</td></tr></table>
+<div class="row"><div>A</div><div>B</div></div>
+</body></html>

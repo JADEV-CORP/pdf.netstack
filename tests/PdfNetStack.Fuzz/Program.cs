@@ -36,13 +36,14 @@ internal static class Program
             bool warm = false;
             Fuzzer.LibFuzzer.Run(input =>
             {
+                byte[] data = input.ToArray();
                 if (!warm)
                 {
-                    Oracle.WarmUp(target);
+                    Oracle.WarmUp(target, data);
                     warm = true;
                 }
 
-                Oracle.Check(target, input.ToArray());
+                Oracle.Check(target, data);
             });
             return 0;
         }
@@ -74,9 +75,12 @@ internal static class Program
     /// <summary>Runs every file through the oracle and prints one line per finding.</summary>
     private static int Replay(FuzzTarget target, string[] paths)
     {
-        Oracle.WarmUp(target);
+        var files = paths.SelectMany<string, string>(p => Directory.Exists(p) ? Directory.GetFiles(p).Order(StringComparer.Ordinal) : [p]).ToList();
+
+        // The same warm up as under libFuzzer, so a replay measures what the fuzzer measured.
+        Oracle.WarmUp(target, files.Count > 0 ? File.ReadAllBytes(files[0]) : null);
         int inputs = 0, findings = 0;
-        foreach (string path in paths.SelectMany<string, string>(p => Directory.Exists(p) ? Directory.GetFiles(p).Order(StringComparer.Ordinal) : [p]))
+        foreach (string path in files)
         {
             inputs++;
             try
