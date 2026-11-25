@@ -43,11 +43,13 @@ internal static class PdfDocumentWriter
     /// <param name="objects">Object i is written with number i + 1.</param>
     /// <param name="trailer">Trailer entries to keep, typically Root, Info and ID.</param>
     /// <param name="mapReference">Maps any reference found in the objects to an output number, or -1.</param>
+    /// <param name="ct">Observed before each object.</param>
     public static ReadOnlyMemory<byte> Write(
         IReadOnlyList<PdfObject> objects,
         PdfDictionary trailer,
         Func<PdfReference, int> mapReference,
-        WriterSettings settings)
+        WriterSettings settings,
+        CancellationToken ct = default)
     {
         long estimate = 1024;
         foreach (PdfObject o in objects)
@@ -57,7 +59,7 @@ internal static class PdfDocumentWriter
         }
 
         var output = new Output(new ByteSink((int)Math.Min(estimate, Compat.MaxArrayLength)), progressive: false);
-        foreach (ReadOnlyMemory<byte> unused in Produce(output, objects, trailer, mapReference, settings, null, CancellationToken.None))
+        foreach (ReadOnlyMemory<byte> unused in Produce(output, objects, trailer, mapReference, settings, null, ct))
         {
             // In memory nothing is handed out: the whole file stays in the buffer.
         }

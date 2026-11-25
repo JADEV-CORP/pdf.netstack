@@ -479,7 +479,7 @@ public static partial class PdfOptimizer
             };
             ReadOnlyMemory<byte> candidate;
             bool linearized = false;
-            if (pushedDown && LinearizedWriter.Write(objects, trailer, Map, settings with { UseObjectStreams = false, Version = LinearizedVersion(file.HeaderVersion) }) is { } lin)
+            if (pushedDown && LinearizedWriter.Write(objects, trailer, Map, settings with { UseObjectStreams = false, Version = LinearizedVersion(file.HeaderVersion) }, ct) is { } lin)
             {
                 candidate = lin;
                 linearized = true;
@@ -487,9 +487,11 @@ public static partial class PdfOptimizer
             else
             {
                 if (pushedDown) notLinearized = "the page tree cannot be laid out page by page";
-                candidate = PdfDocumentWriter.Write(objects, trailer, Map, settings);
+                candidate = PdfDocumentWriter.Write(objects, trailer, Map, settings, ct);
             }
 
+            // A rewrite that finished past the time limit is not delivered.
+            ct.ThrowIfCancellationRequested();
             timings = timings with { Write = phase.Elapsed };
             phase.Restart();
 
