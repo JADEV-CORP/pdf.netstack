@@ -310,6 +310,40 @@ public sealed class StructureHardeningTests
     }
 
     [TestMethod]
+    public void ElementsSharingOneRefArrayAreGivenOneCopyOfIt()
+    {
+        const int Elements = 4000;
+        string elements = string.Join(" ", Enumerable.Range(300, Elements).Select(n => n + " 0 R"));
+        var b = new PdfBuilder();
+        b.Set(1, "<</Type/Catalog/Pages 2 0 R/StructTreeRoot 20 0 R>>");
+        b.Set(2, "<</Type/Pages/Kids[5 0 R]/Count 1>>");
+        b.Set(5, "<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]>>");
+        b.Set(20, "<</Type/StructTreeRoot/K 21 0 R/ParentTree 30 0 R>>");
+        b.Set(21, "<</Type/StructElem/S/Document/P 20 0 R/K[" + elements + "]>>");
+        b.Set(30, "<</Nums[]>>");
+        b.Set(100, "[" + elements + "]");
+        for (int i = 0; i < Elements; i++) b.Set(300 + i, "<</Type/StructElem/S/P/P 21 0 R/Pg 5 0 R/Ref 100 0 R/K 0>>");
+
+        PdfDocument source = PdfDocument.Open(b.Build());
+        PdfDocument target = PdfDocument.Create();
+
+#if NET
+        long before = GC.GetAllocatedBytesForCurrentThread();
+#endif
+        target.Pages.Import(source.Pages);
+#if NET
+        long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+        Assert.IsLessThan(64L * 1024 * 1024, allocated, "a shared /Ref array is not copied once per element");
+#endif
+        List<PdfDictionary> paragraphs = [.. StructureImportTests.Elements(target).Where(e => e.GetName("S") == "P")];
+        Assert.HasCount(Elements, paragraphs);
+        var references = (PdfArray)target.Resolve(paragraphs[0]["Ref"])!;
+        Assert.HasCount(Elements, references);
+        Assert.AreSame(references, target.Resolve(paragraphs[^1]["Ref"]), "the copies share one array, as the originals do");
+        Assert.AreSame(paragraphs[^1], target.ResolveDictionary(references[^1]), "the array names the copies");
+    }
+
+    [TestMethod]
     public void AKidsArrayThatContainsItselfThroughDirectElementsIsWalkedOnce()
     {
         var b = new PdfBuilder();
