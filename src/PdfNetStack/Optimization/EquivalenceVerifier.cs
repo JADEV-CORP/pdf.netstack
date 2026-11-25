@@ -472,7 +472,7 @@ internal sealed class EquivalenceVerifier
                 int? colorTransform = dct.Parms is PdfDictionary parms && parms["ColorTransform"] is PdfNumber { IsInteger: true } t && t.IntegerValue is 0 or 1
                     ? (int)t.IntegerValue
                     : null;
-                if (!LossyImages.RequantizationPasses(da.Data.Span, db.Data.Span, colorTransform, gate, _decodeLimit)) difference = "requantized JPEG is below the perceptual gate";
+                if (!LossyImages.RequantizationPasses(da.Data.Span, db.Data.Span, colorTransform, gate, _decodeLimit, _a.Budget)) difference = "requantized JPEG is below the perceptual gate";
             }
 
             return difference is null ? null : path + ": " + difference;

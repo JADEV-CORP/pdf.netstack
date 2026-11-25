@@ -1016,7 +1016,7 @@ internal static class StreamRecompressor
         {
             byte[]? transcoded = JpegTranscoder.TryTranscode(decoded.Data.Span, jpeg.Quality, jpeg.ColorTransform, jpeg.Components, decodeLimit, out bool requantized, jpeg.Progressive);
             if (transcoded is not null && requantized && jpeg.MinSsim is { } gate
-                && !LossyImages.RequantizationPasses(decoded.Data.Span, transcoded, jpeg.ColorTransform, gate, decodeLimit))
+                && !LossyImages.RequantizationPasses(decoded.Data.Span, transcoded, jpeg.ColorTransform, gate, decodeLimit, budget))
             {
                 // The requantized image failed the gate: keep it lossless.
                 rejected = true;

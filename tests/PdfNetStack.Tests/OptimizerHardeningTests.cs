@@ -238,6 +238,36 @@ public sealed class OptimizerHardeningTests
         Assert.AreEqual(OptimizationDisposition.LimitExceeded, result.Disposition, result.Reason);
     }
 
+    [TestMethod]
+    public void RequantizationGateSpendsTheImagePixelBudget()
+    {
+        // The gate decodes the 320 by 240 photograph and its requantized version: 153,600 pixels.
+        // A lossless run only moves coefficients and decodes no pixels.
+        var limits = new PdfLimits { MaxTotalImagePixels = 100_000 };
+        byte[] input = PhotoPdf();
+
+        (_, PdfOptimizationResult lossless) = PdfOptimizer.Optimize(input, new PdfOptimizerOptions { MinSavingPercent = 0, Limits = limits });
+        (_, PdfOptimizationResult result) = PdfOptimizer.Optimize(input, new PdfOptimizerOptions { MinSavingPercent = 0, JpegQuality = 60, MinImageSsim = 0.5, Limits = limits });
+
+        Assert.AreEqual(OptimizationDisposition.Optimized, lossless.Disposition, lossless.Reason);
+        Assert.AreEqual(OptimizationDisposition.LimitExceeded, result.Disposition, result.Reason);
+        Assert.AreEqual(PdfLimitKind.TotalImagePixels, result.Diagnostics.Single().Limit);
+    }
+
+    [TestMethod]
+    public void RequantizationCheckChargesBothDecodes()
+    {
+        // The proof runs the same check on the source and the output, with the source's budget.
+        byte[] jpeg = JpegCodecTests.Fixture("photo-q95.jpg");
+        var enough = new ResourceBudget(new PdfLimits { MaxTotalImagePixels = 2 * 320 * 240 }, 0, new PdfDiagnostics());
+        var tooSmall = new ResourceBudget(new PdfLimits { MaxTotalImagePixels = (2 * 320 * 240) - 1 }, 0, new PdfDiagnostics());
+
+        Assert.IsTrue(LossyImages.RequantizationPasses(jpeg, jpeg, null, 0.9, 64 << 20, enough));
+        PdfLimitExceededException e = Assert.ThrowsExactly<PdfLimitExceededException>(() => LossyImages.RequantizationPasses(jpeg, jpeg, null, 0.9, 64 << 20, tooSmall));
+
+        Assert.AreEqual(PdfLimitKind.TotalImagePixels, e.Limit);
+    }
+
     /// <summary>A black RGB image of <paramref name="side"/> pixels square under PNG prediction, which deflates to almost nothing.</summary>
     private static byte[] PredictedImagePdf(int side)
     {
