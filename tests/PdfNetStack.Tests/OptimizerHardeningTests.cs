@@ -172,7 +172,7 @@ public sealed class OptimizerHardeningTests
             string source = Path.Combine(directory, "in.pdf");
             string destination = Path.Combine(directory, "out.pdf");
             byte[] input = PaddedPdf(10 << 20);
-            await File.WriteAllBytesAsync(source, input);
+            File.WriteAllBytes(source, input);
             var options = new PdfOptimizerOptions { Limits = new PdfLimits { MaxInputBytes = 1024 } };
 
             // Only the part before the first suspension runs on this thread, and it is where a read
@@ -188,7 +188,7 @@ public sealed class OptimizerHardeningTests
 
             Assert.AreEqual(OptimizationDisposition.LimitExceeded, result.Disposition);
             Assert.AreEqual(PdfLimitKind.InputBytes, result.Diagnostics.Single().Limit);
-            CollectionAssert.AreEqual(input, await File.ReadAllBytesAsync(destination));
+            CollectionAssert.AreEqual(input, File.ReadAllBytes(destination));
 #if NET
             Assert.IsLessThan(2 << 20, allocated, "The file must not be read into memory.");
 #endif
