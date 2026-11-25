@@ -338,7 +338,7 @@ internal sealed partial class PageImporter
     /// elements under the target's structure root, and merges the role map, class map, ID tree,
     /// mark information and language.
     /// </summary>
-    private void FinishStructure(StructureCopy? copy, Dictionary<int, int> pages, Dictionary<int, int> batch, List<int> newlyShared, bool targetWasEmpty)
+    private void FinishStructure(StructureCopy? copy, Dictionary<int, int> pages, Dictionary<int, int> batch, List<int> newlyShared, bool targetWasEmpty, CancellationToken ct)
     {
         _structure = null;
         if (copy is null)
@@ -429,7 +429,7 @@ internal sealed partial class PageImporter
             MergeRoleMap(root!, copy.Index);
             MergeClassMap(root!, copy.ClassMap);
             if (copy.Ids.Count > 0) MergeIdTree(root!, copy);
-            if (_idRenames.Count > 0) RewriteHeaders(copy.Elements);
+            if (_idRenames.Count > 0) RewriteHeaders(copy, ct);
             MergeMarkInfo();
             CarryLanguage([.. copy.Tops.Select(t => t.Dictionary)], targetWasEmpty);
         }
@@ -654,41 +654,68 @@ internal sealed partial class PageImporter
     /// </summary>
     /// <remarks>
     /// Attribute objects are shared by every copy of the source that refers to them, so a renamed
-    /// one goes on the element as a copy of its own, never written in place.
+    /// one goes on the element as a copy of its own, never written in place. Within a round, cells
+    /// that share an attribute object or an array share its renamed copy too, as a copy for each
+    /// cell would cost cells times headers. Each header read is charged to the round's work.
     /// </remarks>
-    private void RewriteHeaders(List<PdfDictionary> elements)
+    private void RewriteHeaders(StructureCopy copy, CancellationToken ct)
     {
-        foreach (PdfDictionary element in elements)
+        var rewrite = new HeaderRewrite(copy, ct);
+        foreach (PdfDictionary element in copy.Elements)
         {
-            switch (_target.Resolve(element["A"]))
+            if (element["A"] is PdfObject attributes && RenamedAttributes(attributes, rewrite) is PdfObject renamed) element.Set("A", renamed);
+            if (rewrite.Refused)
             {
-                case PdfDictionary single:
-                    if (WithRenamedHeaders(single) is { } renamed) element.Set("A", renamed);
-                    break;
-                case PdfArray array:
-                    PdfArray? rewritten = null;
-                    for (int i = 0; i < array.Count; i++)
-                    {
-                        if (_target.Resolve(array[i]) is PdfDictionary attribute && WithRenamedHeaders(attribute) is { } copy)
-                        {
-                            rewritten ??= new PdfArray([.. array.Items]);
-                            rewritten.Items[i] = copy;
-                        }
-                    }
-
-                    if (rewritten is not null) element.Set("A", rewritten);
-                    break;
+                _source.Budget.Diagnostics.Skipped(Compat.Format("A copy of the structure tree stopped after {0} children and references; the rest of its table cells keep the header IDs they had.", StructureIndex.MaxKids));
+                return;
             }
         }
     }
 
-    /// <summary>A copy of <paramref name="attribute"/> whose /Headers use the renamed IDs, or null when none of them was renamed.</summary>
-    private PdfDictionary? WithRenamedHeaders(PdfDictionary attribute)
+    /// <summary>An element's /A, one attribute object or an array of them each optionally followed by a revision number, with renamed header IDs.</summary>
+    private PdfObject? RenamedAttributes(PdfObject value, HeaderRewrite rewrite) => _target.Resolve(value) switch
     {
-        if (_target.Resolve(attribute["Headers"]) is not PdfArray headers) return null;
+        PdfDictionary => RenamedAttribute(value, rewrite),
+        PdfArray => Shared(value, rewrite.Lists, resolved => WithRenamedItems((PdfArray)resolved, rewrite)),
+        _ => null,
+    };
+
+    private PdfObject? RenamedAttribute(PdfObject value, HeaderRewrite rewrite) =>
+        Shared(value, rewrite.Attributes, resolved => resolved is PdfDictionary attribute ? WithRenamedHeaders(attribute, rewrite) : null);
+
+    /// <summary>A copy of an /A array whose attribute objects use the renamed IDs, or null when none of them was renamed.</summary>
+    private PdfArray? WithRenamedItems(PdfArray attributes, HeaderRewrite rewrite)
+    {
+        PdfArray? rewritten = null;
+        for (int i = 0; i < attributes.Count && !rewrite.Refused; i++)
+        {
+            if (attributes[i] is not PdfNumber && RenamedAttribute(attributes[i], rewrite) is PdfObject renamed)
+            {
+                rewritten ??= new PdfArray([.. attributes.Items]);
+                rewritten.Items[i] = renamed;
+            }
+        }
+
+        return rewritten;
+    }
+
+    /// <summary>A copy of <paramref name="attribute"/> whose /Headers use the renamed IDs, or null when none of them was renamed.</summary>
+    private PdfDictionary? WithRenamedHeaders(PdfDictionary attribute, HeaderRewrite rewrite)
+    {
+        if (attribute["Headers"] is not PdfObject value) return null;
+        if (Shared(value, rewrite.Headers, resolved => resolved is PdfArray headers ? RenamedHeaders(headers, rewrite) : null) is not PdfObject renamed) return null;
+        PdfDictionary copy = PdfDocument.Clone(attribute);
+        copy.Set("Headers", renamed);
+        return copy;
+    }
+
+    /// <summary>A copy of a /Headers array with the renamed IDs, or null when none was renamed or the round's work ran out.</summary>
+    private PdfArray? RenamedHeaders(PdfArray headers, HeaderRewrite rewrite)
+    {
         PdfArray? rewritten = null;
         for (int i = 0; i < headers.Count; i++)
         {
+            if (!rewrite.Charge()) return null;
             if (_target.Resolve(headers[i]) is PdfString h && _idRenames.TryGetValue(Compat.Latin1.GetString(h.Value), out string? renamed))
             {
                 rewritten ??= new PdfArray([.. headers.Items]);
@@ -696,10 +723,23 @@ internal sealed partial class PageImporter
             }
         }
 
-        if (rewritten is null) return null;
-        PdfDictionary copy = PdfDocument.Clone(attribute);
-        copy.Set("Headers", rewritten);
-        return copy;
+        return rewritten;
+    }
+
+    /// <summary>
+    /// The renamed copy of <paramref name="value"/>, made by <paramref name="rename"/> from what it
+    /// resolves to, once a round: <paramref name="done"/> keeps it by the original. A value held
+    /// as an object of its own is copied to a new object, which the elements sharing it share.
+    /// Null when nothing in it was renamed.
+    /// </summary>
+    private PdfObject? Shared(PdfObject value, Dictionary<PdfObject, PdfObject?> done, Func<PdfObject, PdfObject?> rename)
+    {
+        if (_target.Resolve(value) is not PdfObject resolved) return null;
+        if (done.TryGetValue(resolved, out PdfObject? known)) return known;
+        PdfObject? copy = rename(resolved);
+        PdfObject? result = copy is not null && value is PdfReference ? _target.AddObject(copy) : copy;
+        done[resolved] = result;
+        return result;
     }
 
     /// <summary>The target is tagged once tagged content arrives (ISO 32000-1, 14.7.1), and suspect when any source was.</summary>
@@ -755,6 +795,29 @@ internal sealed partial class PageImporter
         stream.Dictionary.Remove("StructParent");
     }
 
+    /// <summary>
+    /// The renamed header copies of one round, by the object they copy, with one table per kind of
+    /// object, as a hostile file can use one array both as an /A array and as a /Headers array.
+    /// </summary>
+    private sealed class HeaderRewrite(StructureCopy copy, CancellationToken ct)
+    {
+        public Dictionary<PdfObject, PdfObject?> Lists { get; } = new(ReferenceEqualityComparer.Instance);
+
+        public Dictionary<PdfObject, PdfObject?> Attributes { get; } = new(ReferenceEqualityComparer.Instance);
+
+        public Dictionary<PdfObject, PdfObject?> Headers { get; } = new(ReferenceEqualityComparer.Instance);
+
+        /// <summary>True once the round's work ran out: the rewrite stops there.</summary>
+        public bool Refused { get; private set; }
+
+        public bool Charge()
+        {
+            if (copy.Charge(ct)) return true;
+            Refused = true;
+            return false;
+        }
+    }
+
     /// <summary>The structure copied by one round of an Import call.</summary>
     internal sealed class StructureCopy(StructureIndex index, HashSet<int> kept, Dictionary<int, int> pages)
     {
@@ -795,7 +858,7 @@ internal sealed partial class PageImporter
         public HashSet<int> ListedKids { get; } = [];
 
         /// <summary>
-        /// Children listed and /Ref entries read so far, bounded together by
+        /// Children listed and /Ref and /Headers entries read so far, bounded together by
         /// <see cref="StructureIndex.MaxKids"/>, so the work of a round is bounded however the
         /// file shares its arrays.
         /// </summary>

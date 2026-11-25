@@ -177,7 +177,7 @@ internal sealed partial class PageImporter
             if (_target.Objects[target] is PdfDictionary d) d.Set(key, value);
         }
 
-        FinishStructure(structure, copied, batch, _newlyShared.GetRange(sharedBefore, _newlyShared.Count - sharedBefore), targetWasEmpty);
+        FinishStructure(structure, copied, batch, _newlyShared.GetRange(sharedBefore, _newlyShared.Count - sharedBefore), targetWasEmpty, ct);
     }
 
     /// <summary>What importing fields changes in the target's form: the catalog entry, the form's entries and its two arrays.</summary>

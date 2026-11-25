@@ -374,6 +374,44 @@ public sealed class StructureHardeningTests
     }
 
     [TestMethod]
+    public void CellsSharingOneAttributeObjectRenameItsHeadersOnce()
+    {
+        const int Cells = 4000;
+        const int Headers = 4000;
+        var b = new PdfBuilder();
+        b.Set(1, "<</Type/Catalog/Pages 2 0 R/StructTreeRoot 20 0 R>>");
+        b.Set(2, "<</Type/Pages/Kids[5 0 R]/Count 1>>");
+        b.Set(5, "<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]>>");
+        b.Set(20, "<</Type/StructTreeRoot/K 21 0 R/ParentTree 30 0 R>>");
+        string kids = string.Join(" ", Enumerable.Range(10_000, Headers).Concat(Enumerable.Range(300, Cells)).Select(n => n + " 0 R"));
+        b.Set(21, "<</Type/StructElem/S/Table/P 20 0 R/K[" + kids + "]>>");
+        b.Set(30, "<</Nums[]>>");
+        b.Set(31, "<</O/Table/Headers[" + string.Join(" ", Enumerable.Range(0, Headers).Select(i => "(h" + i + ")")) + "]>>");
+        for (int i = 0; i < Headers; i++) b.Set(10_000 + i, "<</Type/StructElem/S/TH/P 21 0 R/Pg 5 0 R/ID(h" + i + ")/K 0>>");
+        for (int i = 0; i < Cells; i++) b.Set(300 + i, "<</Type/StructElem/S/TD/P 21 0 R/Pg 5 0 R/A 31 0 R/K 0>>");
+
+        PdfDocument source = PdfDocument.Open(b.Build());
+        PdfDocument target = PdfDocument.Create();
+        target.Pages.Import(source.Pages);
+
+        // The second copy finds every header ID taken, so each is renamed.
+#if NET
+        long before = GC.GetAllocatedBytesForCurrentThread();
+#endif
+        target.Pages.Import(source.Pages);
+#if NET
+        long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+        Assert.IsLessThan(64L * 1024 * 1024, allocated, "a shared attribute object is renamed once, not once per cell");
+#endif
+        List<PdfDictionary> cells = [.. StructureImportTests.Elements(target).Where(e => e.GetName("S") == "TD")];
+        Assert.HasCount(2 * Cells, cells);
+        string FirstHeader(PdfDictionary cell) => ((PdfString)((PdfArray)target.Resolve(target.ResolveDictionary(cell["A"])!["Headers"])!)[0]).ToText();
+        Assert.AreEqual("h0", FirstHeader(cells[0]));
+        Assert.AreEqual("h0_2", FirstHeader(cells[Cells]));
+        Assert.AreSame(target.ResolveDictionary(cells[Cells]["A"]), target.ResolveDictionary(cells[^1]["A"]), "the second copy's cells share one renamed attribute object");
+    }
+
+    [TestMethod]
     public void AReferenceToALaterSiblingFollowsItsCopy()
     {
         PdfDocument source = PdfDocument.Open(ReferenceToLaterSibling());
