@@ -77,27 +77,32 @@ public static partial class PdfOptimizer
     /// <summary>
     /// <see cref="RunOnce"/> within <see cref="PdfLimits.Timeout"/>. Lossy work is the slow part, so
     /// with a time limit the lossless rewrite is made first and kept should time run out while
-    /// images are changed lossily; without a time limit the passes run once, as before.
+    /// images are changed lossily; without a time limit the passes run once, as before. Both runs
+    /// share the deadline and one budget: the limits bound the call, every pass together.
     /// </summary>
     private static Outcome RunWithin(ReadOnlyMemory<byte> input, PdfOptimizerOptions options, CancellationToken ct)
     {
         var deadline = Deadline.Start(options.Limits);
         if (!options.IsLossy || !options.Limits.HasTimeout) return RunOnce(input, options, deadline, ct);
 
-        Outcome lossless = RunOnce(input, options.Lossless, deadline, ct);
+        ResourceBudget budget = RunGuard.NewBudget(options.Limits, input.Length, options.Workers);
+        Outcome lossless = RunOnce(input, options.Lossless, deadline, ct, budget);
         if (lossless.Disposition == OptimizationDisposition.LimitExceeded) return lossless;
-        Outcome lossy = RunOnce(input, options, deadline, ct);
+        Outcome lossy = RunOnce(input, options, deadline, ct, budget);
         if (lossy.Disposition == OptimizationDisposition.Optimized) return lossy;
 
         // Only running out of time falls back to the lossless rewrite. A lossy pass that reached
-        // another limit says so, and the call reports it.
+        // another limit says so, and the call reports it, though the lossless pass spent part of
+        // the budget: past a limit the input is written unchanged, as PdfLimits documents.
         if (lossy.Disposition == OptimizationDisposition.LimitExceeded && !lossy.TimedOut) return lossy;
         if (lossless.Disposition != OptimizationDisposition.Optimized && !lossy.TimedOut) return lossy;
         string why = lossy.TimedOut ? "ran out of time (PdfLimits.Timeout)." : "were not kept: " + lossy.Reason;
+
+        // The shared budget collected the diagnostics of both runs.
         return lossless with
         {
             Reason = lossless.Reason + " Lossy image changes " + why,
-            Diagnostics = [.. lossless.Diagnostics, .. lossy.Diagnostics],
+            Diagnostics = lossy.Diagnostics,
         };
     }
 
@@ -362,15 +367,15 @@ public static partial class PdfOptimizer
         public bool TimedOut { get; init; }
     }
 
-    /// <summary>One run of the passes with its own budget.</summary>
-    private static Outcome RunOnce(ReadOnlyMemory<byte> input, PdfOptimizerOptions options, Deadline deadline, CancellationToken caller)
+    /// <summary>One run of the passes, with its own budget unless it is given one to share.</summary>
+    private static Outcome RunOnce(ReadOnlyMemory<byte> input, PdfOptimizerOptions options, Deadline deadline, CancellationToken caller, ResourceBudget? budget = null)
     {
         if (input.Length > options.MaxInputBytes)
         {
             return new Outcome(OptimizationDisposition.UnsupportedRetained, null, "Input exceeds the configured size limit.", 0, null);
         }
 
-        using var guard = new RunGuard(options.Limits, input.Length, deadline, caller, options.Workers);
+        using var guard = new RunGuard(options.Limits, input.Length, deadline, caller, options.Workers, budget);
         Outcome outcome = Run(input, options, guard);
         return outcome with { Diagnostics = guard.Diagnostics, TimedOut = guard.TimedOut };
     }
@@ -613,13 +618,10 @@ public static partial class PdfOptimizer
         private readonly CancellationTokenSource? _timer;
         private readonly CancellationTokenSource? _linked;
 
-        public RunGuard(PdfLimits limits, long inputBytes, Deadline deadline, CancellationToken caller, int workers = 1)
+        /// <param name="budget">A budget shared with another run; null for a new one.</param>
+        public RunGuard(PdfLimits limits, long inputBytes, Deadline deadline, CancellationToken caller, int workers = 1, ResourceBudget? budget = null)
         {
-            // Each worker holds a few buffers of a size at once: the source, a filter layer, the result.
-            Budget = new ResourceBudget(limits, inputBytes, new PdfDiagnostics())
-            {
-                Pool = System.Buffers.ArrayPool<byte>.Create(1 << 30, Math.Max(4, 3 * workers)),
-            };
+            Budget = budget ?? NewBudget(limits, inputBytes, workers);
             _caller = caller;
             _timer = deadline.NewTimer();
             _linked = _timer is null ? null : CancellationTokenSource.CreateLinkedTokenSource(caller, _timer.Token);
@@ -627,6 +629,13 @@ public static partial class PdfOptimizer
         }
 
         public ResourceBudget Budget { get; }
+
+        /// <summary>The budget of one run, or of runs that share it.</summary>
+        public static ResourceBudget NewBudget(PdfLimits limits, long inputBytes, int workers) => new(limits, inputBytes, new PdfDiagnostics())
+        {
+            // Each worker holds a few buffers of a size at once: the source, a filter layer, the result.
+            Pool = System.Buffers.ArrayPool<byte>.Create(1 << 30, Math.Max(4, 3 * workers)),
+        };
 
         /// <summary>The caller's token, cancelled as well at the time limit.</summary>
         public CancellationToken Token { get; }
