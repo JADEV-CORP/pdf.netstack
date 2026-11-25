@@ -19,7 +19,7 @@ internal sealed class StructureIndex
     /// <summary>
     /// Children listed, counted every time an element lists one. Elements may share a /K array
     /// in a damaged or hostile file, so the count of elements alone does not bound the work. A
-    /// copy of the tree counts the /Ref and /Headers entries it reads against the same bound.
+    /// copy of the tree counts the /Ref, /C and /Headers entries it reads against the same bound.
     /// </summary>
     public const long MaxKids = 10_000_000;
 
