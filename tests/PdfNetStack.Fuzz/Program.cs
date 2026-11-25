@@ -34,7 +34,7 @@ internal static class Program
             // Instrumented code needs the coverage map SharpFuzz sets up inside Run, so the warm up
             // happens on the first input rather than before.
             bool warm = false;
-            Oracle.HangLimit = Timeout.InfiniteTimeSpan;
+            Oracle.HangLimit = SharpFuzzHangLimit(args);
             Fuzzer.LibFuzzer.Run(input =>
             {
                 byte[] data = input.ToArray();
@@ -72,6 +72,13 @@ internal static class Program
                 return 2;
         }
     }
+
+    /// <summary>
+    /// None when libFuzzer starts the harness, without arguments: its own -timeout ends a hung run,
+    /// and a thread per input would slow it. Given one file, SharpFuzz runs it once with no
+    /// timeout, so the oracle keeps its limit and a hang is reported instead of blocking.
+    /// </summary>
+    internal static TimeSpan SharpFuzzHangLimit(string[] args) => args.Length == 0 ? Timeout.InfiniteTimeSpan : Oracle.HangLimit;
 
     /// <summary>Runs every file through the oracle and prints one line per finding.</summary>
     private static int Replay(FuzzTarget target, string[] paths)
