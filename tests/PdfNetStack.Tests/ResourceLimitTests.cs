@@ -292,8 +292,10 @@ public sealed class ResourceLimitTests
     {
         // The clock is read every 1024 operators; a page of more than that ends at once.
         byte[] input = Page(Font, Flate(string.Concat(Enumerable.Repeat("1 0 0 1 0 0 cm ", 5000))));
-        using PdfDocument doc = PdfDocument.Open(input, new PdfLoadOptions { Limits = PdfLimits.Default with { Timeout = TimeSpan.FromTicks(1) } });
+        using PdfDocument doc = PdfDocument.Open(input);
 
+        // Opening is bound by the timeout too, so the document is opened without one and given it after.
+        doc.Budget = new ResourceBudget(PdfLimits.Default with { Timeout = TimeSpan.FromTicks(1) }, input.Length, new PdfDiagnostics());
         PdfLimitExceededException e = Assert.ThrowsExactly<PdfLimitExceededException>(() => doc.Pages[0].ExtractText());
 
         Assert.AreEqual(PdfLimitKind.Timeout, e.Limit);
