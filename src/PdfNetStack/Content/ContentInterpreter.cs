@@ -58,7 +58,11 @@ internal abstract class ContentInterpreter
     // The text line matrix Tlm: the text matrix at the start of the current line.
     private PdfMatrix _lineMatrix = PdfMatrix.Identity;
     private long _operations;
+
+    // Operators taken from the document's budget so far: ahead of those run, the rest refunded.
+    private long _reserved;
     private bool _stopped;
+    private bool _decodeLimitReported;
     private long _bytes;
     private long _parsed;
     private int _marked;
@@ -104,8 +108,26 @@ internal abstract class ContentInterpreter
             _ => [],
         };
 
-        if (Joined(parts) is { } content) Execute(content, resources, 0);
-        Document.Budget.TryChargeOperations(_operations % Batch);
+        try
+        {
+            if (Joined(parts) is { } content) Execute(content, resources, 0);
+            _deadline.ThrowIfPassed(Document.Budget);
+        }
+        finally
+        {
+            Document.Budget.RefundOperations(_reserved - _operations);
+            _reserved = _operations;
+        }
+    }
+
+    /// <summary>
+    /// Stops the call with <see cref="OperationCanceledException"/> or, past the time limit, a
+    /// <see cref="PdfLimitExceededException"/>. For loops inside one operator, which the walk's own checks do not reach.
+    /// </summary>
+    protected void CheckLimits()
+    {
+        Cancellation.ThrowIfCancellationRequested();
+        _deadline.ThrowIfPassed(Document.Budget);
     }
 
     /// <summary>
@@ -189,8 +211,14 @@ internal abstract class ContentInterpreter
     private byte[]? Data(PdfStream stream, int? number)
     {
         long left = Document.DecodeLimit - _bytes;
-        if (left <= 0 || _stopped) return null;
-        Cancellation.ThrowIfCancellationRequested();
+        if (_stopped) return null;
+        if (left <= 0)
+        {
+            ReportDecodeLimit("The page's content is longer than its decoded bytes allow; the rest is not read.");
+            return null;
+        }
+
+        CheckLimits();
         try
         {
             byte[] data = Document.GetStreamData(stream, left);
@@ -200,7 +228,7 @@ internal abstract class ContentInterpreter
         catch (PdfLimitExceededException e) when (e.Limit == PdfLimitKind.PageContent)
         {
             _bytes = Document.DecodeLimit;
-            ReportPageLimit(PdfLimitKind.PageContent, e.Message);
+            ReportDecodeLimit(e.Message);
             return null;
         }
         catch (PdfLimitExceededException)
@@ -214,6 +242,13 @@ internal abstract class ContentInterpreter
             Document.Budget.Diagnostics.Skipped("A content stream could not be decoded and draws nothing: " + e.Message, number, _page?.Index);
             return null;
         }
+    }
+
+    private void ReportDecodeLimit(string message)
+    {
+        if (_decodeLimitReported) return;
+        _decodeLimitReported = true;
+        ReportPageLimit(PdfLimitKind.PageContent, message);
     }
 
     private void Execute(byte[] content, PdfDictionary? resources, int depth)
@@ -292,18 +327,29 @@ internal abstract class ContentInterpreter
     /// </summary>
     private bool Count()
     {
-        if (++_operations > MaxOperations)
+        if (_operations >= MaxOperations)
         {
             _stopped = true;
             ReportPageLimit(PdfLimitKind.PageContent, Compat.Format("The page runs more than {0} content operators; the rest is not read.", MaxOperations));
             return false;
         }
 
-        if (_operations % Batch != 0) return true;
-        _deadline.ThrowIfPassed(Document.Budget);
-        if (Document.Budget.TryChargeOperations(Batch)) return true;
-        _stopped = true;
-        return false;
+        // Taken before the operator runs, so a spent budget stops the next page at once.
+        if (_operations >= _reserved)
+        {
+            _deadline.ThrowIfPassed(Document.Budget);
+            long taken = Document.Budget.ReserveOperations(Batch);
+            if (taken == 0)
+            {
+                _stopped = true;
+                return false;
+            }
+
+            _reserved += taken;
+        }
+
+        _operations++;
+        return true;
     }
 
     private void BeginMarked(string tag, PdfDictionary? properties)
