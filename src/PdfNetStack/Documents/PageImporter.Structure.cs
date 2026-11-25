@@ -122,7 +122,7 @@ internal sealed partial class PageImporter
             if (CopyElement(kid, null, 0, copy, pageMap, batch, work, ct) is { } top) copy.Tops.Add(top);
         }
 
-        ResolveReferences(copy);
+        ResolveReferences(copy, ct);
 
         // Attribute classes travel with the elements that use them; their values may refer to
         // other objects, which the work queue copies.
@@ -147,7 +147,7 @@ internal sealed partial class PageImporter
     private (PdfDictionary Dictionary, int Number)? CopyElement(
         PdfObject entry, PdfReference? inheritedPage, int depth, StructureCopy copy, Dictionary<int, int> pageMap, Dictionary<int, int> batch, Queue<(PdfObject, int)> work, CancellationToken ct)
     {
-        if (depth > StructureIndex.MaxDepth || copy.TooManyKids) return null;
+        if (depth > StructureIndex.MaxDepth || copy.Spent) return null;
         int? number = entry is PdfReference r ? r.Number : null;
 
         // An element reached twice, through a cycle or a second parent, is copied once.
@@ -166,14 +166,12 @@ internal sealed partial class PageImporter
         var children = new List<PdfDictionary>();
         foreach (PdfObject kid in StructureIndex.Kids(_source, element))
         {
-            if (++copy.KidCount > StructureIndex.MaxKids)
+            if (!copy.Charge(ct))
             {
-                copy.TooManyKids = true;
-                _source.Budget.Diagnostics.Skipped(Compat.Format("A copy of the structure tree stopped after {0} children; the rest of its content goes untagged.", StructureIndex.MaxKids));
+                _source.Budget.Diagnostics.Skipped(Compat.Format("A copy of the structure tree stopped after {0} children and references; the rest of its content goes untagged.", StructureIndex.MaxKids));
                 break;
             }
 
-            if (copy.KidCount % StructureIndex.KidInterval == 0) ct.ThrowIfCancellationRequested();
             if (kid is PdfNumber { IsInteger: true })
             {
                 if (page is not null && copy.Pages.ContainsKey(page.Number)) kids.Add(kid);
@@ -245,18 +243,44 @@ internal sealed partial class PageImporter
     /// Table 323). Runs once every element is copied, as a reference may name a later sibling.
     /// Elements that were not copied are left out, and so is a /Ref that names none.
     /// </summary>
-    private void ResolveReferences(StructureCopy copy)
+    /// <remarks>
+    /// Many elements can share one /Ref array held as an object. It is mapped once and the copies
+    /// share the result, as the originals do; mapping it for each would cost their product.
+    /// </remarks>
+    private void ResolveReferences(StructureCopy copy, CancellationToken ct)
     {
+        var mappedArrays = new Dictionary<int, PdfReference?>();
         foreach ((PdfDictionary element, PdfObject value) in copy.PendingReferences)
         {
+            if (value is PdfReference shared && mappedArrays.TryGetValue(shared.Number, out PdfReference? done))
+            {
+                if (done is not null) element.Set("Ref", done);
+                continue;
+            }
+
             if (_source.Resolve(value) is not PdfArray array) continue;
             var mapped = new PdfArray();
             foreach (PdfObject item in array)
             {
+                if (!copy.Charge(ct))
+                {
+                    _source.Budget.Diagnostics.Skipped(Compat.Format("A copy of the structure tree stopped after {0} children and references; the rest of its /Ref entries were left out.", StructureIndex.MaxKids));
+                    return;
+                }
+
                 if (item is PdfReference r && StructureReference(r) is PdfReference target) mapped.Add(target);
             }
 
-            if (mapped.Count > 0) element.Set("Ref", mapped);
+            if (value is PdfReference own)
+            {
+                done = mapped.Count > 0 ? _target.AddObject(mapped) : null;
+                mappedArrays[own.Number] = done;
+                if (done is not null) element.Set("Ref", done);
+            }
+            else if (mapped.Count > 0)
+            {
+                element.Set("Ref", mapped);
+            }
         }
     }
 
@@ -770,10 +794,32 @@ internal sealed partial class PageImporter
         /// <summary>Indirect /K arrays some element already listed.</summary>
         public HashSet<int> ListedKids { get; } = [];
 
-        /// <summary>Children listed so far, bounded by <see cref="StructureIndex.MaxKids"/>.</summary>
-        public long KidCount { get; set; }
+        /// <summary>
+        /// Children listed and /Ref entries read so far, bounded together by
+        /// <see cref="StructureIndex.MaxKids"/>, so the work of a round is bounded however the
+        /// file shares its arrays.
+        /// </summary>
+        public long Work { get; private set; }
 
-        public bool TooManyKids { get; set; }
+        /// <summary>True once a unit of work was refused: what asked for it was left out.</summary>
+        public bool Spent { get; private set; }
+
+        /// <summary>
+        /// Counts one unit of work about to be done, looking at the token every
+        /// <see cref="StructureIndex.KidInterval"/> units. False once the round has done
+        /// <see cref="StructureIndex.MaxKids"/>; the caller stops and reports what it left out.
+        /// </summary>
+        public bool Charge(CancellationToken ct)
+        {
+            if (Work >= StructureIndex.MaxKids)
+            {
+                Spent = true;
+                return false;
+            }
+
+            if (++Work % StructureIndex.KidInterval == 0) ct.ThrowIfCancellationRequested();
+            return true;
+        }
 
         /// <summary>
         /// The parent tree value for a copy whose source key is <paramref name="key"/>: for
