@@ -91,6 +91,37 @@ public sealed class HtmlHardeningTests
     }
 
     [TestMethod]
+    public void NthChildOfCountsNestedSiblingsOnce()
+    {
+        // Styling goes depth first: between two <div> children of <body> it styles the <span> in
+        // the first, whose parent is that <div>. With one parent remembered, every <div> counted
+        // all its siblings again: four such rules over 6,000 <div> took 144 million tests, past
+        // the default MaxStyleWork for the document.
+        const int Divs = 6000;
+        string html = "<style>" + Repeat(4, i => $":nth-child({i + 2}n of *) {{ color: red }}") + "</style>" + Repeat(Divs, _ => "<div><span>x</span></div>");
+        HtmlDocument doc = HtmlParser.Parse(html);
+        var budget = new WorkBudget(new HtmlConverterOptions().StyleWorkFor(html), long.MaxValue, CancellationToken.None);
+        var resolver = new StyleResolver(CssMedia.Default, budget);
+        resolver.AddDocument(doc);
+
+        void Style(HtmlElement e, ComputedStyle? parent)
+        {
+            ComputedStyle style = resolver.Compute(e, parent);
+            foreach (HtmlElement child in e.ChildElements) Style(child, style);
+        }
+
+        // About 40 units per element now, whatever the number of <div>.
+        Style(doc.Html, null);
+        Assert.IsLessThan(100L * 2 * Divs, budget.StyleWork);
+
+        // Each element gets its own parent's counts: every <span> is the last child of its <div>.
+        CssSelector last = CssSelector.Parse(":nth-last-child(1 of *)")!.Single();
+        var matched = doc.Body.Descendants().Where(e => last.Matches(e)).ToList();
+        Assert.HasCount(Divs + 1, matched);
+        Assert.AreEqual(Divs, matched.Count(e => e.Name == "span"));
+    }
+
+    [TestMethod]
     public void ParsingTextObservesCancellation()
     {
         using var cancel = new CancellationTokenSource();
