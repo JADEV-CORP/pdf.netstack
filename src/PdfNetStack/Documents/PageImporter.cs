@@ -49,37 +49,41 @@ internal sealed partial class PageImporter
         int firstNumber = _target.NextNumber;
         var idRenames = new Dictionary<string, string>(_idRenames, StringComparer.Ordinal);
         var unkeyed = new HashSet<int>(_unkeyed);
+        bool roleMapMerged = _roleMapMerged, classMapMerged = _classMapMerged;
 
         // Reserve numbers for every page first so links between them can be remapped.
-        var pageMap = new Dictionary<int, int>();
+        var firstCopies = new Dictionary<int, int>();
         var numbers = new int[pages.Count];
         for (int i = 0; i < pages.Count; i++)
         {
             numbers[i] = _target.NextNumber++;
-            pageMap.TryAdd(pages[i].Number, numbers[i]);
+            firstCopies.TryAdd(pages[i].Number, numbers[i]);
         }
 
-        var batch = new Dictionary<int, int>();
-        var work = new Queue<(PdfObject Source, int Target)>();
-        var result = new List<PdfPage>(pages.Count);
+        var result = new PdfPage[pages.Count];
         _newlyShared = [];
 
         // A document still empty takes the source's language as its own.
         bool targetWasEmpty = !SameDocument && _target.Pages.Count == 0;
         FormState form = SaveFormState();
+        TargetState structure = SaveStructureState();
         try
         {
-            CopyPages(pages, numbers, pageMap, batch, work, result, targetWasEmpty, ct);
+            foreach (List<int> round in Rounds(pages)) CopyRound(pages, round, numbers, firstCopies, result, targetWasEmpty, ct);
         }
         catch
         {
-            // A failed or cancelled import leaves the target as it was. The shared copies this
-            // call reserved would otherwise be reused by the next import while some never came
-            // to exist, and renames worked out against the target's role map, class map and IDs
-            // would be applied to a call that finds them changed by another source.
+            // A failed or cancelled import leaves the target as it was, whatever rounds finished.
+            // The shared copies this call reserved would otherwise be reused by the next import
+            // while some never came to exist, and renames worked out against the target's role
+            // map, class map and IDs would be applied to a call that finds them changed by another
+            // source.
             foreach (int source in _newlyShared) _shared.Remove(source);
             RestoreFormState(form);
+            structure.Restore();
             _structure = null;
+            _roleMapMerged = roleMapMerged;
+            _classMapMerged = classMapMerged;
             ResetUnmergedRenames();
             _unkeyed.Clear();
             _unkeyed.UnionWith(unkeyed);
@@ -97,10 +101,45 @@ internal sealed partial class PageImporter
         return result;
     }
 
-    private void CopyPages(
-        List<PdfPage> pages, int[] numbers, Dictionary<int, int> pageMap, Dictionary<int, int> batch, Queue<(PdfObject, int)> work, List<PdfPage> result, bool targetWasEmpty, CancellationToken ct)
+    /// <summary>
+    /// Indexes into <paramref name="pages"/>, in rounds that copy each page at most once. A page
+    /// listed again waits for a later round, so each copy gets its own annotations, fields and
+    /// structure elements.
+    /// </summary>
+    private static List<List<int>> Rounds(List<PdfPage> pages)
     {
+        var rounds = new List<List<int>>();
+        var occurrences = new Dictionary<int, int>();
         for (int i = 0; i < pages.Count; i++)
+        {
+            occurrences.TryGetValue(pages[i].Number, out int round);
+            occurrences[pages[i].Number] = round + 1;
+            if (round == rounds.Count) rounds.Add([]);
+            rounds[round].Add(i);
+        }
+
+        return rounds;
+    }
+
+    private void CopyRound(
+        List<PdfPage> pages, List<int> round, int[] numbers, Dictionary<int, int> firstCopies, PdfPage[] result, bool targetWasEmpty, CancellationToken ct)
+    {
+        // The pages this round copies, which its structure elements tag, and where links to
+        // pages go: a page of this round links to its own copy, any other to its first copy.
+        var copied = new Dictionary<int, int>(round.Count);
+        var pageMap = new Dictionary<int, int>(firstCopies);
+        foreach (int i in round)
+        {
+            copied[pages[i].Number] = numbers[i];
+            pageMap[pages[i].Number] = numbers[i];
+        }
+
+        // Shared objects copied by an earlier round are this call's too, but only those this round
+        // copies first get structure keys from it.
+        int sharedBefore = _newlyShared!.Count;
+        var batch = new Dictionary<int, int>();
+        var work = new Queue<(PdfObject Source, int Target)>();
+        foreach (int i in round)
         {
             ct.ThrowIfCancellationRequested();
             var copy = new PdfDictionary(pages[i].Dictionary.Count);
@@ -112,11 +151,11 @@ internal sealed partial class PageImporter
             }
 
             _target.Objects[numbers[i]] = copy;
-            result.Add(new PdfPage(_target, numbers[i], copy));
+            result[i] = new PdfPage(_target, numbers[i], copy);
         }
 
         List<(int Target, string Key, PdfObject Value)> fixups = ImportFields(pageMap, batch, work);
-        StructureCopy? structure = ImportStructure(pageMap, batch, work, ct);
+        StructureCopy? structure = ImportStructure(copied, pageMap, batch, work, ct);
         for (int done = 0; work.Count > 0; done++)
         {
             if (done % CancellationInterval == 0) ct.ThrowIfCancellationRequested();
@@ -134,7 +173,7 @@ internal sealed partial class PageImporter
             if (_target.Objects[target] is PdfDictionary d) d.Set(key, value);
         }
 
-        FinishStructure(structure, pageMap, batch, _newlyShared!, targetWasEmpty);
+        FinishStructure(structure, copied, batch, _newlyShared.GetRange(sharedBefore, _newlyShared.Count - sharedBefore), targetWasEmpty);
     }
 
     /// <summary>What importing fields changes in the target's form: the catalog entry, the form's entries and its two arrays.</summary>
@@ -154,7 +193,7 @@ internal sealed partial class PageImporter
         if (state.Entry is null) _target.Catalog.Remove("AcroForm");
         else _target.Catalog.Set("AcroForm", state.Entry);
         if (state.Form is null || state.Entries is null) return;
-        foreach (string key in state.Form.Select(e => e.Key).ToList()) state.Form.Remove(key);
+        state.Form.Clear();
         for (int i = 0; i < state.Entries.Count; i++)
         {
             (string key, PdfObject value) = state.Entries.EntryAt(i);
@@ -170,6 +209,44 @@ internal sealed partial class PageImporter
             if (array is null || items is null) return;
             array.Items.Clear();
             array.Items.AddRange(items);
+        }
+    }
+
+    /// <summary>
+    /// Objects of the target an import changes in place, as they were before it: the entries of
+    /// dictionaries, and the length of arrays that only grow at the end.
+    /// </summary>
+    private sealed class TargetState
+    {
+        private readonly List<(PdfDictionary Dictionary, PdfDictionary Entries)> _dictionaries = [];
+        private readonly List<(PdfArray Array, int Count)> _arrays = [];
+
+        public void Save(PdfDictionary? dictionary)
+        {
+            if (dictionary is not null) _dictionaries.Add((dictionary, PdfDocument.Clone(dictionary)));
+        }
+
+        public void Save(PdfArray? array)
+        {
+            if (array is not null) _arrays.Add((array, array.Count));
+        }
+
+        public void Restore()
+        {
+            foreach ((PdfArray array, int count) in _arrays)
+            {
+                if (array.Count > count) array.Items.RemoveRange(count, array.Count - count);
+            }
+
+            foreach ((PdfDictionary dictionary, PdfDictionary entries) in _dictionaries)
+            {
+                dictionary.Clear();
+                for (int i = 0; i < entries.Count; i++)
+                {
+                    (string key, PdfObject value) = entries.EntryAt(i);
+                    dictionary.Set(key, value);
+                }
+            }
         }
     }
 

@@ -9,6 +9,8 @@ public sealed class StructureHardeningTests
 {
     private const string FontObject = "<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>";
 
+    private static readonly PdfSaveOptions Plain = new() { Optimize = false };
+
     private static byte[] Ascii(string text) => Encoding.ASCII.GetBytes(text);
 
     /// <summary>One tagged page: a paragraph and a link annotation tagged through an object reference.</summary>
@@ -88,6 +90,44 @@ public sealed class StructureHardeningTests
         return b.Build();
     }
 
+    /// <summary>Two pages; the first has a link to the second and a link to itself.</summary>
+    private static byte[] LinkedPages()
+    {
+        var b = new PdfBuilder();
+        b.Set(1, "<</Type/Catalog/Pages 2 0 R>>");
+        b.Set(2, "<</Type/Pages/Kids[5 0 R 7 0 R]/Count 2>>");
+        b.Set(5, "<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]/Annots[9 0 R 10 0 R]>>");
+        b.Set(7, "<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]>>");
+        b.Set(9, "<</Type/Annot/Subtype/Link/Rect[72 600 172 620]/Border[0 0 0]/Dest[7 0 R/Fit]>>");
+        b.Set(10, "<</Type/Annot/Subtype/Link/Rect[72 500 172 520]/Border[0 0 0]/Dest[5 0 R/Fit]>>");
+        return b.Build();
+    }
+
+    /// <summary>The page each link annotation of <paramref name="page"/> goes to, null where it goes nowhere.</summary>
+    private static int?[] LinkTargets(PdfDocument doc, PdfPage page) =>
+        [.. ((PdfArray)doc.Resolve(page.Dictionary["Annots"])!).Select(a => ((PdfArray)doc.ResolveDictionary(a)!["Dest"]!)[0] is PdfReference r ? r.Number : (int?)null)];
+
+    /// <summary>
+    /// A tagged page with a text field, a custom paragraph type and an element ID, so importing it
+    /// changes the target's form, role map, ID tree and parent tree.
+    /// </summary>
+    private static byte[] TaggedFieldPage()
+    {
+        var b = new PdfBuilder();
+        b.Set(1, "<</Type/Catalog/Pages 2 0 R/StructTreeRoot 20 0 R/MarkInfo<</Marked true>>/AcroForm<</Fields[11 0 R]>>>>");
+        b.Set(2, "<</Type/Pages/Kids[5 0 R]/Count 1>>");
+        b.Set(3, FontObject);
+        b.SetStream(4, "", Ascii("/Para <</MCID 0>> BDC BT /F1 12 Tf 72 700 Td (text) Tj ET EMC"));
+        b.Set(5, "<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]/Resources<</Font<</F1 3 0 R>>>>/Contents 4 0 R/StructParents 0/Annots[11 0 R]>>");
+        b.Set(11, "<</Type/Annot/Subtype/Widget/FT/Tx/T(name)/V(Ada)/Rect[72 600 272 620]/P 5 0 R/StructParent 1>>");
+        b.Set(20, "<</Type/StructTreeRoot/K 21 0 R/ParentTree 30 0 R/ParentTreeNextKey 2/RoleMap<</Para/P>>/IDTree<</Names[(p1) 22 0 R]>>>>");
+        b.Set(21, "<</Type/StructElem/S/Document/P 20 0 R/K[22 0 R 23 0 R]>>");
+        b.Set(22, "<</Type/StructElem/S/Para/P 21 0 R/Pg 5 0 R/ID(p1)/K 0>>");
+        b.Set(23, "<</Type/StructElem/S/Form/P 21 0 R/Pg 5 0 R/K<</Type/OBJR/Obj 11 0 R>>>>");
+        b.Set(30, "<</Nums[0[22 0 R] 1 23 0 R]>>");
+        return b.Build();
+    }
+
     /// <summary>A tagged target whose parent tree already uses the last two keys an integer holds.</summary>
     private static byte[] TargetWithKeysNearTheLimit()
     {
@@ -123,6 +163,60 @@ public sealed class StructureHardeningTests
         }
 
         Assert.AreNotEqual(annotations[0], annotations[1], "each page has annotations of its own");
+    }
+
+    [TestMethod]
+    public void ARepeatedPageLinksToTheCopiesOfThePagesImportedWithIt()
+    {
+        PdfDocument source = PdfDocument.Open(LinkedPages());
+        PdfDocument target = PdfDocument.Create();
+
+        IReadOnlyList<PdfPage> copies = target.Pages.Import([source.Pages[0], source.Pages[0], source.Pages[1]]);
+
+        CollectionAssert.AreEqual(new int?[] { copies[2].Number, copies[0].Number }, LinkTargets(target, copies[0]), "the first copy");
+        CollectionAssert.AreEqual(new int?[] { copies[2].Number, copies[1].Number }, LinkTargets(target, copies[1]), "the second copy");
+    }
+
+    [TestMethod]
+    public void ARepeatedPageDuplicatedInItsDocumentLinksToTheCopiesMadeWithIt()
+    {
+        PdfDocument doc = PdfDocument.Open(LinkedPages());
+
+        IReadOnlyList<PdfPage> copies = doc.Pages.Import([doc.Pages[0], doc.Pages[0], doc.Pages[1]]);
+
+        CollectionAssert.AreEqual(new int?[] { copies[2].Number, copies[0].Number }, LinkTargets(doc, copies[0]), "the first copy");
+        CollectionAssert.AreEqual(new int?[] { copies[2].Number, copies[1].Number }, LinkTargets(doc, copies[1]), "the second copy");
+    }
+
+    [TestMethod]
+    public void ACancelledImportOfARepeatedPageLeavesTheTargetAsItWas()
+    {
+        // The first copy's contents fire the token, so the call stops as it starts the second copy.
+        using var cancel = new CancellationTokenSource();
+        PdfDocument source = PdfDocument.Open(TaggedFieldPage());
+        var contents = (PdfStream)source.Objects[4];
+        ReadOnlyMemory<byte> data = contents.Data;
+        source.Objects[4] = new PdfStream(contents.Dictionary, () =>
+        {
+            cancel.Cancel();
+            return data;
+        }, data.Length);
+
+        // Saved once, the target has a file ID, so saving it again gives the same bytes.
+        byte[] original = PdfDocument.Open(StructureImportTests.Tagged("T")).ToArray(Plain);
+        byte[] untouched = PdfDocument.Open(original).ToArray(Plain);
+        PdfDocument target = PdfDocument.Open(original);
+        int next = target.NextNumber;
+
+        Assert.ThrowsExactly<OperationCanceledException>(() => target.Pages.Import([source.Pages[0], source.Pages[0]], null, cancel.Token));
+        Assert.AreEqual(next, target.NextNumber);
+        CollectionAssert.AreEqual(untouched, target.ToArray(Plain), "the target saves as it did before the call");
+
+        source.Objects[4] = contents;
+        target.Pages.Import([source.Pages[0], source.Pages[0]]);
+        PdfDocument saved = StructureImportTests.Saved(target);
+        Assert.AreEqual("Document(P(Span),Table(TH,TD),Heading(Link),Figure),Document(Para,Form),Document(Para,Form)", StructureImportTests.CheckStructure(saved));
+        CollectionAssert.AreEqual(new[] { "name", "name_2" }, saved.Form.Fields.Select(f => f.Name).ToArray());
     }
 
     [TestMethod]

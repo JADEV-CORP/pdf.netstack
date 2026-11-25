@@ -62,18 +62,52 @@ internal sealed partial class PageImporter
     }
 
     /// <summary>
-    /// Copies the structure elements that tag content of the imported pages, with every ancestor
-    /// up to the root, so the copies form a tree of their own. Content on pages left behind, and
-    /// elements left with no content, are not copied. Runs before the work queue drains, so
-    /// objects the elements refer to (attributes, form XObjects of marked content references)
-    /// are copied with everything else. Returns null when the source has no structure tree.
+    /// What finishing the structure may change in objects the target already has: the catalog,
+    /// the structure root with its kids and parent tree, the role and class maps while this
+    /// source's are not merged in, and XObjects an earlier import left without their key.
     /// </summary>
-    private StructureCopy? ImportStructure(Dictionary<int, int> pageMap, Dictionary<int, int> batch, Queue<(PdfObject, int)> work, CancellationToken ct)
+    private TargetState SaveStructureState()
+    {
+        var state = new TargetState();
+        state.Save(_target.Catalog);
+        if (_target.Resolve(_target.Catalog["StructTreeRoot"]) is PdfDictionary root)
+        {
+            state.Save(root);
+            state.Save(_target.Resolve(root["K"]) as PdfArray);
+            if (_target.Resolve(root["ParentTree"]) is PdfDictionary tree)
+            {
+                state.Save(tree);
+                state.Save(_target.Resolve(tree["Nums"]) as PdfArray);
+                state.Save(_target.Resolve(tree["Kids"]) as PdfArray);
+            }
+
+            if (!_roleMapMerged) state.Save(_target.Resolve(root["RoleMap"]) as PdfDictionary);
+            if (!_classMapMerged) state.Save(_target.Resolve(root["ClassMap"]) as PdfDictionary);
+        }
+
+        foreach (int source in _unkeyed)
+        {
+            if (_shared.TryGetValue(source, out int number) && _target.Objects.TryGetValue(number, out PdfObject? copy) && copy is PdfStream stream) state.Save(stream.Dictionary);
+        }
+
+        return state;
+    }
+
+    /// <summary>
+    /// Copies the structure elements that tag content of the pages this round copies, given in
+    /// <paramref name="pages"/>, with every ancestor up to the root, so the copies form a tree of
+    /// their own. Content on other pages, and elements left with no content, are not copied. Runs
+    /// before the work queue drains, so objects the elements refer to (attributes, form XObjects
+    /// of marked content references) are copied with everything else, with references to pages
+    /// following <paramref name="pageMap"/>. Returns null when the source has no structure tree.
+    /// </summary>
+    private StructureCopy? ImportStructure(
+        Dictionary<int, int> pages, Dictionary<int, int> pageMap, Dictionary<int, int> batch, Queue<(PdfObject, int)> work, CancellationToken ct)
     {
         StructureIndex? index = SourceStructure(ct);
         if (index is null) return null;
 
-        var copy = new StructureCopy(index, index.Ancestry(pageMap.Keys));
+        var copy = new StructureCopy(index, index.Ancestry(pages.Keys), pages);
         _structure = copy;
         if (!SameDocument)
         {
@@ -141,14 +175,14 @@ internal sealed partial class PageImporter
             if (copy.KidCount % StructureIndex.KidInterval == 0) ct.ThrowIfCancellationRequested();
             if (kid is PdfNumber { IsInteger: true })
             {
-                if (page is not null && pageMap.ContainsKey(page.Number)) kids.Add(kid);
+                if (page is not null && copy.Pages.ContainsKey(page.Number)) kids.Add(kid);
                 continue;
             }
 
             if (_source.Resolve(kid) is not PdfDictionary item) continue;
             if (StructureIndex.IsContentReference(item))
             {
-                if (CopyContentReference(item, page, pageMap, batch, work) is PdfDictionary reference) kids.Add(reference);
+                if (CopyContentReference(item, page, copy.Pages, pageMap, batch, work) is PdfDictionary reference) kids.Add(reference);
             }
             else if (CopyElement(kid, page, depth + 1, copy, pageMap, batch, work, ct) is { } child)
             {
@@ -184,7 +218,7 @@ internal sealed partial class PageImporter
             }
         }
 
-        if (element["Pg"] is PdfReference own && pageMap.TryGetValue(own.Number, out int ownCopy)) result.Set("Pg", new PdfReference(ownCopy, 0));
+        if (element["Pg"] is PdfReference own && copy.Pages.TryGetValue(own.Number, out int ownCopy)) result.Set("Pg", new PdfReference(ownCopy, 0));
         result.Set("K", kids);
 
         int copyNumber = _target.NextNumber++;
@@ -226,13 +260,14 @@ internal sealed partial class PageImporter
     }
 
     /// <summary>
-    /// A marked content reference (MCR) or object reference (OBJR) whose page is imported,
-    /// pointing at the copies; null when its page or object stays behind.
+    /// A marked content reference (MCR) or object reference (OBJR) whose page is in
+    /// <paramref name="pages"/>, pointing at the copies; null when its page or object stays behind.
     /// </summary>
-    private PdfDictionary? CopyContentReference(PdfDictionary item, PdfReference? inheritedPage, Dictionary<int, int> pageMap, Dictionary<int, int> batch, Queue<(PdfObject, int)> work)
+    private PdfDictionary? CopyContentReference(
+        PdfDictionary item, PdfReference? inheritedPage, Dictionary<int, int> pages, Dictionary<int, int> pageMap, Dictionary<int, int> batch, Queue<(PdfObject, int)> work)
     {
         PdfReference? page = item["Pg"] as PdfReference ?? inheritedPage;
-        if (page is null || !pageMap.TryGetValue(page.Number, out int pageCopy)) return null;
+        if (page is null || !pages.TryGetValue(page.Number, out int pageCopy)) return null;
 
         var result = new PdfDictionary(item.Count);
         for (int i = 0; i < item.Count; i++)
@@ -273,11 +308,12 @@ internal sealed partial class PageImporter
     }
 
     /// <summary>
-    /// Once every copy exists: gives the imported pages, annotations and XObjects new keys in
-    /// the target's parent tree, hangs the copied elements under the target's structure root, and
-    /// merges the role map, class map, ID tree, mark information and language.
+    /// Once every copy exists: gives the pages of the round, given in <paramref name="pages"/>,
+    /// their annotations and XObjects new keys in the target's parent tree, hangs the copied
+    /// elements under the target's structure root, and merges the role map, class map, ID tree,
+    /// mark information and language.
     /// </summary>
-    private void FinishStructure(StructureCopy? copy, Dictionary<int, int> pageMap, Dictionary<int, int> batch, List<int> newlyShared, bool targetWasEmpty)
+    private void FinishStructure(StructureCopy? copy, Dictionary<int, int> pages, Dictionary<int, int> batch, List<int> newlyShared, bool targetWasEmpty)
     {
         _structure = null;
         if (copy is null)
@@ -293,7 +329,7 @@ internal sealed partial class PageImporter
 
         // Every page, annotation and XObject may take a key. A target whose keys leave no room
         // below the largest integer gets the pages untagged: Import has no new way to fail.
-        long needed = pageMap.Count + batch.Count + (2L * (newlyShared.Count + _unkeyed.Count));
+        long needed = pages.Count + batch.Count + (2L * (newlyShared.Count + _unkeyed.Count));
         if (first > int.MaxValue - needed)
         {
             _target.Budget.Diagnostics.Skipped("The target's parent tree has no keys left for the imported pages; they were copied untagged.");
@@ -305,7 +341,7 @@ internal sealed partial class PageImporter
         int next = (int)first;
         var entries = new List<(int Key, PdfObject Value)>();
 
-        foreach ((int source, int target) in pageMap)
+        foreach ((int source, int target) in pages)
         {
             if (_source.Objects.TryGetValue(source, out PdfObject? page) && page is PdfDictionary d
                 && copy.ParentTreeValue(_source, d["StructParents"]) is PdfObject value && _target.Objects[target] is PdfDictionary pageCopy)
@@ -694,10 +730,13 @@ internal sealed partial class PageImporter
         stream.Dictionary.Remove("StructParent");
     }
 
-    /// <summary>The structure copied by one Import call.</summary>
-    internal sealed class StructureCopy(StructureIndex index, HashSet<int> kept)
+    /// <summary>The structure copied by one round of an Import call.</summary>
+    internal sealed class StructureCopy(StructureIndex index, HashSet<int> kept, Dictionary<int, int> pages)
     {
         public StructureIndex Index { get; } = index;
+
+        /// <summary>Source page number to the number of its copy, for the pages of the round; content elsewhere stays behind.</summary>
+        public Dictionary<int, int> Pages { get; } = pages;
 
         /// <summary>Indirect elements with content on the imported pages, and their ancestors.</summary>
         public HashSet<int> Kept { get; } = kept;
