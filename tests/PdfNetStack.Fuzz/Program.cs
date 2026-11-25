@@ -34,6 +34,7 @@ internal static class Program
             // Instrumented code needs the coverage map SharpFuzz sets up inside Run, so the warm up
             // happens on the first input rather than before.
             bool warm = false;
+            Oracle.HangLimit = Timeout.InfiniteTimeSpan;
             Fuzzer.LibFuzzer.Run(input =>
             {
                 byte[] data = input.ToArray();
