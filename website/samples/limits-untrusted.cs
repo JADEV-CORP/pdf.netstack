@@ -43,7 +43,8 @@ catch (PdfFormatException e)                 // damaged beyond repair, or not a 
 #endregion
 
 #region optimize
-var optimizerOptions = new PdfOptimizerOptions { Limits = PdfLimits.Untrusted };
+// Streaming keeps memory to the objects and the largest streams, not the size of the file.
+var optimizerOptions = new PdfOptimizerOptions { Limits = PdfLimits.Untrusted, Streaming = true };
 PdfOptimizationResult result = await PdfOptimizer.OptimizeFileAsync("manual.pdf", "manual-small.pdf", optimizerOptions);
 if (result.Disposition == OptimizationDisposition.LimitExceeded)
 {
@@ -53,6 +54,8 @@ if (result.Disposition == OptimizationDisposition.LimitExceeded)
 #endregion
 
 #region inspect
+// Check the size first: the limit is applied to bytes already read, so a huge file would be read whole.
+if (new FileInfo("report.pdf").Length > PdfLimits.Untrusted.MaxInputBytes) throw new InvalidDataException("report.pdf is larger than the input limit.");
 PdfInspection inspection = PdfInspector.Inspect(File.ReadAllBytes("report.pdf"), PdfLimits.Untrusted);
 Console.WriteLine($"{inspection.PageCount} pages, {inspection.Diagnostics.Count} warnings");
 #endregion

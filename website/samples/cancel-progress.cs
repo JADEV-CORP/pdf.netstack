@@ -7,7 +7,7 @@ using PdfNetStack;
 using var cancel = new CancellationTokenSource(TimeSpan.FromMinutes(2));
 PdfDocument[] parts = [PdfDocument.Open("a.pdf"), PdfDocument.Open("b.pdf"), PdfDocument.Open("c.pdf")];
 using PdfDocument merged = PdfDocument.Merge(parts, new ConsoleProgress("merged"), cancel.Token);
-merged.Save("merged.pdf");
+await merged.SaveAsync("merged.pdf", cancellationToken: cancel.Token);
 #endregion
 
 #region split-to

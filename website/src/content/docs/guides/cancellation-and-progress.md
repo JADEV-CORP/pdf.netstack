@@ -8,7 +8,7 @@ faq:
   - q: How do I stop PDF work when an ASP.NET Core client disconnects?
     a: Pass HttpContext.RequestAborted, or a token linked to it with a timeout, to OpenAsync, ExtractText, Merge, Save, the optimizer and the other calls that take one. Work stops within 256 content operators, inside image decoders, and between objects while saving.
   - q: Can PdfNetStack merge large uploads without holding them all in memory?
-    a: Yes. PdfDocument.MergeAsync reads the inputs one at a time, opens each on demand, copies its pages and releases it before the next. With PdfSaveOptions.Optimize set to false, the merged file is written progressively to the output stream.
+    a: Mostly. PdfDocument.MergeAsync reads the inputs one at a time, opens each on demand, copies its pages and releases it before the next, but the merged pages stay in memory until they are written. With PdfSaveOptions.Optimize set to false, the merged file is written progressively to the output stream. In ASP.NET Core the form is read first, and files over 64 KB go to disk.
 ---
 
 Long calls take a `CancellationToken` and report progress through `IProgress<PdfProgress>`, so
@@ -42,10 +42,13 @@ A cancelled call raises `OperationCanceledException`.
 
 What a cancelled call leaves behind:
 
-- `Pages.Import` leaves the target document as it was; `Merge` and `ExtractPages` return nothing.
+- `Pages.Import` from one document leaves the target as it was. With pages from several documents,
+  the fields and tags of the documents copied before the token fired stay in the target, tied to
+  no page: discard the target. `Merge` and `ExtractPages` return nothing.
 - `Split` stops yielding parts; those already returned are yours to dispose.
-- `SplitTo` and `SplitToAsync` keep the parts written before; the stream asked for last is
-  disposed and holds no complete file.
+- `SplitTo` and `SplitToAsync` keep the parts written before. When the token fires while a part
+  is being written, that part's stream is disposed and holds no complete file; progress reports
+  count only complete parts.
 - `FlattenAnnotations` keeps the pages flattened before the token fired.
 - `Save`, `SaveAsync` and `MergeAsync` leave an incomplete file in the output stream: discard it.
 
@@ -55,9 +58,12 @@ when those run on files from users.
 
 ## Merge uploads into a response
 
-`MergeAsync` takes the inputs as streams and holds one at a time: it reads an input to its end,
+`MergeAsync` takes the inputs as streams and reads one at a time: it reads an input to its end,
 opens it on demand, copies its pages, releases it and disposes the stream before it asks for the
-next. With the optimizer off, the merged file is written to the response as it is serialized:
+next. The merged pages stay in memory until they are written. With the optimizer off, the merged
+file is written to the response as it is serialized. ASP.NET Core reads the uploaded form before
+the handler runs and buffers files over 64 KB on disk, so the inputs do not come straight from
+the network:
 
 ```csharp sample="cancel-server.cs" region="merge"
 ```

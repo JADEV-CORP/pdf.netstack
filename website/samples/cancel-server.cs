@@ -29,7 +29,9 @@ app.MapPost("/text", async (HttpContext context) =>
 #endregion
 
 #region merge
-// Merge uploaded files straight into the response, one input in memory at a time.
+// Merge uploaded files into the response. ASP.NET Core reads the form first (files over 64 KB
+// go to disk), then MergeAsync reads one input at a time. The merged pages stay in memory
+// until they are written.
 app.MapPost("/merge", async (HttpContext context) =>
 {
     IFormFileCollection files = (await context.Request.ReadFormAsync(context.RequestAborted)).Files;
