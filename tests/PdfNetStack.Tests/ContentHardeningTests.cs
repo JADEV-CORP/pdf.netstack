@@ -1,5 +1,6 @@
 using System.Text;
 using PdfNetStack.Content;
+using PdfNetStack.Objects;
 
 namespace PdfNetStack.Tests;
 
@@ -35,6 +36,33 @@ public sealed class ContentHardeningTests
 
         Assert.IsFalse(reader.Next(new ContentOperation()));
         Assert.IsTrue(reader.BudgetExhausted);
+    }
+
+    [TestMethod]
+    [DataRow("true")]
+    [DataRow("false")]
+    [DataRow("null")]
+    public void AKeywordOperandReadWithTheLastTokenStopsAtTheBudget(string keyword)
+    {
+        var budget = new ContentBudget(0);
+        var reader = new ContentReader(Encoding.ASCII.GetBytes(keyword + " Tj"), budget);
+
+        Assert.IsFalse(reader.Next(new ContentOperation()));
+        Assert.IsTrue(reader.BudgetExhausted);
+    }
+
+    [TestMethod]
+    public void KeywordOperandsCostOneTokenEach()
+    {
+        var budget = new ContentBudget(10);
+        var reader = new ContentReader("true false null Tj"u8.ToArray(), budget);
+        var op = new ContentOperation();
+
+        Assert.IsTrue(reader.Next(op));
+
+        Assert.AreEqual("Tj", op.Operator);
+        CollectionAssert.AreEqual(new PdfObject[] { PdfBoolean.True, PdfBoolean.False, PdfNull.Instance }, op.Operands);
+        Assert.AreEqual(6, budget.TokensLeft);
     }
 
     [TestMethod]
