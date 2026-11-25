@@ -53,4 +53,51 @@ public sealed class StructureHardeningTests
 
         Assert.AreNotEqual(annotations[0], annotations[1], "each page has annotations of its own");
     }
+
+    [TestMethod]
+    public void RoleRenamesOfACancelledImportDoNotOutliveIt()
+    {
+        PdfDocument target = PdfDocument.Open(StructureImportTests.Tagged("T", headingRole: "H2", id: "t1"));
+        PdfDocument s = PdfDocument.Open(StructureImportTests.Tagged("S", headingRole: "H1", id: "s1"));
+        PdfDocument u = PdfDocument.Open(StructureImportTests.Tagged("U", headingRole: "P", id: "u1"));
+
+        // The second page's contents are copied after the structure, so failing there is a
+        // failure after the renames were worked out.
+        var contents = (PdfStream)s.Objects[6];
+        s.Objects[6] = new PdfStream(contents.Dictionary, () => throw new OperationCanceledException(), 1);
+        Assert.ThrowsExactly<OperationCanceledException>(() => target.Pages.Import(s.Pages));
+        s.Objects[6] = contents;
+
+        target.Pages.Import(u.Pages);
+        target.Pages.Import(s.Pages);
+
+        PdfDocument saved = StructureImportTests.Saved(target);
+        StructureImportTests.CheckStructure(saved);
+        PdfDictionary root = saved.ResolveDictionary(saved.Catalog["StructTreeRoot"])!;
+        PdfDictionary roleMap = saved.ResolveDictionary(root["RoleMap"])!;
+        string role = StructureImportTests.Elements(saved).Last(e => e.GetName("S")!.StartsWith("Heading", StringComparison.Ordinal)).GetName("S")!;
+        for (int i = 0; i < 8 && roleMap.GetName(role) is string next; i++) role = next;
+        Assert.AreEqual("H1", role, "the retried source's custom type keeps its own mapping");
+    }
+
+    [TestMethod]
+    public void ACancelledImportLeavesNoCopiedObjectsInTheTarget()
+    {
+        PdfDocument s = PdfDocument.Open(StructureImportTests.Tagged("S"));
+        var contents = (PdfStream)s.Objects[6];
+        s.Objects[6] = new PdfStream(contents.Dictionary, () => throw new OperationCanceledException(), 1);
+
+        PdfDocument target = PdfDocument.Create();
+        target.Pages.Add(PdfRectangle.A4);
+        int objects = target.Objects.Count;
+        int next = target.NextNumber;
+
+        Assert.ThrowsExactly<OperationCanceledException>(() => target.Pages.Import(s.Pages));
+        Assert.AreEqual(objects, target.Objects.Count);
+        Assert.AreEqual(next, target.NextNumber);
+
+        s.Objects[6] = contents;
+        target.Pages.Import(s.Pages);
+        Assert.AreEqual("Document(P(Span),Table(TH,TD),Heading(Link),Figure)", StructureImportTests.CheckStructure(StructureImportTests.Saved(target)));
+    }
 }
