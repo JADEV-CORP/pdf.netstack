@@ -401,6 +401,63 @@ public sealed class DocumentHardeningTests
         CollectionAssert.AreEqual(new[] { 0, 1, 2, 3, 0, 1, 2, 3 }, pages.Select(p => doc.Pages.ToList().IndexOf(p!)).ToArray());
     }
 
+    /// <summary>A parent field with <paramref name="entries"/> and two child fields, a and b, that inherit its value.</summary>
+    private static byte[] FormWithInheritedValue(string entries)
+    {
+        PdfBuilder b = PdfBuilder.Simple("A");
+        b.Set(10, $"<<{entries}/T(parent)/Kids[11 0 R 12 0 R]>>");
+        b.Set(11, "<</T(a)/Parent 10 0 R/Subtype/Widget/Rect[0 0 100 20]/P 5 0 R>>");
+        b.Set(12, "<</T(b)/Parent 10 0 R/Subtype/Widget/Rect[0 30 100 50]/P 5 0 R>>");
+        b.Set(1, "<</Type/Catalog/Pages 2 0 R/AcroForm<</Fields[10 0 R]>>>>");
+        return b.Build();
+    }
+
+    [TestMethod]
+    public void ClearingATextFieldHidesTheValueOfItsParent()
+    {
+        using PdfDocument doc = PdfDocument.Open(FormWithInheritedValue("/FT/Tx/V(old)"));
+        Assert.AreEqual("old", doc.Form["parent.a"]!.Value);
+
+        doc.Form.Fill(new Dictionary<string, string> { ["parent.a"] = null! });
+
+        using PdfDocument saved = PdfDocument.Open(doc.ToArray(Plain));
+        foreach (PdfDocument read in new[] { doc, saved })
+        {
+            Assert.AreEqual("", ((PdfTextField)read.Form["parent.a"]!).Text);
+            Assert.AreEqual("old", read.Form["parent.b"]!.Value, "The sibling keeps the parent's value.");
+        }
+    }
+
+    [TestMethod]
+    public void ClearingAChoiceFieldHidesTheValueOfItsParent()
+    {
+        using PdfDocument doc = PdfDocument.Open(FormWithInheritedValue("/FT/Ch/Ff 131072/Opt[(x)(y)]/V(x)"));
+        Assert.AreEqual("x", doc.Form["parent.a"]!.Value);
+
+        doc.Form.Fill(new Dictionary<string, string> { ["parent.a"] = "" });
+
+        using PdfDocument saved = PdfDocument.Open(doc.ToArray(Plain));
+        foreach (PdfDocument read in new[] { doc, saved })
+        {
+            Assert.IsEmpty(((PdfChoiceField)read.Form["parent.a"]!).SelectedValues);
+            Assert.IsNull(read.Form["parent.a"]!.Value);
+            Assert.AreEqual("x", read.Form["parent.b"]!.Value, "The sibling keeps the parent's value.");
+        }
+    }
+
+    [TestMethod]
+    public void ClearingAFieldWithNothingToInheritRemovesItsValue()
+    {
+        using PdfDocument doc = PdfDocument.Open(FormWithInheritedValue("/FT/Tx"));
+        var a = (PdfTextField)doc.Form["parent.a"]!;
+        a.Text = "new";
+
+        a.Text = null;
+
+        Assert.IsNull(a.Text);
+        Assert.IsNull(a.Dictionary["V"]);
+    }
+
     private sealed class TempFolder : IDisposable
     {
         public TempFolder()
