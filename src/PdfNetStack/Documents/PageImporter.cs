@@ -45,6 +45,10 @@ internal sealed partial class PageImporter
             throw new InvalidOperationException("The source document does not permit copying its content. Open it with the owner password.");
         }
 
+        // Everything this call allocates is numbered from here, so a failure can take it back.
+        int firstNumber = _target.NextNumber;
+        var idRenames = new Dictionary<string, string>(_idRenames, StringComparer.Ordinal);
+
         // Reserve numbers for every page first so links between them can be remapped.
         var pageMap = new Dictionary<int, int>();
         var numbers = new int[pages.Count];
@@ -68,12 +72,18 @@ internal sealed partial class PageImporter
         }
         catch
         {
-            // A failed or cancelled import leaves the target as it was: copies made so far are
-            // unreachable and never saved, but the shared copies this call reserved would
-            // otherwise be reused by the next import while some never came to exist.
+            // A failed or cancelled import leaves the target as it was. The shared copies this
+            // call reserved would otherwise be reused by the next import while some never came
+            // to exist, and renames worked out against the target's role map, class map and IDs
+            // would be applied to a call that finds them changed by another source.
             foreach (int source in _newlyShared) _shared.Remove(source);
             RestoreFormState(form);
             _structure = null;
+            ResetUnmergedRenames();
+            _idRenames.Clear();
+            foreach (KeyValuePair<string, string> rename in idRenames) _idRenames[rename.Key] = rename.Value;
+            for (int number = firstNumber; number < _target.NextNumber; number++) _target.Objects.Remove(number);
+            _target.NextNumber = firstNumber;
             throw;
         }
         finally

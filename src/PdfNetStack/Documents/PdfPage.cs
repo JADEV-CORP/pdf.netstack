@@ -264,10 +264,10 @@ public sealed class PdfPageCollection : IReadOnlyList<PdfPage>
     /// <param name="index">Where to insert them; null appends.</param>
     /// <param name="cancellationToken">
     /// Observed while pages and the objects they use are copied. When it fires, no page is added
-    /// and the document's form and structure tree are as they were; objects already copied stay
-    /// in the document unused, and saving leaves them out. With pages from several documents,
-    /// those are copied one document at a time, and the form fields and structure elements of
-    /// documents copied before the token fired stay, tied to no page: discard the document then.
+    /// and the document's form and structure tree are as they were, and the objects copied so far
+    /// are removed. With pages from several documents, those are copied one document at a time,
+    /// and the form fields and structure elements of documents copied before the token fired
+    /// stay, tied to no page: discard the document then.
     /// </param>
     /// <exception cref="OperationCanceledException">Cancelled before the pages were added.</exception>
     public IReadOnlyList<PdfPage> Import(IEnumerable<PdfPage> pages, int? index, CancellationToken cancellationToken)
