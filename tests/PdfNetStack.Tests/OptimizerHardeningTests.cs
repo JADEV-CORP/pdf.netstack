@@ -1,6 +1,7 @@
 using System.IO.Compression;
 using System.Text;
 using PdfNetStack.Filters;
+using PdfNetStack.Imaging;
 using PdfNetStack.Optimization;
 using PdfNetStack.Objects;
 using PdfNetStack.Parsing;
@@ -320,5 +321,60 @@ public sealed class OptimizerHardeningTests
         PdfLimitExceededException e = Assert.ThrowsExactly<PdfLimitExceededException>(() => images[1].Decode());
 
         Assert.AreEqual(PdfLimitKind.TotalDecodedBytes, e.Limit);
+    }
+
+    private static void AssertSecondImageOverTheBudget(PdfDocument doc)
+    {
+        IReadOnlyList<PdfPageImage> images = doc.Pages[0].GetImages();
+
+        Assert.IsNotNull(images[0].Decode());
+        PdfLimitExceededException e = Assert.ThrowsExactly<PdfLimitExceededException>(() => images[1].Decode());
+
+        Assert.AreEqual(PdfLimitKind.TotalImagePixels, e.Limit);
+    }
+
+    [TestMethod]
+    public void JpegPixelsAreChargedAtTheirOwnSize()
+    {
+        // The dictionary says 1 by 1; the JPEG holds 100 by 100.
+        using JpegImage encoded = JpegEncoder.Encode(SyntheticImages.Photo(100, 100, 3), 80, false);
+        byte[] jpeg = JpegWriter.TryWriteSmallest(encoded, 0, false)!;
+        using PdfDocument doc = TwoImages("/Type/XObject/Subtype/Image/Width 1/Height 1/ColorSpace/DeviceRGB/BitsPerComponent 8/Filter/DCTDecode",
+            jpeg, jpeg, PdfLimits.Default with { MaxTotalImagePixels = 15_000 });
+
+        AssertSecondImageOverTheBudget(doc);
+    }
+
+    [TestMethod]
+    public void Jpeg2000PixelsAreChargedAtTheirOwnSize()
+    {
+        // 61 by 45 pixels under a dictionary that says 1 by 1.
+        byte[] jpx = File.ReadAllBytes(Path.Combine(AppContext.BaseDirectory, "Fixtures", "Jpx", "gray-53.jp2"));
+        using PdfDocument doc = TwoImages("/Type/XObject/Subtype/Image/Width 1/Height 1/ColorSpace/DeviceGray/BitsPerComponent 8/Filter/JPXDecode",
+            jpx, jpx, PdfLimits.Default with { MaxTotalImagePixels = 4_000 });
+
+        AssertSecondImageOverTheBudget(doc);
+    }
+
+    [TestMethod]
+    public void CcittPixelsAreChargedAtTheirOwnSize()
+    {
+        // 301 by 97 pixels by the parameters, under a dictionary that says 1 by 1.
+        byte[] g4 = File.ReadAllBytes(Path.Combine(AppContext.BaseDirectory, "Fixtures", "Ccitt", "g4.bin"));
+        using PdfDocument doc = TwoImages("/Type/XObject/Subtype/Image/Width 1/Height 1/ColorSpace/DeviceGray/BitsPerComponent 1/Filter/CCITTFaxDecode/DecodeParms<</K -1/Columns 301/Rows 97>>",
+            g4, g4, PdfLimits.Default with { MaxTotalImagePixels = 40_000 });
+
+        AssertSecondImageOverTheBudget(doc);
+    }
+
+    [TestMethod]
+    public void SampleConversionStopsWhenCancelled()
+    {
+        double[] decode = [0, 1];
+
+        // Short data read as stored goes row by row, a bilevel image through a lookup table.
+        Assert.ThrowsExactly<OperationCanceledException>(() => ImageSamples.Convert(new byte[10], 100, 100, 8, 100, ColorSpace.Gray, decode, false, Cancelled()));
+        Assert.ThrowsExactly<OperationCanceledException>(() => ImageSamples.Convert(new byte[10], 100, 100, 1, 13, ColorSpace.Gray, decode, false, Cancelled()));
+        Assert.AreEqual(100, ImageSamples.Convert(new byte[10], 100, 100, 1, 13, ColorSpace.Gray, decode, false, CancellationToken.None).Width);
     }
 }

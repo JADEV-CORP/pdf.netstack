@@ -53,7 +53,7 @@ internal static class ImageSamples
 
         // Every image the document decodes counts against its pixel budget, before any of it is allocated.
         doc.Budget.ChargeImagePixels((long)width * height);
-        if (encoding == "JPXDecode") return DecodeJpx(doc, dict, raw, resources, mask, ct);
+        if (encoding == "JPXDecode") return DecodeJpx(doc, dict, raw, resources, mask, (long)width * height, ct);
 
         int bpc = mask || encoding is "CCITTFaxDecode" or "JBIG2Decode" ? 1 : encoding == "DCTDecode" ? 8 : Int(doc, dict["BitsPerComponent"]);
         ColorSpace? space = mask ? ColorSpace.Gray : ColorSpace.Read(doc, doc.Resolve(dict["ColorSpace"]), resources, 0);
@@ -78,6 +78,7 @@ internal static class ImageSamples
                 throw new PdfFormatException("Image exceeds the decode limit.");
             }
 
+            ChargeBeyond(doc, (long)parameters.Columns * rows, (long)width * height);
             try
             {
                 data = CcittDecoder.Decode(data, parameters, height, ct);
@@ -102,9 +103,12 @@ internal static class ImageSamples
             Raster jpeg;
             try
             {
+                // The JPEG decodes at its own size, whatever Width and Height say.
+                JpegHeader header = JpegHeader.Read(data);
+                ChargeBeyond(doc, (long)header.Width * header.Height, (long)width * height);
                 jpeg = JpegDecoder.Decode(data, transform, doc.DecodeLimit, doc.MaxImagePixels, ct);
             }
-            catch (JpegFormatException e)
+            catch (Exception e) when (e is JpegFormatException or FormatException)
             {
                 throw new PdfFormatException("JPEG image cannot be decoded: " + e.Message, e);
             }
@@ -127,6 +131,12 @@ internal static class ImageSamples
         SampleBytes(doc, width, height, bpc, space);
         return Convert(data, width, height, bpc, (((long)width * space.Components * bpc) + 7) / 8, space, decode, mask, ct);
     }
+
+    /// <summary>
+    /// Charges the pixels a codec decodes past those already charged from the dictionary's
+    /// Width and Height, which a codec's own size is free to exceed.
+    /// </summary>
+    private static void ChargeBeyond(PdfDocument doc, long decoded, long charged) => doc.Budget.ChargeImagePixels(Math.Max(0, decoded - charged));
 
     /// <summary>The bytes of the samples, checked with the output against the decode ceiling.</summary>
     /// <exception cref="PdfFormatException">The samples or the pixels would not fit.</exception>
@@ -167,10 +177,11 @@ internal static class ImageSamples
 
     /// <summary>
     /// JPXDecode. The dictionary's color space wins, else the JP2 header's (ISO 32000-1, 7.4.9);
-    /// the data's own size wins over Width and Height. Samples arrive as 8 bits per component.
+    /// the data's own size wins over Width and Height, and is charged to the pixel budget past what
+    /// the dictionary's size already was. Samples arrive as 8 bits per component.
     /// SMaskInData is not applied: opacity channels in the data are left out.
     /// </summary>
-    private static Raster? DecodeJpx(PdfDocument doc, PdfDictionary dict, ReadOnlyMemory<byte> raw, PdfDictionary? resources, bool mask, CancellationToken ct)
+    private static Raster? DecodeJpx(PdfDocument doc, PdfDictionary dict, ReadOnlyMemory<byte> raw, PdfDictionary? resources, bool mask, long charged, CancellationToken ct)
     {
         byte[] data = EncodedData(doc, dict, raw);
         ct.ThrowIfCancellationRequested();
@@ -178,7 +189,7 @@ internal static class ImageSamples
         Raster? jpx;
         try
         {
-            (jpx, space) = Jpeg2000Decoder.DecodeForPdf(data, space, doc.DecodeLimit, maxPixels: doc.MaxImagePixels, ct: ct);
+            (jpx, space) = Jpeg2000Decoder.DecodeForPdf(data, space, doc.DecodeLimit, maxPixels: doc.MaxImagePixels, ct: ct, onSize: pixels => ChargeBeyond(doc, pixels, charged));
         }
         catch (Jpeg2000FormatException e)
         {
@@ -242,7 +253,7 @@ internal static class ImageSamples
     /// Short data is common, and viewers draw what is there: samples past the end read as zero,
     /// without padding the data out to its declared size.
     /// </remarks>
-    private static Raster Convert(byte[] data, int width, int height, int bpc, long rowBytes, ColorSpace space, double[] decode, bool mask, CancellationToken ct)
+    internal static Raster Convert(byte[] data, int width, int height, int bpc, long rowBytes, ColorSpace space, double[] decode, bool mask, CancellationToken ct)
     {
         int n = space.Components, channels = space.IsGray ? 1 : 3;
         long stride = (long)width * n;
@@ -259,6 +270,7 @@ internal static class ImageSamples
         {
             for (int y = 0; y < height; y++)
             {
+                ct.ThrowIfCancellationRequested();
                 long from = y * rowBytes;
                 if (from >= data.Length) break;
                 data.AsSpan((int)from, (int)Math.Min(stride, data.Length - from)).CopyTo(output.AsSpan((int)(y * stride)));
@@ -281,7 +293,7 @@ internal static class ImageSamples
 
         if (tables is not null && n == 1)
         {
-            ConvertByValue(data, width, height, bpc, rowBytes, space, tables[0], mask, output, channels);
+            ConvertByValue(data, width, height, bpc, rowBytes, space, tables[0], mask, output, channels, ct);
             return new Raster(width, height, channels, output);
         }
 
@@ -348,7 +360,7 @@ internal static class ImageSamples
     /// One component of 8 bits or less, such as a bilevel scan: a sample value gives the same
     /// pixel wherever it appears, so each value's pixel is worked out once and looked up.
     /// </summary>
-    private static void ConvertByValue(byte[] data, int width, int height, int bpc, long rowBytes, ColorSpace space, double[] table, bool mask, byte[] output, int channels)
+    private static void ConvertByValue(byte[] data, int width, int height, int bpc, long rowBytes, ColorSpace space, double[] table, bool mask, byte[] output, int channels, CancellationToken ct)
     {
         int values = 1 << bpc;
         var pixels = new byte[values * channels];
@@ -371,6 +383,7 @@ internal static class ImageSamples
         long o = 0;
         for (int y = 0; y < height; y++)
         {
+            ct.ThrowIfCancellationRequested();
             long row = y * rowBytes;
             if (bpc == 1 && channels == 1)
             {
