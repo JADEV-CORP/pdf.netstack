@@ -111,7 +111,18 @@ internal readonly struct Deadline
         : TimeSpan.FromSeconds(Math.Max(0, _end - Stopwatch.GetTimestamp()) / (double)Stopwatch.Frequency);
 
     /// <summary>A source the deadline cancels, for work that takes a token; null without a deadline.</summary>
-    public CancellationTokenSource? NewTimer() => _end == 0 ? null : new CancellationTokenSource(Remaining);
+    public CancellationTokenSource? NewTimer()
+    {
+        if (_end == 0) return null;
+        TimeSpan left = Remaining;
+        if (left >= TimeSpan.FromMilliseconds(1)) return new CancellationTokenSource(left);
+
+        // Under a millisecond left: .NET cancels such a source at once, but .NET Framework starts a
+        // timer that fires later, so short work would finish past its deadline. Cancel it here.
+        var spent = new CancellationTokenSource();
+        spent.Cancel();
+        return spent;
+    }
 
     /// <exception cref="PdfLimitExceededException">The deadline has passed.</exception>
     public void ThrowIfPassed(ResourceBudget? budget)
