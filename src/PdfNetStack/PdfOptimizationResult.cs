@@ -74,6 +74,13 @@ public sealed record OptimizationStatistics(
     /// </summary>
     public int ImagesRecodedAsGroup4 { get; init; }
 
+    /// <summary>
+    /// Bilevel images re-encoded as JBIG2 with exactly the same pixels by
+    /// <see cref="PdfOptimizerOptions.OptimizeBilevelImages"/> and <see cref="PdfOptimizerOptions.UseJbig2"/>,
+    /// counted in <see cref="StreamsRecompressed"/> as well.
+    /// </summary>
+    public int ImagesRecodedAsJbig2 { get; init; }
+
     /// <summary>Resource entries removed because no content stream could name them.</summary>
     public int ResourcesPruned { get; init; }
 
@@ -83,11 +90,31 @@ public sealed record OptimizationStatistics(
     /// <summary>TrueType font programs replaced by a merged program shared with other subsets of the same font.</summary>
     public int FontProgramsMerged { get; init; }
 
+    /// <summary>TrueType and CFF font programs replaced by a subset holding the glyphs the document can show.</summary>
+    public int FontProgramsSubset { get; init; }
+
+    /// <summary>Type 1 font programs rewritten as CFF with the same glyphs and hints.</summary>
+    public int Type1FontsConverted { get; init; }
+
+    /// <summary>
+    /// Fully embedded fonts that were not subset for a reason other than size, one entry per
+    /// program: its name, a colon and the reason (forms can draw text with it, its use could not
+    /// be listed in full, readers treat its name specially, and so on).
+    /// </summary>
+    public IReadOnlyList<string> FontsLeftWhole { get; init; } = [];
+
     /// <summary>True when the output was written as a linearized file.</summary>
     public bool Linearized { get; init; }
 
     /// <summary>True when the file was optimized in streaming mode (<see cref="PdfOptimizerOptions.Streaming"/>).</summary>
     public bool Streamed { get; init; }
+
+    /// <summary>
+    /// True when the source was encrypted and the output was encrypted again exactly as it was
+    /// (<see cref="PdfOptimizerOptions.OptimizeEncryptedFiles"/>): same encryption dictionary,
+    /// file key and first /ID entry, so the same passwords open it with the same permissions.
+    /// </summary>
+    public bool Reencrypted { get; init; }
 
     internal static OptimizationStatistics Empty(TimeSpan elapsed) => new(0, 0, 0, 0, 0, 0, 0, elapsed, new PhaseTimings());
 }
@@ -98,7 +125,7 @@ public sealed record PhaseTimings
     /// <summary>Parsing, safety checks and reachability.</summary>
     public TimeSpan Analyze { get; init; }
 
-    /// <summary>Content analysis, resource pruning and font program merging.</summary>
+    /// <summary>Content analysis, resource pruning, font subsetting, conversion and merging.</summary>
     public TimeSpan Content { get; init; }
 
     /// <summary>Stream re-encoding.</summary>

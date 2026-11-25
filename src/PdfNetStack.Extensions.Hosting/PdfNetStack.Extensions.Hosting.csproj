@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- Metrics through IMeterFactory and tracing are in the .NET 8 base library; no package is
+         needed for them on these targets. -->
+    <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
+    <RootNamespace>PdfNetStack.Extensions.Hosting</RootNamespace>
+    <IsAotCompatible>true</IsAotCompatible>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <PackageId>PdfNetStack.Extensions.Hosting</PackageId>
+    <Title>PdfNetStack.Extensions.Hosting: dependency injection, options and telemetry for PdfNetStack</Title>
+    <Description>Registers PdfNetStack in a .NET host: services.AddPdfNetStack() adds an IPdfOptimizer bound to options and configuration (PdfOptimizerOptions and PdfLimits), with an ActivitySource and a Meter that report optimization duration, bytes in and out and the outcome of every run to OpenTelemetry. Trim and Native AOT safe. MIT licensed. By Jamal Abdelkhalek, JADEV.</Description>
+    <PackageTags>pdf;pdf-compression;dependency-injection;options;opentelemetry;metrics;aspnetcore;hosting;jadev</PackageTags>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\PdfNetStack\PdfNetStack.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- MIT. The lowest versions with what is used here, so hosts on .NET 8 and later bring their
+         own newer ones. Configuration is read key by key (see PdfNetStackConfiguration), not
+         through the binder. -->
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="8.0.2" />
+    <PackageReference Include="Microsoft.Extensions.Options" Version="8.0.2" />
+    <PackageReference Include="Microsoft.Extensions.Options.ConfigurationExtensions" Version="8.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="PdfNetStack.Tests" />
+  </ItemGroup>
+
+</Project>

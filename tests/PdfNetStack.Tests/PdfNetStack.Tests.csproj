@@ -48,6 +48,16 @@
     <ProjectReference Include="..\..\src\PdfNetStack.Ocr.Tool\PdfNetStack.Ocr.Tool.csproj" />
   </ItemGroup>
 
+  <!-- The optional packages for ingestion pipelines and hosts, which target .NET only. -->
+  <ItemGroup Condition="'$(TargetFramework)' != 'net48'">
+    <ProjectReference Include="..\..\src\PdfNetStack.DataIngestion\PdfNetStack.DataIngestion.csproj" />
+    <ProjectReference Include="..\..\src\PdfNetStack.Extensions.Hosting\PdfNetStack.Extensions.Hosting.csproj" />
+    <!-- Test-only, MIT: a service provider and in-memory configuration to resolve the hosting package's services. -->
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="10.0.15" />
+    <PackageReference Include="Microsoft.Extensions.Configuration" Version="10.0.15" />
+    <PackageReference Include="Microsoft.Extensions.Diagnostics" Version="10.0.15" />
+  </ItemGroup>
+
   <!-- The fuzzing harness, whose seeds the tests replay through every target. .NET only. -->
   <ItemGroup Condition="'$(TargetFramework)' != 'net48'">
     <ProjectReference Include="..\PdfNetStack.Fuzz\PdfNetStack.Fuzz.csproj" />

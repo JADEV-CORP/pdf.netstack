@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using System.Text;
 using PdfNetStack.Objects;
@@ -29,8 +30,11 @@ internal sealed class StandardSecurity
         0x2E, 0x2E, 0x00, 0xB6, 0xD0, 0x68, 0x3E, 0x80, 0x2F, 0x0C, 0xA9, 0xFE, 0x64, 0x53, 0x69, 0x7A,
     ];
 
+    // AES strings and streams whose length or padding was wrong, decrypted as far as they go.
+    private int _damaged;
+
     private StandardSecurity(PdfDictionary dictionary, byte[] fileKey, int revision, int permissions,
-        CryptMethod streams, CryptMethod strings, bool encryptMetadata, bool isOwner)
+        CryptMethod streams, CryptMethod strings, bool encryptMetadata, bool isOwner, byte[] documentId)
     {
         Dictionary = dictionary;
         FileKey = fileKey;
@@ -40,9 +44,20 @@ internal sealed class StandardSecurity
         StringMethod = strings;
         EncryptMetadata = encryptMetadata;
         IsOwner = isOwner;
+        DocumentId = documentId;
     }
 
     public PdfDictionary Dictionary { get; }
+
+    /// <summary>The first /ID entry the file key was derived with (revisions 2 to 4); empty when the file has none.</summary>
+    public byte[] DocumentId { get; }
+
+    /// <summary>
+    /// How many AES strings and streams decrypted so far had a length or padding AES-CBC cannot
+    /// produce. They are decrypted as far as they go, as viewers do, but other readers may
+    /// recover them differently, so the file counts as damaged.
+    /// </summary>
+    public int DamagedCiphertexts => Volatile.Read(ref _damaged);
 
     public byte[] FileKey { get; }
 
@@ -89,16 +104,16 @@ internal sealed class StandardSecurity
             byte[] pw = Utf8Password(candidate);
             if (o.Length >= 48 && u.Length >= 48)
             {
-                if (Hash(r, pw, o.AsSpan(32, 8), u.AsSpan(0, 48)).AsSpan().SequenceEqual(o.AsSpan(0, 32)))
+                if (FixedTimeEquals(Hash(r, pw, o.AsSpan(32, 8), u.AsSpan(0, 48)), o.AsSpan(0, 32)))
                 {
                     byte[] key = AesNoIv(Hash(r, pw, o.AsSpan(40, 8), u.AsSpan(0, 48)), oe, encrypt: false);
-                    return new StandardSecurity(enc, key, r, p, streams, strings, encryptMetadata, isOwner: true);
+                    return new StandardSecurity(enc, key, r, p, streams, strings, encryptMetadata, isOwner: true, id0);
                 }
 
-                if (Hash(r, pw, u.AsSpan(32, 8), []).AsSpan().SequenceEqual(u.AsSpan(0, 32)))
+                if (FixedTimeEquals(Hash(r, pw, u.AsSpan(32, 8), []), u.AsSpan(0, 32)))
                 {
                     byte[] key = AesNoIv(Hash(r, pw, u.AsSpan(40, 8), []), ue, encrypt: false);
-                    return new StandardSecurity(enc, key, r, p, streams, strings, encryptMetadata, isOwner: false);
+                    return new StandardSecurity(enc, key, r, p, streams, strings, encryptMetadata, isOwner: false, id0);
                 }
             }
 
@@ -128,13 +143,13 @@ internal sealed class StandardSecurity
         byte[] asOwner = FileKeyR4(recovered, o, p, id0, r, keyLength, encryptMetadata);
         if (UserMatches(asOwner, u, id0, r))
         {
-            return new StandardSecurity(enc, asOwner, r, p, streams, strings, encryptMetadata, isOwner: true);
+            return new StandardSecurity(enc, asOwner, r, p, streams, strings, encryptMetadata, isOwner: true, id0);
         }
 
         byte[] asUser = FileKeyR4(Pad(Latin1Password(candidate)), o, p, id0, r, keyLength, encryptMetadata);
         if (UserMatches(asUser, u, id0, r))
         {
-            return new StandardSecurity(enc, asUser, r, p, streams, strings, encryptMetadata, isOwner: false);
+            return new StandardSecurity(enc, asUser, r, p, streams, strings, encryptMetadata, isOwner: false, id0);
         }
 
         throw new PdfPasswordException();
@@ -143,7 +158,8 @@ internal sealed class StandardSecurity
     // ---------------------------------------------------------------- creating
 
     /// <summary>Creates new encryption. AES-256 uses revision 6; AES-128 uses revision 4 and needs the document ID.</summary>
-    public static StandardSecurity Create(string userPassword, string ownerPassword, int permissions, PdfEncryption algorithm, byte[] id0)
+    /// <param name="encryptMetadata">False leaves metadata streams in the clear (/EncryptMetadata false).</param>
+    public static StandardSecurity Create(string userPassword, string ownerPassword, int permissions, PdfEncryption algorithm, byte[] id0, bool encryptMetadata = true)
     {
         if (string.IsNullOrEmpty(ownerPassword)) ownerPassword = Compat.ToHex(Compat.RandomBytes(16));
         var enc = new PdfDictionary();
@@ -165,7 +181,7 @@ internal sealed class StandardSecurity
             byte[] perms = new byte[16];
             Compat.WriteInt32LittleEndian(perms.AsSpan(0, 4), p);
             perms[4] = perms[5] = perms[6] = perms[7] = 0xFF;
-            perms[8] = (byte)'T';
+            perms[8] = encryptMetadata ? (byte)'T' : (byte)'F';
             perms[9] = (byte)'a';
             perms[10] = (byte)'d';
             perms[11] = (byte)'b';
@@ -184,7 +200,8 @@ internal sealed class StandardSecurity
             enc.Set("UE", new PdfString(ue, true));
             enc.Set("P", PdfNumber.FromInteger(p));
             enc.Set("Perms", new PdfString(permsEncrypted, true));
-            return new StandardSecurity(enc, fileKey, 6, p, CryptMethod.AesV3, CryptMethod.AesV3, true, isOwner: true);
+            if (!encryptMetadata) enc.Set("EncryptMetadata", PdfBoolean.False);
+            return new StandardSecurity(enc, fileKey, 6, p, CryptMethod.AesV3, CryptMethod.AesV3, encryptMetadata, isOwner: true, id0);
         }
 
         const int r4 = 4, n = 16;
@@ -192,7 +209,7 @@ internal sealed class StandardSecurity
         byte[] ownerKey = OwnerRc4Key(Latin1Password(ownerPassword), r4, n);
         byte[] oValue = Rc4.Apply(ownerKey, userPad);
         for (int i = 1; i <= 19; i++) oValue = Rc4.Apply(Xor(ownerKey, i), oValue);
-        byte[] key = FileKeyR4(userPad, oValue, p, id0, r4, n, encryptMetadata: true);
+        byte[] key = FileKeyR4(userPad, oValue, p, id0, r4, n, encryptMetadata);
         byte[] uValue = [.. UserHashR3(key, id0), .. new byte[16]];
 
         enc.Set("V", PdfNumber.FromInteger(4));
@@ -204,27 +221,50 @@ internal sealed class StandardSecurity
         enc.Set("O", new PdfString(oValue, true));
         enc.Set("U", new PdfString(uValue, true));
         enc.Set("P", PdfNumber.FromInteger(p));
-        return new StandardSecurity(enc, key, r4, p, CryptMethod.AesV2, CryptMethod.AesV2, true, isOwner: true);
+        if (!encryptMetadata) enc.Set("EncryptMetadata", PdfBoolean.False);
+        return new StandardSecurity(enc, key, r4, p, CryptMethod.AesV2, CryptMethod.AesV2, encryptMetadata, isOwner: true, id0);
     }
 
-    /// <summary>Revision 3 encryption with RC4, for tests of the legacy read path only.</summary>
-    internal static StandardSecurity CreateLegacyRc4(string userPassword, string ownerPassword, int permissions, byte[] id0, int keyBytes)
+    /// <summary>
+    /// RC4 encryption, for tests of the legacy read path only: revision 3 (/V 2, 40 to 128 bit keys)
+    /// or revision 2 (/V 1, 40 bit keys).
+    /// </summary>
+    internal static StandardSecurity CreateLegacyRc4(string userPassword, string ownerPassword, int permissions, byte[] id0, int keyBytes, int revision = 3)
     {
-        const int r = 3;
+        if (revision is not (2 or 3)) throw new ArgumentOutOfRangeException(nameof(revision));
+        if (revision == 2) keyBytes = 5;
         byte[] userPad = Pad(Latin1Password(userPassword));
-        byte[] ownerKey = OwnerRc4Key(Latin1Password(ownerPassword), r, keyBytes);
+        byte[] ownerKey = OwnerRc4Key(Latin1Password(ownerPassword), revision, keyBytes);
         byte[] o = Rc4.Apply(ownerKey, userPad);
-        for (int i = 1; i <= 19; i++) o = Rc4.Apply(Xor(ownerKey, i), o);
-        byte[] key = FileKeyR4(userPad, o, permissions, id0, r, keyBytes, encryptMetadata: true);
+        if (revision == 3)
+        {
+            for (int i = 1; i <= 19; i++) o = Rc4.Apply(Xor(ownerKey, i), o);
+        }
+
+        byte[] key = FileKeyR4(userPad, o, permissions, id0, revision, keyBytes, encryptMetadata: true);
         var enc = new PdfDictionary();
         enc.Set("Filter", new PdfName("Standard"));
-        enc.Set("V", PdfNumber.FromInteger(2));
-        enc.Set("R", PdfNumber.FromInteger(r));
-        enc.Set("Length", PdfNumber.FromInteger(keyBytes * 8));
+        enc.Set("V", PdfNumber.FromInteger(revision == 2 ? 1 : 2));
+        enc.Set("R", PdfNumber.FromInteger(revision));
+        if (revision == 3) enc.Set("Length", PdfNumber.FromInteger(keyBytes * 8));
         enc.Set("O", new PdfString(o, true));
-        enc.Set("U", new PdfString([.. UserHashR3(key, id0), .. new byte[16]], true));
+        enc.Set("U", new PdfString(revision == 2 ? Rc4.Apply(key, Padding) : [.. UserHashR3(key, id0), .. new byte[16]], true));
         enc.Set("P", PdfNumber.FromInteger(permissions));
-        return new StandardSecurity(enc, key, r, permissions, CryptMethod.Rc4, CryptMethod.Rc4, true, isOwner: true);
+        return new StandardSecurity(enc, key, revision, permissions, CryptMethod.Rc4, CryptMethod.Rc4, true, isOwner: true, id0);
+    }
+
+    /// <summary>The cipher and revision, as a reason names them: "AES-256, revision 6".</summary>
+    public string Describe()
+    {
+        CryptMethod method = StreamMethod != CryptMethod.None ? StreamMethod : StringMethod;
+        string cipher = method switch
+        {
+            CryptMethod.Rc4 => Compat.Format("RC4 {0}-bit", FileKey.Length * 8),
+            CryptMethod.AesV2 => "AES-128",
+            CryptMethod.AesV3 => "AES-256",
+            _ => "no cipher",
+        };
+        return Compat.Format("{0}, revision {1}", cipher, Revision);
     }
 
     private static PdfDictionary CryptFilters(string method, int length)
@@ -264,16 +304,24 @@ internal sealed class StandardSecurity
                     return [.. iv, .. Compat.AesCbcEncrypt(key, iv, data, pkcs7: true)];
                 }
 
-                return data.Length < 16 ? [] : DecryptLenient(key, data);
+                // Shorter than an initialization vector: nothing to decrypt. Only an empty value is well formed.
+                if (data.Length < 16)
+                {
+                    if (!data.IsEmpty) Interlocked.Increment(ref _damaged);
+                    return [];
+                }
+
+                return DecryptLenient(key, data);
             }
         }
     }
 
     // Damaged files sometimes carry truncated blocks or bad padding; viewers decrypt what they can.
-    private static byte[] DecryptLenient(byte[] key, ReadOnlySpan<byte> data)
+    private byte[] DecryptLenient(byte[] key, ReadOnlySpan<byte> data)
     {
         ReadOnlySpan<byte> iv = data[..16];
         ReadOnlySpan<byte> body = data[16..];
+        if (body.Length % 16 != 0) Interlocked.Increment(ref _damaged);
         body = body[..(body.Length / 16 * 16)];
         if (body.IsEmpty) return [];
         byte[] plain = Compat.AesCbcDecryptNoPadding(key, iv, body);
@@ -285,6 +333,7 @@ internal sealed class StandardSecurity
             if (valid) return plain[..^pad];
         }
 
+        Interlocked.Increment(ref _damaged);
         return plain;
     }
 
@@ -355,7 +404,24 @@ internal sealed class StandardSecurity
     }
 
     private static bool UserMatches(byte[] key, byte[] u, byte[] id0, int r) =>
-        r == 2 ? Rc4.Apply(key, Padding).AsSpan().SequenceEqual(u.AsSpan(0, 32)) : UserHashR3(key, id0).AsSpan().SequenceEqual(u.AsSpan(0, 16));
+        r == 2 ? FixedTimeEquals(Rc4.Apply(key, Padding), u.AsSpan(0, 32)) : FixedTimeEquals(UserHashR3(key, id0), u.AsSpan(0, 16));
+
+    /// <summary>
+    /// Compares secrets (password hashes, keys) in a time that does not depend on where they
+    /// differ, so a caller timing failed attempts learns nothing about the expected value.
+    /// </summary>
+#if NET8_0_OR_GREATER
+    internal static bool FixedTimeEquals(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b) => CryptographicOperations.FixedTimeEquals(a, b);
+#else
+    [MethodImpl(MethodImplOptions.NoInlining | MethodImplOptions.NoOptimization)]
+    internal static bool FixedTimeEquals(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b)
+    {
+        if (a.Length != b.Length) return false;
+        int difference = 0;
+        for (int i = 0; i < a.Length; i++) difference |= a[i] ^ b[i];
+        return difference == 0;
+    }
+#endif
 
     private static byte[] UserHashR3(byte[] key, byte[] id0)
     {

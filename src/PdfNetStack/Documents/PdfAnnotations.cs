@@ -85,6 +85,9 @@ public sealed class PdfAnnotation
     }
 
     internal PdfObject Entry { get; }
+
+    /// <summary>The page the annotation is on.</summary>
+    internal PdfPage Page => _page;
 }
 
 /// <summary>

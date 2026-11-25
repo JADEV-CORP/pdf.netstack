@@ -22,7 +22,7 @@ The source bytes and the candidate bytes are parsed independently. Starting at t
   bytes must match exactly; filters that stay encoded (DCT, JPX, JBIG2, CCITT) must be identical,
   including their parameters and any objects they reference such as `/JBIG2Globals`,
 - JPEG data whose bytes changed is decoded to DCT coefficients on both sides (see below),
-- a bilevel image whose output is CCITT data is decoded to pixels on both sides (see below),
+- a bilevel image whose output is CCITT or JBIG2 data is decoded to pixels on both sides (see below),
 - streams that cannot be decoded must be byte identical with an identical filter chain.
 
 Apart from the structural changes below, bilevel images coded again, and the opt-in image
@@ -77,7 +77,74 @@ head; the same ascender, descender, line gap, caret slope and metric format in h
 version and hinting limits at least as wide; and for each of those glyphs the same outline bytes
 (up to trailing zero padding), the same advance width and the same left side bearing. Glyph names
 (post) are dropped and the name and cmap tables come from one of the merged programs; a
-CIDFontType2 with an identity map selects glyphs by id and reads none of them.
+CIDFontType2 with an identity map selects glyphs by id and reads none of them. Subsets made by
+the pass below may be merged too, so the tables readers never apply may be missing.
+
+**Font subsets.** A TrueType program (FontFile2) or a CFF program (FontFile3 /Type1C or
+/CIDFontType0C) may be replaced by a subset of itself only when every glyph a reader can draw
+from it is known. The verifier finds that out from its own analysis of the source and requires
+all of this:
+
+- the analysis read in full every content stream that can use the program (pages, forms,
+  tiling patterns, Type 3 glyph procedures, soft masks, every state of every appearance) and
+  tied every string shown to its font, and each font using the program is selectable only
+  through resource dictionaries it read in full;
+- no interactive form can draw new text with it: the program is not reached from the AcroForm
+  /DR, no /DA string anywhere names a font that uses it, and the document has no XFA;
+- each font using it is a simple TrueType or Type 1 font with /Widths, or a Type0 font with
+  Identity-H or Identity-V over a CIDFontType2 (identity or stream /CIDToGIDMap) or a
+  CIDFontType0; its descriptor has no /CharSet or /CIDSet; the file is not PDF/A-1.
+
+The glyphs that must survive are worked out on the source. For a composite font, the glyph of
+each CID shown, through /CIDToGIDMap or the CFF charset. For a simple font, every glyph some
+reader could pick for each code shown: through every cmap subtable (the code, the code plus
+0xF000, 0xF100 and 0xF200, and the Unicode value of each candidate name), the glyph names of
+/Differences and of every predefined encoding at that code looked up in post or the CFF
+charset, the program's built-in encoding, and the glyph whose id is the code. Then .notdef,
+every component of a composite glyph and both parts of an accented (seac) glyph, transitively.
+
+Each of those glyphs must keep its outline byte for byte (TrueType glyf data up to zero padding,
+CFF charstrings exactly), its advance width and its left side bearing. Glyph ids never change,
+so /CIDToGIDMap, cmap, post and the charset select the same glyphs as before. Everything else
+that steers rendering must be byte identical: for TrueType every table but glyf, loca and hmtx,
+with head differing only in its checksum and loca format, and only tables readers never apply
+(GSUB, GPOS, GDEF, BASE, JSTF, MATH, kern, morx, mort, kerx, feat, DSIG) allowed to go; for CFF
+the names, strings, charset, encoding, FDSelect, every Top, Font and Private DICT entry other
+than offsets, the number of subroutines, and byte for byte every subroutine those glyphs call,
+directly or through other subroutines, found by running their charstrings. A subroutine nothing
+calls becomes a bare return, so every subroutine keeps its number. Hinting instructions (fpgm,
+prep, cvt, glyph instructions, CFF hints) stay as they were, so hinted rendering matches too.
+Font dictionaries,
+/Widths, /W, /W2, /DW, /Encoding and /ToUnicode go through the graph walk unchanged. The one
+change allowed there is the subset tag of ISO 32000-1, 9.6.4: /BaseFont, the CIDFont's
+/BaseFont and /FontName may gain six capital letters and a plus sign, only when they had no
+tag and the name is not one readers treat specially (the standard 14 names, the Arial, Times,
+Helvetica and Courier aliases some readers map Type 1 fonts to, Symbol and dingbat fonts). A new
+tag is never one the source already uses, and two different output programs never share one.
+Programs with the same content are subset together for all their fonts, so they stay one.
+
+**Type 1 programs as CFF.** With `ConvertType1Fonts` (off by default), a Type 1 program
+(FontFile) may be replaced by a CFF program
+(FontFile3 /Subtype /Type1C) holding every one of its glyphs, when every font using the
+descriptor is a simple Type 1 font and the output is PDF 1.2 or later; the descriptor's /FontFile
+becomes /FontFile3 and the stream drops /Length1 to /Length3. The verifier decrypts the source
+(eexec, binary or hex, and charstrings) and interprets both programs glyph by glyph. Each glyph
+must have the same name, the same advance width and the same path: moves, lines and curves at
+exactly the same coordinates, Type 1 flex against CFF flex with the same depth. Type 1 division
+is taken in 16.16 fixed point, rounded to nearest, as FreeType and pdf.js compute it, so CFF
+holds the result exactly. Hints must match as well: the same stems, grouped the same way at the
+same points of the path (Type 1 hint replacement against CFF hint masks), stem3 hints as the
+same counter groups, and an accented glyph must name the same base and accent at the same
+offset. The font matrix, bounding box, built-in encoding (the glyph named by each code), paint
+type and every Private value that steers hinting (blue zones, blue scale, shift and fuzz,
+standard and snap stem widths, ForceBold, language group, expansion factor) must be equal, and
+the CFF DICTs may hold nothing else that changes rendering. A font that uses anything CFF
+cannot say exactly is left as it is: counter control and other OtherSubrs, dotsection, a
+vertical advance, coordinates out of the 16.16 range, stroked (PaintType 2) or multiple master
+fonts. Rasterizers hint the two formats with separate code: on 220 Type 1 programs from the
+public corpus, FreeType draws 62,347 of 62,748 hinted glyph images alike in both forms, and
+the other 401 differ in the same way for Adobe's own converter (tx), whose output FreeType draws
+identically to this one; PDFium, which draws these fonts without hinting, shows no difference.
 
 **Streams equal after decoding.** Deduplication compares streams by what they decode to, so two
 copies of a font program or image merge even when they were encoded differently. The comparison
@@ -107,16 +174,94 @@ checked again after the walk has read every stream. A merged object is allowed e
 image change its representative got, which is what the output holds for it. Only a proven
 rewrite reaches the destination; otherwise the input is copied there unchanged.
 
+### Encrypted files
+
+With `OptimizeEncryptedFiles`, on by default, a file encrypted with the standard security handler
+that opens with the empty user password, or with `Password`, is rewritten. The passes and the
+proof work on decrypted objects, in memory; nothing decrypted is ever written. The output is
+encrypted as it is written, with the source's own security handler:
+
+- the encryption dictionary is copied unchanged: `/Filter`, `/V`, `/R`, `/Length`, `/P`, `/O`,
+  `/U`, `/OE`, `/UE`, `/Perms`, `/CF`, `/StmF`, `/StrF` and `/EncryptMetadata`,
+- the file key is the source's, and the trailer keeps the source's `/ID`, whose first entry
+  revisions 2 to 4 derive the key from,
+- every string and stream is encrypted with that key under its new object number; a metadata
+  stream stays in the clear when `/EncryptMetadata` is false, as it was.
+
+The proof adds one rule. A standard security handler decides which passwords open a file, in
+which role (user or owner), with which permissions and under which file key, from the encryption
+dictionary and the first `/ID` entry alone (ISO 32000-2, 7.6.4.3 and 7.6.4.4). The verifier
+unlocks the output with the password that opened the source and requires:
+
+- an encryption dictionary equal to the source's, entry by entry,
+- the same first `/ID` entry,
+- the same file key, compared in constant time, and the same role and permissions for that password.
+
+Every password then opens the output exactly as it opens the source, with the same rights; the
+cipher, the key length and the permissions cannot change. The object walk compares both files
+decrypted, as for any file. With `Verify` off this check still runs, since a mistake there would
+lock every reader out of the file. `PdfEquivalence` and `pdfnetstack verify` unlock two encrypted
+files with the empty user password and apply the same rule.
+
+Left as they are, with the reason in the result:
+
+- files that need a password that was not given,
+- other security handlers (public key, custom), and versions and revisions outside the
+  standard pairs (`/V` 1 or 2 with `/R` 2 or 3, `/V` 4 with `/R` 4, `/V` 5 with `/R` 5 or 6),
+- crypt filter settings the reader would decrypt one way and the writer encrypt another: an
+  `/EFF` of its own for embedded files, a filter named but not defined, a method the version does
+  not define, a `/Crypt` filter chosen by a stream, `/EncryptMetadata` false before version 4,
+- AES data of a wrong length or padding, which viewers recover in different ways, unless
+  `AllowRepairedFiles` is set,
+- signed files, and files with usage rights unless `RemoveUsageRights` applies,
+- files that claim PDF/A conformance, which forbids encryption.
+
+An encrypted file is not linearized: the linearized writer does not encrypt. Streaming mode
+encrypts each object as it is written and proves the result the same way.
+
 ### Linearized output
 
 A linearized file holds the same objects as any other rewrite, so the proof above covers its
 content. Its layout is checked separately. The tests read every linearized file back and check
 the linearization dictionary against the file (`/L`, `/O`, `/E`, `/N`, `/T`, `/H`), both
 cross-reference sections, and every entry of the page offset, shared object and outline hint
-tables against the real offsets and lengths of the objects. `tools/measure_optimizer.py
---linearize` also runs qpdf's `--check-linearization` on each output when qpdf, or pikepdf with
-its bundled libqpdf, is installed. The objects are assigned to the parts of Annex F the way qpdf
-assigns them, so its check computes the same layout.
+tables against the real offsets and lengths of the objects, an object in an object stream
+counting as the object stream; and that everything the first page uses ends before `/E`. Where
+qpdf 12.4.2 or later is installed, they also run its `--check-linearization` on each output.
+`tools/measure_optimizer.py --linearize` runs that check too, with qpdf or pikepdf. The objects
+are assigned to the parts of Annex F the way qpdf 12.4.2 assigns them, so its check computes
+the same layout. An object a page shares with the outlines or the structure tree goes with the
+page; qpdf before 12.4.2 put it in part 9, and its check reports such files.
+
+With object streams (the default, except for PDF/A-1) objects are packed only with objects of
+the same part, and page objects and the catalog stay outside object streams, as readers of the
+hint tables expect. A later page whose own objects come to 4 KB gets an object stream in its
+own section; smaller groups are pooled in page order with the objects later pages share, in
+part 8 streams that each page using them lists. Both cross-reference sections are streams, and
+in each the objects in object streams are numbered after the others. A reader of the hint
+tables takes an object stream in place of the objects it holds, used by whatever uses any of
+them, so the parts are computed again that way and the file is laid out by them. If the object
+streams cannot be laid out, the file is written without them and the result says why.
+
+Size against the plain rewrite of the same input, before and after object streams. qpdf
+12.4.2's `--check-linearization` passed on the linearized rewrite of each of the 65 public
+corpus files the optimizer rewrites (the other 12 are signed or encrypted) and of the synthetic
+samples; the classic layout drew warnings on four of the files below:
+
+| File | Plain | Linearized before | Linearized now |
+|---|---:|---:|---:|
+| NIST SP 800-53 Rev. 5 (492 pages, tagged) | 4,969,226 | +113.5% | +4.1% |
+| NIST SP 800-63-3 | 1,298,287 | +26.4% | +1.5% |
+| NIST FIPS 197 | 520,406 | +178.7% | +2.8% |
+| NASA SE handbook | 3,687,892 | +3.4% | +1.3% |
+| CDC MMWR 72-01 | 257,693 | +151.6% | +10.4% |
+| arXiv papers (8) | | +0.6% to +10.4% | +0.1% to +0.8% |
+
+What remains is mostly the page objects, written on their own, and a few hundred bytes of hint
+and cross-reference streams: CDC MMWR keeps 2.4 KB of InDesign `/PieceInfo` in each page
+dictionary (`RemovePieceInfo` drops it), and a file of a few kilobytes grows by those fixed
+parts. The first page section ends earlier too: `/E` at 166,603 bytes in the NIST file, against
+244,436.
 
 ### Bilevel images
 
@@ -141,6 +286,27 @@ different ways, so only data every reader takes alike counts, on both sides:
 
 Anything else must match as it was, encoded bytes and parameters included. Group 3 data with a
 flaw, or with parameters a reader could take differently, is never coded again.
+
+With `UseJbig2` (on by default) each such image is also coded as JBIG2 (ITU-T T.88) and keeps
+whichever of Group 4 and JBIG2 is smaller; output that stays below PDF 1.4, which has no
+JBIG2Decode, gets Group 4 only. Only generic region coding is written, which is lossless, never
+symbol coding, which matches glyphs by likeness and can show one character in place of another.
+The stream is the embedded organisation PDF uses (ISO 32000-1, 7.4.7), with no file header and
+no JBIG2Globals: one page information segment and one immediate generic region over the whole
+page, arithmetic coded with template 0, its adaptive pixels at their nominal places, typical
+prediction on, and the coded data ended by the 0xFFAC marker. JBIG2Decode gives a reader the
+inverse of the T.88 bitmap, so the bitmap coded is the samples inverted, whatever the samples
+mean. The optimizer decodes every JBIG2 image it would keep before keeping it. jbig2dec reads the
+same pixels (a test checks this where it is installed), and the coded data matches what jbig2enc
+writes in generic mode to a few bytes.
+
+The proof accepts JBIG2 data in place of samples or CCITT data, again only by its pixels, and
+only in the form every reader decodes alike, the form written here: the page information segment
+of exactly the image's size, white by default and not striped; one immediate generic region over
+the whole page at its origin, drawn by OR or REPLACE, arithmetic coded with a standard template
+and its adaptive pixels at their nominal places, its data ended by the 0xFFAC marker so that no
+reader reads past it; nothing after but an end of page or end of file; and no JBIG2Globals.
+JBIG2 data in any other form must match as it was.
 
 ### JPEG images
 
@@ -187,6 +353,36 @@ is a ridge across or along the image (covered more than the neighbour before it 
 much as the one after it): the middle of a stroke thinner than the new pixels, which plain
 thresholding would erase. The arithmetic is exact and in a fixed order, so the proof reproduces
 the reduction bit for bit and the optimizer's own output reaches SSIM 1 against it.
+
+### Lossy changes proven when written
+
+The bounds above take decoding both images, resampling the source and comparing them, which on
+a scanned book is as much work as making the change. When the optimizer proves its own output,
+it does not do that work twice. As it writes a changed image it checks that image against the
+same bounds, on the same images, with the same functions, and records a key for the check: a
+SHA-256 over both images after their general filters (samples only up to the size the
+dictionary gives them, which is all a decoder reads; coded data whole), how each is coded and
+sized (width, height, components, bits, coding, JPEG color transform, CCITT parameters, palette),
+the JBIG2Globals of each, and the gate. A requantized JPEG gets a key over both images and its
+color transform and the gate, once its SSIM met the gate. The proof then reads both images as
+always, undoes their general filters, makes every check that needs no pixels (same components
+and bit depth, no larger, the same aspect, coded as the dictionary says, and for JPEG the exact
+requantization of every coefficient), computes the key from what it read and looks it up. A
+changed image whose key was not recorded is refused, whatever its pixels: the output holds
+something other than what was checked. A key only skips work: anything that differs in any
+input gives another key. Outputs whose pixels are by construction the reference itself (samples
+under Flate, a palette under Flate, bilevel samples, Group 4 or JBIG2 data of the reduced
+bitmap) count as checked once their data is known to decode to it: under Flate the key's hash
+is of the samples the proof inflates, and Group 4 and JBIG2 data is decoded before it is kept.
+`PdfEquivalence` and `pdfnetstack verify` have no keys and check every changed image in full.
+
+Images that cannot gain are not decoded in the first place. A lossy candidate must cost less
+than 90% of the best lossless encoding, which is never more than the stored one; the JPEG
+encoder writes at least two bits for every 8 by 8 block (a DC code and an end of block, or in
+progressive coding a DC code and its refinement bit), so an image stored in fewer bytes than
+that for its size can never become a smaller JPEG. Such images, and images under 256 bytes,
+are left out before their data is read, unless they are downsampled and could still win as
+samples.
 
 The coefficient reader is itself checked against libjpeg: test fixtures written by libjpeg-turbo
 in baseline, optimized, progressive and restart marker layouts of the same image must decode to
@@ -261,13 +457,34 @@ PSNR says little. Read side by side, the reduced pages keep every stroke, rule a
   numbers, names, strings, comments and inline images, a randomized round trip, and every kind
   of token change caught; font merging with glyph conflicts, glyphs past the end of a subset and
   changed outlines; mutated inputs that must never throw.
-- Linearization: the layout checks above on documents with one and many pages, shared fonts,
-  bookmarks in and out of the first page, form fields, an open action and inherited attributes;
-  page trees it cannot lay out; mutated inputs.
+- Font subsets and Type 1 conversion: simple and composite TrueType and CFF fonts subset with
+  every glyph a reader could pick, composite components and subroutine numbers kept; fonts that
+  forms can draw with, fonts a /DA string names, special names and unreadable content left whole;
+  every change the subset proof must catch (a shown glyph, a used table or subroutine); Type 1
+  programs written in code with hint replacement, flex, seac, stem3, division, sbw and hex eexec,
+  converted and proven, and each feature CFF cannot express refused; mutated Type 1 programs
+  that may only fail as font errors.
+- Linearization: the layout checks above, with and without object streams, on documents with
+  one and many pages, shared fonts, bookmarks in and out of the first page, form fields, an open
+  action and inherited attributes, and on tagged documents of many small objects, against the
+  size of the plain rewrite; PDF/A-1 written without object streams; page trees it cannot lay
+  out; mutated inputs.
 - JPEG: libjpeg-turbo fixtures (4:2:0, 4:2:2, 4:4:4, gray, Adobe CMYK, untransformed RGB, odd
   sizes) in baseline, optimized, progressive and restart marker layouts; lossless and requantized
   round trips; soft masks, Flate wrapped JPEG, color space mismatches, palettes, damaged and
   truncated data, unsupported coding processes, and mutated inputs that must never throw.
+- JBIG2: the generic region encoder round tripped at every width from 1 to 40 pixels and up to
+  2551, blank and full pages, the inversion of PDF samples, jbig2dec reading the same pixels,
+  scanned text at least 10% under Group 4, the encoder giving up past its limit, the decoder's
+  fast path for nominal template 0 against its general case, and every departure from the plain
+  form (another size, black by default, stripes, XOR, MMR, moved adaptive pixels, referred-to
+  segments, no end marker, a second region, a file header, symbol coding) refused by the proof.
+- Lossy proof keys: a resampled image and a requantized JPEG each pass with the key recorded
+  when they were written, and are refused with one sample off, another quality, another gate or
+  no key, though the full check would let the first two through. The JPEG size floor holds for
+  flat and photographic images in gray, RGB and CMYK at qualities 5 to 95; images under it are
+  never planned for decoding. JPEG 2000 decoded straight to samples, and with one workspace
+  serving image after image in either order, gives the same samples as a fresh decode to planes.
 - Bilevel images: the Group 4 encoder byte for byte against libtiff, round trips of random rows
   at widths from 1 to 9000 pixels with runs past 2560 in both polarities, the libtiff Group 3
   fixtures coded again as Group 4, stencil masks, palettes, /Decode and predictors; Group 3 with
@@ -276,6 +493,14 @@ PSNR says little. Read side by side, the reduced pages keep every stroke, rule a
   JBIG2 and raw scans with thin strokes kept, and bad reductions (another page, too dark, plain
   subsampling, gray output) rejected; JPEG 2000 converted and reduced, and the JPEG 2000 images
   the dictionary cannot describe left alone; mutated fax and JBIG2 data that must never throw.
+- Encryption: files written in code with every revision the library writes (RC4 40 bit at
+  revisions 2 and 3, RC4 128 bit, AES-128, AES-256), with and without `/EncryptMetadata` false
+  and object streams, holding strings in arrays, name trees, annotations and XMP; each output
+  opens with the same user and owner passwords in the same roles, under the same key and
+  dictionary, keeps decrypted content equal, and stores in the clear only what the source did;
+  qpdf `--check` and `--show-encryption` agree on source and output. Passwords given or
+  needed, streaming mode, every refusal rule, and protection the proof must catch (decrypted,
+  new key, fewer rights, another user password, another role).
 - Fuzzing: mutated inputs (byte flips, deletions, truncation, injected tokens, duplicated
   regions) must never throw and must produce either the exact input or a verified rewrite.
   CI runs 600 cases; set `PDFNETSTACK_FUZZ_ITERATIONS` for a long soak. 20,000 cases pass locally.

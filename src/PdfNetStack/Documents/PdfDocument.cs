@@ -44,6 +44,13 @@ public sealed record PdfSaveOptions
     /// metadata the standard requires.
     /// </summary>
     public PdfConformance Conformance { get; init; }
+
+    /// <summary>
+    /// An accessibility standard to conform to, such as PDF/UA-1, alone or with a
+    /// <see cref="Conformance"/> level. Saving repairs what it can, then throws listing every
+    /// rule the content breaks that the library can check; see <see cref="PdfAccessibility.PdfUA1"/>.
+    /// </summary>
+    public PdfAccessibility Accessibility { get; init; }
 }
 
 /// <summary>
@@ -58,7 +65,7 @@ public sealed record PdfSaveOptions
 /// A document read on demand (<see cref="PdfLoadMode.OnDemand"/>) holds its file until it is
 /// disposed; disposing any other document does nothing.
 /// </remarks>
-public sealed class PdfDocument : IDisposable
+public sealed partial class PdfDocument : IDisposable
 {
     /// <summary>
     /// Levels of /Pages nodes read. Real trees are a handful of levels deep; the bound keeps a
@@ -80,6 +87,7 @@ public sealed class PdfDocument : IDisposable
     /// <summary>The Factur-X invoice attached with <see cref="PdfInvoice.Attach"/>, written to the PDF/A-3 metadata on save.</summary>
     internal InvoiceMetadata? Invoice { get; set; }
     private PdfOutlineCollection? _outlines;
+    private PdfStructureTree? _structure;
 
     private PdfDocument(string version, StandardSecurity? security = null)
     {
@@ -190,6 +198,13 @@ public sealed class PdfDocument : IDisposable
 
     /// <summary>Document information: title, author, dates and custom entries.</summary>
     public PdfDocumentInfo Info { get; }
+
+    /// <summary>
+    /// The logical structure of a tagged PDF: headings, paragraphs, tables, figures and their
+    /// reading order. Created on first access, keeping the structure tree of an opened file; tag
+    /// content while drawing with <see cref="Drawing.PdfGraphics.BeginTag(PdfStructureType)"/>.
+    /// </summary>
+    public PdfStructureTree Structure => _structure ??= new PdfStructureTree(this);
 
     /// <summary>The bookmark tree. Loaded on first access.</summary>
     public PdfOutlineCollection Outlines => _outlines ??= PdfOutlineCollection.Load(this);
@@ -1103,6 +1118,7 @@ public sealed class PdfDocument : IDisposable
         FinishFonts();
         if (Pages.Count == 0) throw new InvalidOperationException("A PDF must have at least one page.");
         _outlines?.WriteTo(this);
+        _structure?.WriteTo();
 
         PdfFile baseline = _baseline ??= _file.Fork();
         if (!PageTreeUnchanged(baseline))
@@ -1430,10 +1446,14 @@ public sealed class PdfDocument : IDisposable
             throw new InvalidOperationException("A Factur-X or ZUGFeRD invoice must be saved as PDF/A-3: set PdfSaveOptions.Conformance to PdfA3B or PdfA3U.");
         }
 
-        // Bookmarks are written first, so PDF/A sees their actions as they will be saved.
+        // Bookmarks and tags are written first, so PDF/A and PDF/UA see them as they will be saved.
         _outlines?.WriteTo(this);
+        _structure?.WriteTo();
+        bool accessible = options.Accessibility == PdfAccessibility.PdfUA1;
+        if (accessible) PdfUniversalAccess.Prepare(this);
         int archive = PdfArchive.Part(options.Conformance);
-        if (archive != 0) PdfArchive.Prepare(this, options.Conformance);
+        if (archive != 0) PdfArchive.Prepare(this, options.Conformance, accessible);
+        else if (accessible) PdfArchive.WriteMetadata(this, 0, null, null, accessible);
         Security.RequireOwner();
 
         CompressionLevel level = options.Compression switch

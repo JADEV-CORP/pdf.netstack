@@ -47,6 +47,10 @@ namespace PdfNetStack.Cli
               --no-prune                Keep resources no content uses
               --no-compact              Do not rewrite content streams compactly
               --no-font-merge           Do not merge subsets of one TrueType font
+              --no-font-subset          Do not subset fully embedded TrueType and CFF fonts
+              --convert-type1           Rewrite Type 1 fonts as CFF (same outlines and hints;
+                                        hinted rasterizers may draw a few small glyphs
+                                        a pixel apart)
               --linearize               Write a linearized file (fast web view)
               --streaming               Read the input on demand and write the rewrite
                                         through a temporary file, proven there: memory
@@ -54,6 +58,9 @@ namespace PdfNetStack.Cli
                                         inputs of any size are accepted
               --no-recompress           Do not re-encode streams
               --no-group4               Do not re-encode bilevel images as CCITT Group 4
+                                        or JBIG2
+              --no-jbig2                Code bilevel images as CCITT Group 4 only, never
+                                        as JBIG2
               --no-image-predictors     Do not try PNG prediction on raw images
               --no-jpeg                 Do not re-encode JPEG images
               --jpeg-quality <1-100>    Requantize JPEG images to this quality (lossy);
@@ -79,6 +86,10 @@ namespace PdfNetStack.Cli
               --strip-pieceinfo         Remove application private data (not lossless)
               --remove-usage-rights     Rewrite files whose only signature is Adobe Reader
                                         usage rights (/UR3), removing them
+              --password <password>     Open encrypted inputs with this user or owner
+                                        password (the empty user password is tried too)
+              --no-encrypted            Leave encrypted files as they are (default: rewrite
+                                        those that open, encrypted again as they were)
               --min-saving <percent>    Minimum saving to keep a rewrite (default 1)
               --threads <n>             Threads per document (default: all cores)
               --jobs <n>                Documents processed in parallel by batch (default: all cores)
@@ -176,7 +187,7 @@ namespace PdfNetStack.Cli
                 {
                     Console.WriteLine($"pages {result.PageCount}, objects {s.ObjectsInFile} -> {s.ObjectsWritten} " +
                                       $"(unreachable {s.UnreachableRemoved}, merged {s.ObjectsDeduplicated}), " +
-                                      $"streams re-encoded {s.StreamsRecompressed} (JPEG {s.JpegImagesRecompressed}, requantized {s.JpegImagesRequantized}, Group 4 {s.ImagesRecodedAsGroup4}), " +
+                                      $"streams re-encoded {s.StreamsRecompressed} (JPEG {s.JpegImagesRecompressed}, requantized {s.JpegImagesRequantized}, Group 4 {s.ImagesRecodedAsGroup4}, JBIG2 {s.ImagesRecodedAsJbig2}), " +
                                       $"objects verified {s.ObjectsVerified}");
                     if (s.ImagesDownsampled + s.ImagesConvertedToJpeg + s.ImagesQuantized + s.ImagesKeptByQualityGate > 0)
                     {
@@ -185,7 +196,7 @@ namespace PdfNetStack.Cli
                     }
 
                     Console.WriteLine($"resources pruned {s.ResourcesPruned}, content streams compacted {s.ContentStreamsCompacted}, " +
-                                      $"font programs merged {s.FontProgramsMerged}{(s.Linearized ? ", linearized" : "")}{(s.Streamed ? ", streamed" : "")}");
+                                      $"font programs merged {s.FontProgramsMerged}{(s.Linearized ? ", linearized" : "")}{(s.Streamed ? ", streamed" : "")}{(s.Reencrypted ? ", encrypted again" : "")}");
                     PhaseTimings p = s.Phases;
                     Console.WriteLine($"analyze {p.Analyze.TotalMilliseconds:F0} ms, content {p.Content.TotalMilliseconds:F0} ms, recompress {p.Recompress.TotalMilliseconds:F0} ms, " +
                                       $"dedup {p.Deduplicate.TotalMilliseconds:F0} ms, write {p.Write.TotalMilliseconds:F0} ms, verify {p.Verify.TotalMilliseconds:F0} ms");
@@ -560,10 +571,13 @@ namespace PdfNetStack.Cli
                     case "--no-prune": o = o with { PruneUnusedResources = false }; break;
                     case "--no-compact": o = o with { CompactContentStreams = false }; break;
                     case "--no-font-merge": o = o with { MergeFontSubsets = false }; break;
+                    case "--no-font-subset": o = o with { SubsetFonts = false }; break;
+                    case "--convert-type1": o = o with { ConvertType1Fonts = true }; break;
                     case "--linearize": o = o with { Linearize = true }; break;
                     case "--streaming": o = o with { Streaming = true, MaxInputBytes = long.MaxValue }; break;
                     case "--no-recompress": o = o with { RecompressStreams = false }; break;
                     case "--no-group4": o = o with { OptimizeBilevelImages = false }; break;
+                    case "--no-jbig2": o = o with { UseJbig2 = false }; break;
                     case "--no-image-predictors": o = o with { UseImagePredictors = false }; break;
                     case "--no-jpeg": o = o with { OptimizeJpegImages = false }; break;
                     case "--jpeg-quality": o = o with { JpegQuality = int.Parse(Value(args, ref i), CultureInfo.InvariantCulture) }; break;
@@ -581,6 +595,7 @@ namespace PdfNetStack.Cli
                     case "--strip-thumbnails": o = o with { RemovePageThumbnails = true }; break;
                     case "--strip-pieceinfo": o = o with { RemovePieceInfo = true }; break;
                     case "--remove-usage-rights": o = o with { RemoveUsageRights = true }; break;
+                    case "--no-encrypted": o = o with { OptimizeEncryptedFiles = false }; break;
                     case "--min-saving": o = o with { MinSavingPercent = double.Parse(Value(args, ref i), CultureInfo.InvariantCulture) }; break;
                     case "--threads":
                         o = o with { MaxDegreeOfParallelism = int.Parse(Value(args, ref i), CultureInfo.InvariantCulture) };
@@ -605,7 +620,8 @@ namespace PdfNetStack.Cli
                 }
             }
 
-            a.Options = o;
+            // --password opens encrypted inputs for the optimizer as for the editing commands.
+            a.Options = o with { Password = a.Password };
             return a;
         }
 

@@ -34,6 +34,18 @@ internal sealed class ResourceBudget
     /// </summary>
     public System.Buffers.ArrayPool<byte>? Pool { get; init; }
 
+    /// <summary>
+    /// JPEG 2000 decoder workspaces of this run, each lent to one decode at a time: a scanned book
+    /// decodes hundreds of images of one size, and their band buffers, tens of megabytes each, are
+    /// then allocated once per worker. Collected with the run.
+    /// </summary>
+    private readonly System.Collections.Concurrent.ConcurrentBag<Imaging.Jpeg2000Workspace> _jpeg2000 = [];
+
+    /// <summary>A workspace for one JPEG 2000 decode, to give back with <see cref="Return"/>.</summary>
+    public Imaging.Jpeg2000Workspace RentJpeg2000() => _jpeg2000.TryTake(out Imaging.Jpeg2000Workspace? workspace) ? workspace : new();
+
+    public void Return(Imaging.Jpeg2000Workspace workspace) => _jpeg2000.Add(workspace);
+
     /// <summary>Decoded bytes still allowed; negative once the budget is spent.</summary>
     public long DecodedBytesLeft => Interlocked.Read(ref _decodedLeft);
 

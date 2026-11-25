@@ -37,6 +37,12 @@ public enum PdfFileRelationship
 
     /// <summary>The file is an equivalent representation of the document, as a full invoice XML is.</summary>
     Alternative,
+
+    /// <summary>The file adds to the document's content. Read from other producers; Factur-X does not allow it.</summary>
+    Supplement,
+
+    /// <summary>The relationship is not known. Read from other producers; Factur-X does not allow it.</summary>
+    Unspecified,
 }
 
 /// <summary>Options for <see cref="PdfInvoice.Attach"/>.</summary>
@@ -68,7 +74,7 @@ public sealed record PdfInvoiceOptions
 /// <see cref="PdfConformance.PdfA3B"/> or <see cref="PdfConformance.PdfA3U"/>; saving checks that
 /// the attachment is still there with an allowed name and relationship.
 /// </remarks>
-public static class PdfInvoice
+public static partial class PdfInvoice
 {
     /// <summary>The attachment name Factur-X 1.0 and ZUGFeRD 2 define.</summary>
     public const string FacturXFileName = "factur-x.xml";
@@ -95,7 +101,7 @@ public static class PdfInvoice
         CheckWellFormed(xml);
 
         PdfFileRelationship relationship = options.Relationship ?? (profile is PdfInvoiceProfile.Minimum or PdfInvoiceProfile.BasicWL ? PdfFileRelationship.Data : PdfFileRelationship.Alternative);
-        if (relationship is not (PdfFileRelationship.Data or PdfFileRelationship.Source or PdfFileRelationship.Alternative)) throw new ArgumentException("Unknown relationship.", nameof(options));
+        if (relationship is not (PdfFileRelationship.Data or PdfFileRelationship.Source or PdfFileRelationship.Alternative)) throw new ArgumentException("Factur-X allows the Data, Source or Alternative relationship only.", nameof(options));
 
         // Another invoice attachment would leave readers guessing which one counts.
         foreach (string other in new[] { FacturXFileName, XRechnungFileName, "zugferd-invoice.xml", "ZUGFeRD-invoice.xml" })

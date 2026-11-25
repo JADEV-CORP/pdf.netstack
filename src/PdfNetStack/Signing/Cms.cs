@@ -19,12 +19,15 @@ internal static class Cms
     public const string SigningCertificateV2 = "1.2.840.113549.1.9.16.2.47";
     public const string SignatureTimeStampToken = "1.2.840.113549.1.9.16.2.14";
 
-    /// <summary>Signs a digest; <paramref name="timestamp"/> turns the signature value into a timestamp token to attach.</summary>
-    public static byte[] Sign(byte[] digest, HashAlgorithmName hash, X509Certificate2 certificate, byte[][] chain, Func<byte[], byte[]>? timestamp = null)
+    /// <summary>
+    /// The signed attributes over a document digest, DER encoded as the SET the signer signs.
+    /// Nothing in them varies between calls (PAdES keeps the claimed signing time in the
+    /// signature dictionary, not here), so the same inputs always give the same bytes: a deferred
+    /// signature rebuilds them from its state instead of storing them.
+    /// </summary>
+    public static byte[] SignedAttributes(byte[] digest, HashAlgorithmName hash, X509Certificate2 certificate)
     {
-        byte[] digestAlgorithm = Der.Seq(Der.Oid(Pkix.HashOid(hash)));
         byte[] serial = Pkix.SerialNumber(certificate);
-        byte[] issuerSerial = Der.Seq(certificate.IssuerName.RawData, Der.IntRaw(serial));
 
         // ESS signing certificate v2: the certificate's hash binds it to the signature. SHA-256,
         // the default, is not written out.
@@ -32,7 +35,7 @@ internal static class Cms
         byte[] essIssuerSerial = Der.Seq(Der.Seq(Der.Context(4, true, certificate.IssuerName.RawData)), Der.IntRaw(serial));
         byte[] essCertId = hash == HashAlgorithmName.SHA256
             ? Der.Seq(Der.Octets(certHash), essIssuerSerial)
-            : Der.Seq(digestAlgorithm, Der.Octets(certHash), essIssuerSerial);
+            : Der.Seq(Der.Seq(Der.Oid(Pkix.HashOid(hash))), Der.Octets(certHash), essIssuerSerial);
 
         byte[][] attributes =
         [
@@ -40,22 +43,55 @@ internal static class Cms
             Der.Seq(Der.Oid(MessageDigestAttribute), Der.SetOf(Der.Octets(digest))),
             Der.Seq(Der.Oid(SigningCertificateV2), Der.SetOf(Der.Seq(Der.Seq(essCertId)))),
         ];
+        return Der.SetOf(attributes);
+    }
+
+    /// <summary>The AlgorithmIdentifier of the signature value in the SignerInfo.</summary>
+    public static byte[] SignatureAlgorithm(PdfSignatureAlgorithm algorithm, HashAlgorithmName hash)
+    {
+        switch (algorithm)
+        {
+            case PdfSignatureAlgorithm.RsaPss:
+            {
+                // RFC 4055 and RFC 4056: the parameters are always explicit, MGF1 uses the same
+                // hash, and the salt is as long as the hash, which is what .NET, cloud key
+                // services and HSMs produce. The hash identifiers carry NULL, as RFC 4055 writes them.
+                byte[] hashId = Der.Seq(Der.Oid(Pkix.HashOid(hash)), Der.NullValue());
+                byte[] mgf = Der.Seq(Der.Oid(Pkix.Mgf1), hashId);
+                byte[] parameters = Der.Seq(Der.Context(0, true, hashId), Der.Context(1, true, mgf), Der.Context(2, true, Der.Int(Pkix.HashLength(hash))));
+                return Der.Seq(Der.Oid(Pkix.RsaPss), parameters);
+            }
+
+            case PdfSignatureAlgorithm.Ecdsa:
+                return Der.Seq(Der.Oid(Pkix.EcdsaOid(hash)));
+            default:
+                // Plain rsaEncryption with the hash in the digest algorithm, as this library has
+                // always written PKCS #1 v1.5 signatures; every CMS and PAdES validator reads it.
+                return Der.Seq(Der.Oid(Pkix.RsaEncryption), Der.NullValue());
+        }
+    }
+
+    /// <summary>
+    /// Assembles the detached SignedData around a signature of <paramref name="signedAttributes"/>.
+    /// A signature timestamp token, when given, goes in the unsigned attributes.
+    /// </summary>
+    public static byte[] Build(byte[] signedAttributes, HashAlgorithmName hash, X509Certificate2 certificate, byte[][] chain, byte[] signatureAlgorithm, byte[] signature, byte[]? timestampToken)
+    {
+        byte[] digestAlgorithm = Der.Seq(Der.Oid(Pkix.HashOid(hash)));
+        byte[] issuerSerial = Der.Seq(certificate.IssuerName.RawData, Der.IntRaw(Pkix.SerialNumber(certificate)));
 
         // The signature covers the attributes encoded as a SET; in the SignerInfo they carry tag [0].
-        byte[] signedSet = Der.SetOf(attributes);
-        byte[] signedAttributes = Der.Concat([0xA0], signedSet.AsSpan(1).ToArray());
-        (byte[] signature, byte[] signatureAlgorithm) = SignBytes(signedSet, hash, certificate);
+        byte[] signed = Der.Concat([0xA0], signedAttributes.AsSpan(1).ToArray());
 
         // The timestamp covers the signature value, and goes in the unsigned attributes [1].
         byte[] unsigned = [];
-        if (timestamp is not null)
+        if (timestampToken is not null)
         {
-            byte[] token = timestamp(signature);
-            byte[] set = Der.SetOf(Der.Seq(Der.Oid(SignatureTimeStampToken), Der.SetOf(token)));
+            byte[] set = Der.SetOf(Der.Seq(Der.Oid(SignatureTimeStampToken), Der.SetOf(timestampToken)));
             unsigned = Der.Concat([0xA1], set.AsSpan(1).ToArray());
         }
 
-        byte[] signerInfo = Der.Seq(Der.Int(1), issuerSerial, digestAlgorithm, signedAttributes, signatureAlgorithm, Der.Octets(signature), unsigned);
+        byte[] signerInfo = Der.Seq(Der.Int(1), issuerSerial, digestAlgorithm, signed, signatureAlgorithm, Der.Octets(signature), unsigned);
         byte[] certificates = Der.Context(0, true, Der.Concat([certificate.RawData, .. chain]));
         byte[] signedData = Der.Seq(
             Der.Int(1),
@@ -80,21 +116,6 @@ internal static class Cms
         if (!info.DigestMatches) info.Problem = "The document changed after it was signed.";
         else if (!info.SignatureValid) info.Problem = parsed.Problem ?? "The signature does not verify with the signer's certificate.";
         return parsed;
-    }
-
-    private static (byte[] Signature, byte[] Algorithm) SignBytes(byte[] data, HashAlgorithmName hash, X509Certificate2 certificate)
-    {
-        using (RSA? rsa = certificate.GetRSAPrivateKey())
-        {
-            if (rsa is not null)
-            {
-                return (rsa.SignData(data, hash, RSASignaturePadding.Pkcs1), Der.Seq(Der.Oid(Pkix.RsaEncryption), Der.NullValue()));
-            }
-        }
-
-        using ECDsa ecdsa = certificate.GetECDsaPrivateKey() ?? throw new ArgumentException("The certificate's key must be RSA or ECDSA.", nameof(certificate));
-        byte[] raw = ecdsa.SignData(data, hash);
-        return (Pkix.P1363ToDer(raw), Der.Seq(Der.Oid(Pkix.EcdsaOid(hash))));
     }
 }
 

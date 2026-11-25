@@ -44,6 +44,18 @@ internal sealed class ReferenceIndex
     /// <summary>Arrays that are a page's /Contents.</summary>
     public HashSet<PdfArray> ContentArrays { get; } = [];
 
+    /// <summary>Values of /DR entries: the resources interactive forms draw new text with.</summary>
+    public HashSet<PdfDictionary> FormResourceDictionaries { get; } = [];
+
+    /// <summary>
+    /// Values of /DA entries (default appearance strings of form fields, widgets, free text
+    /// annotations and the AcroForm), which name fonts a viewer may draw new text with.
+    /// </summary>
+    public List<PdfString> DefaultAppearances { get; } = [];
+
+    /// <summary>True when some dictionary has an /XFA entry: an XFA form may draw text with any font.</summary>
+    public bool HasXfa { get; private set; }
+
     /// <param name="order">The reachable indirect objects.</param>
     /// <param name="ignoredKeys">Entries whose references do not count, for keys that opt-in stripping removes.</param>
     public static ReferenceIndex Build(PdfFile file, IEnumerable<int> order, IEnumerable<string> ignoredKeys, CancellationToken ct)
@@ -137,7 +149,18 @@ internal sealed class ReferenceIndex
         switch (key)
         {
             case "Resources" or "DR":
-                if (_file.Resolve(value) is PdfDictionary resources) ResourceDictionaries.Add(resources);
+                if (_file.Resolve(value) is PdfDictionary resources)
+                {
+                    ResourceDictionaries.Add(resources);
+                    if (key == "DR") FormResourceDictionaries.Add(resources);
+                }
+
+                break;
+            case "DA":
+                if (_file.Resolve(value) is PdfString appearance) DefaultAppearances.Add(appearance);
+                break;
+            case "XFA":
+                HasXfa = true;
                 break;
             case "AP":
                 if (_file.Resolve(value) is PdfDictionary ap) AppearanceDictionaries.Add(ap);

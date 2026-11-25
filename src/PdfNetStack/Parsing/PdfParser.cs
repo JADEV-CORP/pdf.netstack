@@ -52,6 +52,9 @@ internal sealed class PdfParser
 
     public int Position { get; set; }
 
+    /// <summary>Shares the names a file repeats, as one string and one <see cref="PdfName"/> each; null decodes every name anew.</summary>
+    public NameTable? Names { get; set; }
+
     public int Length => _data.Length;
 
     public ReadOnlySpan<byte> Span => _data.Span;
@@ -226,22 +229,20 @@ internal sealed class PdfParser
             case TokenKind.Number:
             {
                 ReadOnlySpan<byte> text = s[t.Start..t.End];
-                if (TryParseInteger(text, out long n) && n >= 0 && n <= int.MaxValue)
+                if (TryParseInteger(text, out long n) && n >= 0 && n <= int.MaxValue && ReferenceFollows(out long gen))
                 {
-                    int afterFirst = Position;
-                    if (TryReadInteger(out long gen) && gen >= 0 && gen <= 65535 && TryReadKeyword("R"u8))
-                    {
-                        return new PdfReference((int)n, (int)gen);
-                    }
-
-                    Position = afterFirst;
+                    return new PdfReference((int)n, (int)gen);
                 }
 
                 return PdfNumber.Parse(text);
             }
 
             case TokenKind.Name:
-                return new PdfName(DecodeName(s[(t.Start + 1)..t.End]));
+            {
+                ReadOnlySpan<byte> raw = s[(t.Start + 1)..t.End];
+                return Names is { } names ? names.GetName(raw) : new PdfName(DecodeName(raw));
+            }
+
             case TokenKind.LiteralString:
                 return new PdfString(DecodeLiteralString(s[(t.Start + 1)..t.End]));
             case TokenKind.HexString:
@@ -286,6 +287,158 @@ internal sealed class PdfParser
         }
     }
 
+    /// <summary>
+    /// Steps over one direct object exactly as <see cref="ParseObject"/> reads it, ending at the
+    /// same position, counting the same tokens and failing on the same input, without building
+    /// it. Returns the kind of the object's first token: a reference reads as a number.
+    /// </summary>
+    public TokenKind SkipObject(int depth = 0)
+    {
+        if (depth == 0) NestingExceeded = false;
+        if (depth > MaxNesting)
+        {
+            NestingExceeded = true;
+            throw new PdfFormatException("Object nesting exceeds the supported depth.");
+        }
+
+        Token t = NextToken();
+        ReadOnlySpan<byte> s = Span;
+        switch (t.Kind)
+        {
+            case TokenKind.Number:
+                if (TryParseInteger(s[t.Start..t.End], out long n) && n >= 0 && n <= int.MaxValue) ReferenceFollows(out _);
+                return TokenKind.Number;
+            case TokenKind.Name or TokenKind.LiteralString or TokenKind.HexString:
+                return t.Kind;
+            case TokenKind.ArrayStart:
+                while (true)
+                {
+                    int saved = Position;
+                    Token next = NextToken();
+                    if (next.Kind == TokenKind.ArrayEnd) return TokenKind.ArrayStart;
+                    if (next.Kind == TokenKind.EndOfInput) throw new PdfFormatException("Unterminated array.");
+                    if (next.Kind == TokenKind.DictEnd) throw new PdfFormatException("Unexpected '>>' inside array.");
+                    if (next.Kind == TokenKind.Keyword && IsObjectBoundary(s[next.Start..next.End]))
+                    {
+                        throw new PdfFormatException("Unterminated array.");
+                    }
+
+                    Position = saved;
+                    SkipObject(depth + 1);
+                }
+
+            case TokenKind.DictStart:
+                while (true)
+                {
+                    Token key = NextToken();
+                    if (key.Kind == TokenKind.DictEnd) return TokenKind.DictStart;
+                    if (key.Kind == TokenKind.EndOfInput) throw new PdfFormatException("Unterminated dictionary.");
+                    if (key.Kind != TokenKind.Name)
+                    {
+                        if (key.Kind == TokenKind.Keyword && IsObjectBoundary(s[key.Start..key.End])) throw new PdfFormatException("Unterminated dictionary.");
+                        continue;
+                    }
+
+                    int saved = Position;
+                    if (NextToken().Kind == TokenKind.DictEnd) return TokenKind.DictStart;
+                    Position = saved;
+                    SkipObject(depth + 1);
+                }
+
+            case TokenKind.Keyword:
+            {
+                ReadOnlySpan<byte> k = s[t.Start..t.End];
+                if (k.SequenceEqual("true"u8) || k.SequenceEqual("false"u8) || k.SequenceEqual("null"u8)) return TokenKind.Keyword;
+                throw new PdfFormatException($"Unexpected keyword '{Compat.Latin1.GetString(k)}' at offset {t.Start}.");
+            }
+
+            case TokenKind.EndOfInput:
+                throw new PdfFormatException("Unexpected end of input.");
+            default:
+                throw new PdfFormatException($"Unexpected token at offset {t.Start}.");
+        }
+    }
+
+    /// <summary>
+    /// After an object number: true, past the reference, when a generation number and R
+    /// follow; otherwise the position stays. Most numbers are followed by something that cannot
+    /// start an integer, which a look at one byte tells without reading the token. The look
+    /// stands in for a token only where reading it could not fail, and counts it as read, so
+    /// the result, the failures and <see cref="Tokens"/> are those of reading every token.
+    /// </summary>
+    private bool ReferenceFollows(out long gen)
+    {
+        gen = 0;
+        int afterFirst = Position;
+        int next = NextByteAt(afterFirst);
+        if (ReadsSafely(next) && !MayStartInteger(next))
+        {
+            Tokens++;
+            return false;
+        }
+
+        if (TryReadInteger(out gen) && gen >= 0 && gen <= 65535)
+        {
+            int r = NextByteAt(Position);
+            if (r >= 0 && Span[r] == (byte)'R' && (r + 1 == Span.Length || !PdfSyntax.IsRegular(Span[r + 1])))
+            {
+                Position = r + 1;
+                Tokens++;
+                return true;
+            }
+
+            if (!ReadsSafely(r) && TryReadKeyword("R"u8)) return true;
+            if (ReadsSafely(r)) Tokens++;
+        }
+
+        Position = afterFirst;
+        return false;
+    }
+
+    /// <summary>
+    /// True when the token starting at <paramref name="at"/> reads without failing: anything but
+    /// a string, which may be unterminated, or a lone '&gt;'. The end of the data reads too.
+    /// </summary>
+    private bool ReadsSafely(int at)
+    {
+        if (at < 0) return true;
+        ReadOnlySpan<byte> s = Span;
+        return s[at] switch
+        {
+            (byte)'(' => false,
+            (byte)'<' or (byte)'>' => at + 1 < s.Length && s[at + 1] == s[at],
+            _ => true,
+        };
+    }
+
+    /// <summary>Where the next token starts after <paramref name="from"/>, past white space and comments; -1 at the end.</summary>
+    private int NextByteAt(int from)
+    {
+        ReadOnlySpan<byte> s = Span;
+        int p = from;
+        while (p < s.Length)
+        {
+            byte b = s[p];
+            if (PdfSyntax.IsWhitespace(b))
+            {
+                p++;
+            }
+            else if (b == (byte)'%')
+            {
+                while (p < s.Length && s[p] != (byte)'\n' && s[p] != (byte)'\r') p++;
+            }
+            else
+            {
+                return p;
+            }
+        }
+
+        return -1;
+    }
+
+    /// <summary>True when a token starting at <paramref name="at"/> could read as an integer: a digit or a sign.</summary>
+    private bool MayStartInteger(int at) => at >= 0 && (PdfSyntax.IsDigit(Span[at]) || Span[at] == (byte)'+' || Span[at] == (byte)'-');
+
     private static bool IsObjectBoundary(ReadOnlySpan<byte> keyword) =>
         keyword.SequenceEqual("endobj"u8) || keyword.SequenceEqual("stream"u8) || keyword.SequenceEqual("obj"u8);
 
@@ -306,7 +459,8 @@ internal sealed class PdfParser
                 continue;
             }
 
-            string name = DecodeName(Span[(key.Start + 1)..key.End]);
+            ReadOnlySpan<byte> raw = Span[(key.Start + 1)..key.End];
+            string name = Names is { } names ? names.Get(raw) : DecodeName(raw);
             int saved = Position;
             Token peek = NextToken();
             if (peek.Kind == TokenKind.DictEnd)
@@ -358,10 +512,27 @@ internal sealed class PdfParser
     public static byte[] DecodeLiteralString(ReadOnlySpan<byte> body)
     {
         // The token span still ends with ')'; strip it.
-        if (body.Length > 0 && body[^1] == (byte)')') body = body[..^1];
-        if (body.IndexOfAny((byte)'\\', (byte)'\r') < 0) return body.ToArray();
+        ReadOnlySpan<byte> inner = body.Length > 0 && body[^1] == (byte)')' ? body[..^1] : body;
+        if (inner.IndexOfAny((byte)'\\', (byte)'\r') < 0) return inner.ToArray();
 
-        var result = new byte[body.Length];
+        var result = new byte[inner.Length];
+        return result.AsSpan(0, DecodeLiteralString(body, result)).ToArray();
+    }
+
+    /// <summary>
+    /// Decodes the body of a literal string into <paramref name="result"/>, which must hold at
+    /// least the body's length, and returns the decoded length. No allocation, for callers that
+    /// only look at the bytes.
+    /// </summary>
+    public static int DecodeLiteralString(ReadOnlySpan<byte> body, Span<byte> result)
+    {
+        if (body.Length > 0 && body[^1] == (byte)')') body = body[..^1];
+        if (body.IndexOfAny((byte)'\\', (byte)'\r') < 0)
+        {
+            body.CopyTo(result);
+            return body.Length;
+        }
+
         int o = 0;
         for (int i = 0; i < body.Length; i++)
         {
@@ -418,14 +589,23 @@ internal sealed class PdfParser
             }
         }
 
-        return result.AsSpan(0, o).ToArray();
+        return o;
     }
 
     /// <summary>Decodes the body of a hex string, without the leading '&lt;'.</summary>
     public static byte[] DecodeHexString(ReadOnlySpan<byte> body)
     {
-        if (body.Length > 0 && body[^1] == (byte)'>') body = body[..^1];
         var result = new byte[(body.Length + 1) / 2];
+        return result.AsSpan(0, DecodeHexString(body, result)).ToArray();
+    }
+
+    /// <summary>
+    /// Decodes the body of a hex string into <paramref name="result"/>, which must hold at least
+    /// half the body's length rounded up, and returns the decoded length.
+    /// </summary>
+    public static int DecodeHexString(ReadOnlySpan<byte> body, Span<byte> result)
+    {
+        if (body.Length > 0 && body[^1] == (byte)'>') body = body[..^1];
         int o = 0;
         int high = -1;
         foreach (byte b in body)
@@ -444,7 +624,7 @@ internal sealed class PdfParser
         }
 
         if (high >= 0) result[o++] = (byte)(high << 4);
-        return result.AsSpan(0, o).ToArray();
+        return o;
     }
 
     public static string DecodeName(ReadOnlySpan<byte> body)
@@ -452,6 +632,16 @@ internal sealed class PdfParser
         if (body.IndexOf((byte)'#') < 0) return Compat.Latin1.GetString(body);
 
         Span<byte> buffer = body.Length <= 256 ? stackalloc byte[body.Length] : new byte[body.Length];
+        return Compat.Latin1.GetString(buffer[..DecodeName(body, buffer)]);
+    }
+
+    /// <summary>
+    /// Decodes the body of a name, without its slash, into <paramref name="result"/>, which must
+    /// hold at least the body's length, and returns the decoded length: one byte per character
+    /// of the string <see cref="DecodeName(ReadOnlySpan{byte})"/> returns.
+    /// </summary>
+    public static int DecodeName(ReadOnlySpan<byte> body, Span<byte> result)
+    {
         int o = 0;
         for (int i = 0; i < body.Length; i++)
         {
@@ -461,15 +651,15 @@ internal sealed class PdfParser
                 int l = PdfSyntax.HexValue(body[i + 2]);
                 if (h >= 0 && l >= 0)
                 {
-                    buffer[o++] = (byte)((h << 4) | l);
+                    result[o++] = (byte)((h << 4) | l);
                     i += 2;
                     continue;
                 }
             }
 
-            buffer[o++] = body[i];
+            result[o++] = body[i];
         }
 
-        return Compat.Latin1.GetString(buffer[..o]);
+        return o;
     }
 }

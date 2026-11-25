@@ -15,11 +15,45 @@ public interface IPdfRevocationSource
 }
 
 /// <summary>
+/// Supplies revocation data asynchronously: OCSP responses and CRLs fetched over the network
+/// without holding a thread, stopping when the caller cancels. The library asks for each
+/// certificate it needs, as with <see cref="IPdfRevocationSource"/>, and never opens a
+/// connection itself.
+/// </summary>
+/// <example>
+/// <code>
+/// sealed class OcspOverHttp(HttpClient http) : IAsyncPdfRevocationSource
+/// {
+///     public async Task&lt;PdfRevocationValues&gt; GetRevocationValuesAsync(PdfRevocationRequest request, CancellationToken cancellationToken)
+///     {
+///         var responses = new List&lt;byte[]&gt;();
+///         foreach (string url in request.OcspUrls)
+///         {
+///             using var content = new ByteArrayContent(request.CreateOcspRequest());
+///             content.Headers.ContentType = new MediaTypeHeaderValue("application/ocsp-request");
+///             using HttpResponseMessage reply = await http.PostAsync(url, content, cancellationToken);
+///             if (reply.IsSuccessStatusCode) responses.Add(await reply.Content.ReadAsByteArrayAsync(cancellationToken));
+///         }
+///
+///         return new PdfRevocationValues { OcspResponses = responses };
+///     }
+/// }
+/// </code>
+/// </example>
+public interface IAsyncPdfRevocationSource
+{
+    /// <summary>The OCSP responses and CRLs the application has for <see cref="PdfRevocationRequest.Certificate"/>; empty when it has none.</summary>
+    /// <param name="request">The certificate, its issuer and where its revocation data is published.</param>
+    /// <param name="cancellationToken">The caller's token: stop fetching when it fires.</param>
+    Task<PdfRevocationValues> GetRevocationValuesAsync(PdfRevocationRequest request, CancellationToken cancellationToken);
+}
+
+/// <summary>
 /// DER encoded revocation data: OCSP responses (RFC 6960 OCSPResponse, or a BasicOCSPResponse)
 /// and CRLs (RFC 5280 CertificateList). As a source it offers all of them for every certificate;
 /// the library keeps only those that match and verify.
 /// </summary>
-public sealed class PdfRevocationValues : IPdfRevocationSource
+public sealed class PdfRevocationValues : IPdfRevocationSource, IAsyncPdfRevocationSource
 {
     /// <summary>No revocation data.</summary>
     public static PdfRevocationValues None { get; } = new();
@@ -32,6 +66,20 @@ public sealed class PdfRevocationValues : IPdfRevocationSource
 
     /// <inheritdoc/>
     PdfRevocationValues IPdfRevocationSource.GetRevocationValues(PdfRevocationRequest request) => this;
+
+    /// <inheritdoc/>
+    Task<PdfRevocationValues> IAsyncPdfRevocationSource.GetRevocationValuesAsync(PdfRevocationRequest request, CancellationToken cancellationToken) => Task.FromResult(this);
+}
+
+/// <summary>
+/// A synchronous source behind the asynchronous interface, so one code path serves both. The
+/// task it returns is always complete: the synchronous methods of <see cref="PdfSigner"/> rely on
+/// that to run to the end on the calling thread.
+/// </summary>
+internal sealed class SynchronousRevocationSource(IPdfRevocationSource source) : IAsyncPdfRevocationSource
+{
+    public Task<PdfRevocationValues> GetRevocationValuesAsync(PdfRevocationRequest request, CancellationToken cancellationToken) =>
+        Task.FromResult(source.GetRevocationValues(request));
 }
 
 /// <summary>A certificate whose revocation status is needed, with what the application needs to fetch it.</summary>

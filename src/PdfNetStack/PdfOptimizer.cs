@@ -289,7 +289,12 @@ public static partial class PdfOptimizer
         var timings = new PhaseTimings();
         try
         {
+            // Unlocked before any object is read: objects read while locked come out encrypted,
+            // and an object stream that cannot be decoded counts as unreadable.
+            string? locked = UnlockSource(file, options, out string? password);
             pageCount = CountPages(file, guard.Budget.Diagnostics);
+            if (locked is not null) return Retained(OptimizationDisposition.UnsupportedRetained, locked);
+            Security.StandardSecurity? encryption = file.Security;
             int byteRanges = UsageRights.CountByteRanges(input.Span);
             bool usageRightsRemoved = options.RemoveUsageRights && UsageRights.Remove(file, byteRanges);
             if (Unsupported(file, byteRanges > 0 && !usageRightsRemoved, options) is { } unsupported)
@@ -298,7 +303,7 @@ public static partial class PdfOptimizer
             }
 
             ObjectGraph graph = ObjectGraph.Collect(file, options.RemovePageThumbnails, options.RemovePieceInfo, ct);
-            if (Unsupported(graph, file, options) is { } unsupportedGraph)
+            if ((Unsupported(graph, file, options) ?? UnsupportedEncryptedContent(file)) is { } unsupportedGraph)
             {
                 return Retained(OptimizationDisposition.UnsupportedRetained, unsupportedGraph);
             }
@@ -307,6 +312,7 @@ public static partial class PdfOptimizer
             bool objectStreams = options.UseObjectStreams && !pdfA1;
             string version = OutputVersion(file.HeaderVersion, objectStreams);
             bool progressive = options.ProgressiveJpeg && AllowsProgressiveJpeg(version) && (!options.Linearize || AllowsProgressiveJpeg(LinearizedVersion(file.HeaderVersion)));
+            bool jbig2 = options.UseJbig2 && AllowsJbig2(version) && (!options.Linearize || AllowsJbig2(LinearizedVersion(file.HeaderVersion)));
             int stripped = graph.StrippedEntries + (usageRightsRemoved ? 1 : 0);
             timings = timings with { Analyze = phase.Elapsed };
             phase.Restart();
@@ -315,7 +321,8 @@ public static partial class PdfOptimizer
             int pruned = 0, fontsMerged = 0;
             HashSet<int> compact = [], encoded = [];
             bool mergeFonts = options.MergeFontSubsets && options.DeduplicateObjects;
-            if (options.PruneUnusedResources || options.CompactContentStreams || mergeFonts)
+            FontPassResult fonts = FontPassResult.None;
+            if (options.PruneUnusedResources || options.CompactContentStreams || mergeFonts || options.SubsetFonts || options.ConvertType1Fonts)
             {
                 ContentAnalysis analysis = ContentAnalysis.Run(file, graph.Order, [], options.MaxDecodedStreamBytes, ct);
                 if (options.PruneUnusedResources && (pruned = ResourcePruner.Run(analysis)) > 0)
@@ -323,12 +330,16 @@ public static partial class PdfOptimizer
                     graph = ObjectGraph.Collect(file, options.RemovePageThumbnails, options.RemovePieceInfo, ct);
                 }
 
+                // Subsetting and Type 1 conversion come first: subsets of one font may then merge.
+                fonts = FontPasses.Run(file, analysis, graph.Order, options, pdfA1, ct);
                 if (mergeFonts) (fontsMerged, encoded) = FontProgramMerger.Run(file, analysis, options.ZlibLevel, options.MaxDecodedStreamBytes, ct);
                 if (options.CompactContentStreams) compact = analysis.ContentStreams;
             }
 
             // A linearized file describes each page by what the page itself refers to.
-            string? notLinearized = options.Linearize ? InheritedAttributes.PushToPages(file) : null;
+            string? notLinearized = !options.Linearize ? null
+                : encryption is not null ? EncryptedNotLinearized
+                : InheritedAttributes.PushToPages(file);
             bool pushedDown = options.Linearize && notLinearized is null;
 
             timings = timings with { Content = phase.Elapsed };
@@ -339,11 +350,15 @@ public static partial class PdfOptimizer
             {
                 JpegSettings? jpeg = options.OptimizeJpegImages ? new JpegSettings(options.JpegQuality, progressive, options.MinImageSsim) : null;
                 ImageSettings? images = options.MaxImageDpi is not null || options.MaxBilevelImageDpi is not null || options.ConvertImagesToJpeg || options.QuantizeImages
-                    ? new ImageSettings(options.MaxImageDpi, options.ConvertImagesToJpeg, options.JpegQuality, options.MinImageSsim, progressive) { Quantize = options.QuantizeImages, MaxBilevelDpi = options.MaxBilevelImageDpi }
+                    ? new ImageSettings(options.MaxImageDpi, options.ConvertImagesToJpeg, options.JpegQuality, options.MinImageSsim, progressive) { Quantize = options.QuantizeImages, MaxBilevelDpi = options.MaxBilevelImageDpi, Jbig2 = jbig2 }
                     : null;
-                var scope = new RecompressionScope(options.RecompressStreams, compact, encoded, options.DeduplicateObjects) { KeepMetadataUnfiltered = pdfA1 || options.KeepMetadataUnfiltered };
+                var scope = new RecompressionScope(options.RecompressStreams, compact, encoded, options.DeduplicateObjects)
+                {
+                    KeepMetadataUnfiltered = pdfA1 || options.KeepMetadataUnfiltered,
+                    Prove = options.Verify,
+                };
                 recompressed = StreamRecompressor.Run(file, graph, scope, options.ZlibLevel, options.Compression == CompressionEffort.Exhaustive, options.UseImagePredictors,
-                    options.OptimizeBilevelImages, jpeg, images, options.MaxDecodedStreamBytes, options.Workers, ct);
+                    options.OptimizeBilevelImages, jbig2, jpeg, images, options.MaxDecodedStreamBytes, options.Workers, ct);
 
                 // A JBIG2 image coded anew no longer needs its JBIG2Globals, which may now be unused.
                 if (recompressed.ResampledObjects.Count > 0) graph = ObjectGraph.Collect(file, options.RemovePageThumbnails, options.RemovePieceInfo, ct);
@@ -393,21 +408,34 @@ public static partial class PdfOptimizer
                 Exhaustive = options.Compression == CompressionEffort.Exhaustive,
                 Parallelism = options.Workers,
             };
+            Func<PdfReference, int> map = Map;
+            if (encryption is not null) map = EncryptLikeSource(encryption, objects, trailer, map, ref settings);
             ReadOnlyMemory<byte> candidate;
             bool linearized = false;
-            if (pushedDown && LinearizedWriter.Write(objects, trailer, Map, settings with { UseObjectStreams = false, Version = LinearizedVersion(file.HeaderVersion) }) is { } lin)
+            string? withoutObjectStreams = null;
+
+            // With object streams the version is the one any rewrite with them has; the writer
+            // falls back to the linearization version when it has to leave them out.
+            if (pushedDown && LinearizedWriter.Write(objects, trailer, map, settings, LinearizedVersion(file.HeaderVersion), ct) is { } lin)
             {
-                candidate = lin;
+                candidate = lin.Bytes;
                 linearized = true;
+                withoutObjectStreams = lin.WithoutObjectStreams;
             }
             else
             {
                 if (pushedDown) notLinearized = "the page tree cannot be laid out page by page";
-                candidate = PdfDocumentWriter.Write(objects, trailer, Map, settings);
+                candidate = PdfDocumentWriter.Write(objects, trailer, map, settings);
             }
 
             timings = timings with { Write = phase.Elapsed };
             phase.Restart();
+
+            // Writing decrypted every stream, so any damaged AES data has been seen by now.
+            if (encryption is not null && DamagedCiphertext(encryption, options) is { } damaged)
+            {
+                return Retained(OptimizationDisposition.UnsupportedRetained, damaged);
+            }
 
             var stats = new OptimizationStatistics(
                 file.Xref.Count(e => e.Value.Type != XrefEntryType.Free),
@@ -427,10 +455,15 @@ public static partial class PdfOptimizer
                 ImagesQuantized = recompressed.Quantized,
                 ImagesKeptByQualityGate = recompressed.KeptByGate,
                 ImagesRecodedAsGroup4 = recompressed.Group4,
+                ImagesRecodedAsJbig2 = recompressed.Jbig2,
                 ResourcesPruned = pruned,
                 ContentStreamsCompacted = recompressed.Compacted,
                 FontProgramsMerged = fontsMerged,
+                FontProgramsSubset = fonts.Subset,
+                Type1FontsConverted = fonts.Converted,
+                FontsLeftWhole = fonts.Kept,
                 Linearized = linearized,
+                Reencrypted = encryption is not null,
             };
 
             // Linearizing a file that is not linearized yet is worth keeping even when it costs bytes.
@@ -452,6 +485,11 @@ public static partial class PdfOptimizer
                     return new Outcome(OptimizationDisposition.OriginalRetained, null, "Verification failed: output is not well formed.", pageCount, stats);
                 }
 
+                if (encryption is not null && UnlockForProof(reference, written, password) is { } unopened)
+                {
+                    return new Outcome(OptimizationDisposition.OriginalRetained, null, "Verification failed: " + unopened + ".", pageCount, stats);
+                }
+
                 var ignored = new List<string>();
                 if (options.RemovePageThumbnails) ignored.Add("Thumb");
                 if (options.RemovePieceInfo) ignored.Add("PieceInfo");
@@ -459,12 +497,14 @@ public static partial class PdfOptimizer
                 var rules = new VerificationRules
                 {
                     IgnoredSourceKeys = ignored,
-                    Images = new ImageAllowance(recompressed.RequantizedObjects.Contains, recompressed.ResampledObjects.Contains, options.MinImageSsim),
+                    Images = new ImageAllowance(recompressed.RequantizedObjects.Contains, recompressed.ResampledObjects.Contains, options.MinImageSsim) { Proofs = recompressed.ImageProofs },
                     AllowResourcePruning = pruned > 0,
                     AllowContentCompaction = recompressed.Compacted > 0,
                     AllowFontMerging = fontsMerged > 0,
+                    AllowFontSubsetting = fonts.Subset > 0,
+                    AllowFontConversion = fonts.Converted > 0,
                     AllowInheritedAttributes = pushedDown,
-                    AllowBilevelRecoding = recompressed.Group4 > 0,
+                    AllowBilevelRecoding = recompressed.Group4 + recompressed.Jbig2 > 0,
                     AllowXObjectNameRemoval = namesRemoved > 0,
                 };
                 string? difference = EquivalenceVerifier.Verify(reference, written, rules, options.MaxDecodedStreamBytes,
@@ -476,10 +516,15 @@ public static partial class PdfOptimizer
 
                 stats = stats with { ObjectsVerified = compared, Phases = timings with { Verify = phase.Elapsed } };
             }
+            else if (encryption is not null && ProveProtection(file, PdfFile.Open(candidate, options.MaxDecodedStreamBytes, guard.Budget), password) is { } unprotected)
+            {
+                return new Outcome(OptimizationDisposition.OriginalRetained, null, "Verification failed: " + unprotected + ".", pageCount, stats);
+            }
 
-            string reason = Reason(options, recompressed);
+            string reason = Reason(options, recompressed) + fonts.Note();
             if (usageRightsRemoved) reason += " Usage rights removed.";
-            if (linearized) reason += " The output is linearized.";
+            if (encryption is not null) reason += Reencrypted(encryption);
+            if (linearized) reason += " The output is linearized." + (withoutObjectStreams is null ? "" : " Object streams were left out: " + withoutObjectStreams + ".");
             else if (notLinearized is not null) reason += " Not linearized: " + notLinearized + ".";
             return new Outcome(OptimizationDisposition.Optimized, candidate, reason, pageCount, stats);
         }
@@ -572,7 +617,7 @@ public static partial class PdfOptimizer
     /// <param name="signed">The file's bytes hold a signature's /ByteRange.</param>
     private static string? Unsupported(PdfFile file, bool signed, PdfOptimizerOptions options)
     {
-        if (file.Trailer["Encrypt"] is not null and not PdfNull) return "Encrypted PDF.";
+        if (IsEncrypted(file) && file.Security is null) return "Encrypted PDF.";
         if (signed) return "Digitally signed PDF.";
         if (file.RevisionCount > 1 && !options.AllowIncrementalUpdates)
         {
@@ -701,6 +746,10 @@ public static partial class PdfOptimizer
     /// <summary>Progressive JPEG (DCTDecode) arrived with PDF 1.3; output at an earlier version keeps sequential coding.</summary>
     private static bool AllowsProgressiveJpeg(string version) =>
         decimal.TryParse(version, NumberStyles.AllowDecimalPoint, CultureInfo.InvariantCulture, out decimal v) && v >= 1.3m;
+
+    /// <summary>JBIG2Decode arrived with PDF 1.4; output at an earlier version keeps CCITT and Flate.</summary>
+    private static bool AllowsJbig2(string version) =>
+        decimal.TryParse(version, NumberStyles.AllowDecimalPoint, CultureInfo.InvariantCulture, out decimal v) && v >= 1.4m;
 
     /// <summary>Linearization arrived with PDF 1.2.</summary>
     private static string LinearizedVersion(string header) =>

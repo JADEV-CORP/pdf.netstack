@@ -56,15 +56,23 @@ public sealed class PdfBoolean : PdfObject
 /// </summary>
 public sealed class PdfNumber : PdfObject
 {
-    private PdfNumber(byte[] text, bool isInteger, long integerValue)
+    // Integers read from files are mostly small: page counts, generations, MCIDs, kerning, widths.
+    private const int CachedMin = -1;
+    private const int CachedMax = 1023;
+    private static readonly PdfNumber[] Cached = MakeCached();
+
+    // Reals and malformed tokens keep their text; an integer's is its value, made on first use.
+    private byte[]? _text;
+
+    private PdfNumber(byte[]? text, bool isInteger, long integerValue)
     {
-        Text = text;
+        _text = text;
         IsInteger = isInteger;
         IntegerValue = integerValue;
     }
 
     /// <summary>Canonical ASCII representation, ready to serialize.</summary>
-    internal byte[] Text { get; }
+    internal byte[] Text => _text ??= Encoding.ASCII.GetBytes(IntegerValue.ToString(System.Globalization.CultureInfo.InvariantCulture));
 
     /// <summary>True for integers, false for reals.</summary>
     public bool IsInteger { get; }
@@ -73,8 +81,7 @@ public sealed class PdfNumber : PdfObject
     public long IntegerValue { get; }
 
     /// <summary>Creates an integer.</summary>
-    public static PdfNumber FromInteger(long value) =>
-        new(Encoding.ASCII.GetBytes(value.ToString(System.Globalization.CultureInfo.InvariantCulture)), true, value);
+    public static PdfNumber FromInteger(long value) => new(null, true, value);
 
     /// <summary>
     /// Creates a real, rounded to 6 decimal places and written without an exponent, as PDF
@@ -91,10 +98,25 @@ public sealed class PdfNumber : PdfObject
     /// <summary>
     /// Parses a numeric token and canonicalizes it: no leading plus, no redundant zeros,
     /// no trailing decimal point. The numeric value never changes. Tokens that do not look
-    /// like a well formed number are kept verbatim.
+    /// like a well formed number are kept verbatim. Small integers are shared instances.
     /// </summary>
     internal static PdfNumber Parse(ReadOnlySpan<byte> raw)
     {
+        Span<byte> text = raw.Length <= 64 ? stackalloc byte[raw.Length] : new byte[raw.Length];
+        int length = Canonicalize(raw, text, out bool isInteger, out long value);
+        if (!isInteger) return new PdfNumber(text[..length].ToArray(), false, 0);
+        return value is >= CachedMin and <= CachedMax ? Cached[value - CachedMin] : new PdfNumber(null, true, value);
+    }
+
+    /// <summary>
+    /// Writes the canonical form of a numeric token, the text <see cref="Parse"/> keeps, into
+    /// <paramref name="text"/>, which must hold at least the token's length, and returns its
+    /// length. It is never longer than the token.
+    /// </summary>
+    internal static int Canonicalize(ReadOnlySpan<byte> raw, Span<byte> text, out bool isInteger, out long integerValue)
+    {
+        isInteger = false;
+        integerValue = 0;
         int i = 0;
         bool negative = false;
         if (i < raw.Length && (raw[i] == (byte)'+' || raw[i] == (byte)'-'))
@@ -118,7 +140,8 @@ public sealed class PdfNumber : PdfObject
         bool wellFormed = i == raw.Length && (intEnd > intStart || fracEnd > fracStart);
         if (!wellFormed)
         {
-            return new PdfNumber(raw.ToArray(), false, 0);
+            raw.CopyTo(text);
+            return raw.Length;
         }
 
         ReadOnlySpan<byte> intDigits = raw[intStart..intEnd];
@@ -128,29 +151,36 @@ public sealed class PdfNumber : PdfObject
 
         if (intDigits.IsEmpty && fracDigits.IsEmpty)
         {
-            return new PdfNumber("0"u8.ToArray(), true, 0);
+            text[0] = (byte)'0';
+            isInteger = true;
+            return 1;
         }
 
-        var text = new byte[(negative ? 1 : 0) + intDigits.Length + (fracDigits.IsEmpty ? 0 : fracDigits.Length + 1)];
         int p = 0;
         if (negative) text[p++] = (byte)'-';
-        intDigits.CopyTo(text.AsSpan(p));
+        intDigits.CopyTo(text[p..]);
         p += intDigits.Length;
         if (!fracDigits.IsEmpty)
         {
             text[p++] = (byte)'.';
-            fracDigits.CopyTo(text.AsSpan(p));
+            fracDigits.CopyTo(text[p..]);
+            return p + fracDigits.Length;
         }
 
-        if (fracDigits.IsEmpty && intDigits.Length <= 18)
+        if (intDigits.Length <= 18)
         {
             long value = 0;
             foreach (byte b in intDigits) value = value * 10 + (b - '0');
-            return new PdfNumber(text, true, negative ? -value : value);
+            isInteger = true;
+            integerValue = negative ? -value : value;
         }
 
-        return new PdfNumber(text, false, 0);
+        return p;
     }
+
+    /// <summary>True when both numbers have the same canonical text, without making an integer's.</summary>
+    internal bool SameValue(PdfNumber other) =>
+        IsInteger && other.IsInteger ? IntegerValue == other.IntegerValue : Text.AsSpan().SequenceEqual(other.Text);
 
     /// <summary>The value as a double. Exact for integers up to 2^53.</summary>
     public double ToDouble() =>
@@ -160,6 +190,17 @@ public sealed class PdfNumber : PdfObject
                 System.Globalization.CultureInfo.InvariantCulture, out double d) ? d : 0;
 
     private static bool IsDigit(byte b) => b is >= (byte)'0' and <= (byte)'9';
+
+    private static PdfNumber[] MakeCached()
+    {
+        var cached = new PdfNumber[CachedMax - CachedMin + 1];
+        for (int v = CachedMin; v <= CachedMax; v++)
+        {
+            cached[v - CachedMin] = new PdfNumber(Encoding.ASCII.GetBytes(v.ToString(System.Globalization.CultureInfo.InvariantCulture)), true, v);
+        }
+
+        return cached;
+    }
 
     /// <summary>The number as written in the file.</summary>
     public override string ToString() => Encoding.ASCII.GetString(Text);
@@ -278,9 +319,16 @@ public sealed class PdfArray : PdfObject, IReadOnlyList<PdfObject>
 public sealed class PdfDictionary : PdfObject, IEnumerable<KeyValuePair<string, PdfObject>>
 {
     private const int IndexThreshold = 12;
-    private readonly List<string> _keys;
-    private readonly List<PdfObject> _values;
+
+    // Entries in one array: a parsed document holds hundreds of thousands of small dictionaries,
+    // and two lists per dictionary cost more than their entries.
+    private KeyValuePair<string, PdfObject>[] _entries;
+    private int _count;
     private Dictionary<string, int>? _index;
+    private KeyList? _keys;
+
+    // Counts added and removed keys, so enumerating Keys while they change fails as a list would.
+    private int _version;
 
     /// <summary>Creates an empty dictionary.</summary>
     public PdfDictionary()
@@ -288,17 +336,13 @@ public sealed class PdfDictionary : PdfObject, IEnumerable<KeyValuePair<string, 
     {
     }
 
-    internal PdfDictionary(int capacity)
-    {
-        _keys = new List<string>(capacity);
-        _values = new List<PdfObject>(capacity);
-    }
+    internal PdfDictionary(int capacity) => _entries = capacity > 0 ? new KeyValuePair<string, PdfObject>[capacity] : [];
 
     /// <summary>Number of entries.</summary>
-    public int Count => _keys.Count;
+    public int Count => _count;
 
     /// <summary>The keys, in insertion order.</summary>
-    public IReadOnlyList<string> Keys => _keys;
+    public IReadOnlyList<string> Keys => _keys ??= new KeyList(this);
 
     /// <summary>
     /// The value for <paramref name="key"/>, or null when absent. The value may be a reference;
@@ -327,7 +371,7 @@ public sealed class PdfDictionary : PdfObject, IEnumerable<KeyValuePair<string, 
             return false;
         }
 
-        value = _values[i];
+        value = _entries[i].Value;
         return true;
     }
 
@@ -339,14 +383,15 @@ public sealed class PdfDictionary : PdfObject, IEnumerable<KeyValuePair<string, 
         int i = IndexOf(key);
         if (i >= 0)
         {
-            _values[i] = value;
+            _entries[i] = new KeyValuePair<string, PdfObject>(_entries[i].Key, value);
             return;
         }
 
-        _keys.Add(key);
-        _values.Add(value);
-        if (_index is not null) _index[key] = _keys.Count - 1;
-        else if (_keys.Count > IndexThreshold) BuildIndex();
+        if (_count == _entries.Length) Array.Resize(ref _entries, Math.Max(4, _entries.Length * 2));
+        _entries[_count++] = new KeyValuePair<string, PdfObject>(key, value);
+        _version++;
+        if (_index is not null) _index[key] = _count - 1;
+        else if (_count > IndexThreshold) BuildIndex();
     }
 
     /// <summary>Removes an entry; returns false when it was absent.</summary>
@@ -354,8 +399,10 @@ public sealed class PdfDictionary : PdfObject, IEnumerable<KeyValuePair<string, 
     {
         int i = IndexOf(key);
         if (i < 0) return false;
-        _keys.RemoveAt(i);
-        _values.RemoveAt(i);
+        _count--;
+        if (i < _count) Array.Copy(_entries, i + 1, _entries, i, _count - i);
+        _entries[_count] = default;
+        _version++;
         if (_index is not null) BuildIndex();
         return true;
     }
@@ -363,26 +410,28 @@ public sealed class PdfDictionary : PdfObject, IEnumerable<KeyValuePair<string, 
     /// <summary>The value of <paramref name="key"/> when it is a direct name, without the slash.</summary>
     public string? GetName(string key) => this[key] is PdfName n ? n.Value : null;
 
-    internal KeyValuePair<string, PdfObject> EntryAt(int i) => new(_keys[i], _values[i]);
+    internal KeyValuePair<string, PdfObject> EntryAt(int i) => _entries[Check(i)];
 
-    internal void SetValueAt(int i, PdfObject value) => _values[i] = value;
+    internal void SetValueAt(int i, PdfObject value) => _entries[Check(i)] = new KeyValuePair<string, PdfObject>(_entries[i].Key, value);
 
-    internal PdfObject ValueAt(int i) => _values[i];
+    internal PdfObject ValueAt(int i) => _entries[Check(i)].Value;
 
     /// <inheritdoc/>
     public IEnumerator<KeyValuePair<string, PdfObject>> GetEnumerator()
     {
-        for (int i = 0; i < _keys.Count; i++) yield return new KeyValuePair<string, PdfObject>(_keys[i], _values[i]);
+        for (int i = 0; i < _count; i++) yield return _entries[i];
     }
 
     IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
 
+    private int Check(int i) => (uint)i < (uint)_count ? i : throw new ArgumentOutOfRangeException(nameof(i));
+
     private int IndexOf(string key)
     {
         if (_index is not null) return _index.TryGetValue(key, out int i) ? i : -1;
-        for (int i = 0; i < _keys.Count; i++)
+        for (int i = 0; i < _count; i++)
         {
-            if (string.Equals(_keys[i], key, StringComparison.Ordinal)) return i;
+            if (string.Equals(_entries[i].Key, key, StringComparison.Ordinal)) return i;
         }
 
         return -1;
@@ -390,8 +439,30 @@ public sealed class PdfDictionary : PdfObject, IEnumerable<KeyValuePair<string, 
 
     private void BuildIndex()
     {
-        _index = new Dictionary<string, int>(_keys.Count * 2, StringComparer.Ordinal);
-        for (int i = 0; i < _keys.Count; i++) _index[_keys[i]] = i;
+        _index = new Dictionary<string, int>(_count * 2, StringComparer.Ordinal);
+        for (int i = 0; i < _count; i++) _index[_entries[i].Key] = i;
+    }
+
+    /// <summary>A live view of the keys, as the list of keys was before entries shared one array.</summary>
+    private sealed class KeyList(PdfDictionary owner) : IReadOnlyList<string>
+    {
+        public int Count => owner._count;
+
+        public string this[int index] => owner._entries[owner.Check(index)].Key;
+
+        public IEnumerator<string> GetEnumerator()
+        {
+            int version = owner._version;
+            for (int i = 0; i < owner._count; i++)
+            {
+                if (version != owner._version) throw new InvalidOperationException("The dictionary's keys changed during enumeration.");
+                yield return owner._entries[i].Key;
+            }
+
+            if (version != owner._version) throw new InvalidOperationException("The dictionary's keys changed during enumeration.");
+        }
+
+        IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
     }
 }
 

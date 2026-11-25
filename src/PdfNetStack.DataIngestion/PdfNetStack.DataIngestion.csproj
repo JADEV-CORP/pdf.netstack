@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- The reader is asynchronous end to end, on the core's ReadTextAsync (.NET 8 and later). -->
+    <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
+    <RootNamespace>PdfNetStack.DataIngestion</RootNamespace>
+    <IsAotCompatible>true</IsAotCompatible>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <PackageId>PdfNetStack.DataIngestion</PackageId>
+    <!-- Microsoft.Extensions.DataIngestion is only published as a preview, and a stable package
+         cannot depend on a preview: this one is a preview of the release it ships with until the
+         abstractions are stable. A preview release (a version with a suffix) keeps its own. -->
+    <PackageVersion Condition="!$(Version.Contains('-'))">$(Version)-preview</PackageVersion>
+    <Title>PdfNetStack.DataIngestion: a PDF reader for Microsoft.Extensions.DataIngestion</Title>
+    <Description>An IngestionDocumentReader for Microsoft.Extensions.DataIngestion that reads PDF files with PdfNetStack: each page a section of headings, paragraphs, list items and tables in reading order, from the structure tree when the PDF is tagged, as Markdown. Artifacts such as running headers and page numbers are left out, and so is text a reader cannot see (invisible, white on white, clipped, off the page, on a hidden layer), a common carrier of prompt injection. Pure C#, MIT licensed, no native binaries, Native AOT compatible. By Jamal Abdelkhalek, JADEV.</Description>
+    <PackageTags>pdf;rag;dataingestion;ingestion;markdown;pdf-to-markdown;text-extraction;llm;ai;vector-search;prompt-injection;jadev</PackageTags>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\PdfNetStack\PdfNetStack.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- MIT. The abstractions only, as Microsoft advises for libraries that implement them. -->
+    <PackageReference Include="Microsoft.Extensions.DataIngestion.Abstractions" Version="11.0.0-preview.1.26560.3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="PdfNetStack.Tests" />
+  </ItemGroup>
+
+</Project>
