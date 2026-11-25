@@ -42,10 +42,11 @@ public static partial class PdfOptimizer
         Compat.ThrowIfNull(output, nameof(output));
         options ??= PdfOptimizerOptions.Default;
         options.Validate();
-        if (options.Streaming) return OptimizeStreaming(new Source(input), output, options, cancellationToken);
+        var deadline = Deadline.Start(options.Limits);
+        if (options.Streaming) return OptimizeStreaming(new Source(input), output, options, deadline, cancellationToken);
 
         var clock = Stopwatch.StartNew();
-        (ReadOnlyMemory<byte> written, PdfOptimizationResult result) = OptimizeInMemory(input, options, cancellationToken);
+        (ReadOnlyMemory<byte> written, PdfOptimizationResult result) = OptimizeInMemory(input, options, deadline, cancellationToken);
         output.Write(written.Span);
         return WithElapsed(result, clock);
     }
@@ -54,10 +55,11 @@ public static partial class PdfOptimizer
     /// The in-memory run: the bytes to write, which are the input itself when it is kept, and the
     /// result. Nothing is copied; each entry point writes or copies the bytes once, as it needs them.
     /// </summary>
-    private static (ReadOnlyMemory<byte> Written, PdfOptimizationResult Result) OptimizeInMemory(ReadOnlyMemory<byte> input, PdfOptimizerOptions options, CancellationToken ct)
+    /// <param name="deadline">The call's deadline, started before the input was read.</param>
+    private static (ReadOnlyMemory<byte> Written, PdfOptimizationResult Result) OptimizeInMemory(ReadOnlyMemory<byte> input, PdfOptimizerOptions options, Deadline deadline, CancellationToken ct)
     {
         string sourceHash = Sha256Hex(input.Span);
-        Outcome outcome = RunWithin(input, options, ct);
+        Outcome outcome = RunWithin(input, options, deadline, ct);
 
         ReadOnlyMemory<byte> written = outcome.Candidate ?? input;
         string outputHash = outcome.Candidate is null ? sourceHash : Sha256Hex(written.Span);
@@ -80,9 +82,8 @@ public static partial class PdfOptimizer
     /// images are changed lossily; without a time limit the passes run once, as before. Both runs
     /// share the deadline and one budget: the limits bound the call, every pass together.
     /// </summary>
-    private static Outcome RunWithin(ReadOnlyMemory<byte> input, PdfOptimizerOptions options, CancellationToken ct)
+    private static Outcome RunWithin(ReadOnlyMemory<byte> input, PdfOptimizerOptions options, Deadline deadline, CancellationToken ct)
     {
-        var deadline = Deadline.Start(options.Limits);
         if (!options.IsLossy || !options.Limits.HasTimeout) return RunOnce(input, options, deadline, ct);
 
         ResourceBudget budget = RunGuard.NewBudget(options.Limits, input.Length, options.Workers);
@@ -125,7 +126,7 @@ public static partial class PdfOptimizer
         // the caller never holds the array it passed in.
         options.Validate();
         var clock = Stopwatch.StartNew();
-        (ReadOnlyMemory<byte> written, PdfOptimizationResult result) = OptimizeInMemory(input, options, cancellationToken);
+        (ReadOnlyMemory<byte> written, PdfOptimizationResult result) = OptimizeInMemory(input, options, Deadline.Start(options.Limits), cancellationToken);
         return (written.ToArray(), WithElapsed(result, clock));
     }
 
@@ -137,11 +138,17 @@ public static partial class PdfOptimizer
     /// demand where it is, and any other input is first copied, asynchronously, to a temporary file.
     /// An input over <see cref="PdfOptimizerOptions.MaxInputBytes"/> or <see cref="PdfLimits.MaxInputBytes"/>
     /// is passed on to <paramref name="output"/> as it is read, never held beyond one chunk past the limit.
+    /// Reading the input counts toward <see cref="PdfLimits.Timeout"/>.
     /// </remarks>
     /// <param name="input">The source PDF, read from its current position to its end.</param>
     /// <param name="output">Receives the optimized PDF, or the input unchanged.</param>
     /// <param name="options">Optimization options; <see cref="PdfOptimizerOptions.Default"/> when null.</param>
     /// <param name="cancellationToken">Cancels between and within passes.</param>
+    /// <exception cref="PdfLimitExceededException">
+    /// Time ran out (<see cref="PdfLimits.Timeout"/>) while the input was being read or passed on.
+    /// The input cannot then be written unchanged: <paramref name="output"/> holds nothing, or the
+    /// part of an input over the limits that was passed on.
+    /// </exception>
     public static async Task<PdfOptimizationResult> OptimizeAsync(
         Stream input,
         Stream output,
@@ -152,42 +159,33 @@ public static partial class PdfOptimizer
         Compat.ThrowIfNull(output, nameof(output));
         options ??= PdfOptimizerOptions.Default;
         options.Validate();
+
+        // Started before the first read: an input that trickles or stalls is part of the time the call may take.
+        var deadline = Deadline.Start(options.Limits);
         if (options.Streaming)
         {
-            return await OptimizeStreamingAsync(input, output, options, cancellationToken).ConfigureAwait(false);
+            return await OptimizeStreamingAsync(input, output, options, deadline, cancellationToken).ConfigureAwait(false);
         }
 
-#pragma warning disable CA1835 // Array overloads keep one code path for .NET Standard 2.0.
         // Buffer at most the smaller of the two input limits. Anything larger is streamed through
         // untouched without ever being held in memory, as the in-memory path would return it
         // unchanged anyway. A seekable input of known length gets its buffer at once, rather than
         // by doubling, or is passed through at once when it is known to be over the limit.
         long cap = InputCap(options);
         long known = input.CanSeek ? input.Length - input.Position : 0;
-        if (known > cap)
+        using var buffer = new MemoryStream(known > 0 && known <= cap && known <= Compat.MaxArrayLength ? (int)known : 0);
+        using (var time = new TimeLimit(deadline, cancellationToken))
         {
-            long length = await PassThroughAsync(null, input, output, cancellationToken).ConfigureAwait(false);
-            return OverLimit(length, options, cancellationToken);
-        }
-
-        using var buffer = new MemoryStream(known > 0 && known <= Compat.MaxArrayLength ? (int)known : 0);
-        byte[] chunk = new byte[81920];
-        int read;
-        while ((read = await input.ReadAsync(chunk, 0, chunk.Length, cancellationToken).ConfigureAwait(false)) > 0)
-        {
-            buffer.Write(chunk, 0, read);
-            if (buffer.Length > cap)
+            if (known > cap || await SpoolAsync(input, buffer, cap, time).ConfigureAwait(false))
             {
-                long length = await PassThroughAsync(buffer, input, output, cancellationToken).ConfigureAwait(false);
+                long length = await PassThroughAsync(buffer, input, output, time).ConfigureAwait(false);
                 return OverLimit(length, options, cancellationToken);
             }
         }
 
-#pragma warning restore CA1835
-
         // The rewrite goes to the output as it lies in memory, without a copy into another stream.
         var clock = Stopwatch.StartNew();
-        (ReadOnlyMemory<byte> written, PdfOptimizationResult r) = OptimizeInMemory(buffer.GetBuffer().AsMemory(0, (int)buffer.Length), options, cancellationToken);
+        (ReadOnlyMemory<byte> written, PdfOptimizationResult r) = OptimizeInMemory(buffer.GetBuffer().AsMemory(0, (int)buffer.Length), options, deadline, cancellationToken);
         await Compat.WriteAsync(output, written, cancellationToken).ConfigureAwait(false);
         return WithElapsed(r, clock);
     }
@@ -217,28 +215,97 @@ public static partial class PdfOptimizer
     }
 
 #pragma warning disable CA1835 // Array overloads keep one code path for .NET Standard 2.0.
-    /// <summary>Writes what was taken in so far, if anything, then the rest of <paramref name="input"/>, to <paramref name="output"/>; returns the input's length.</summary>
-    private static async Task<long> PassThroughAsync(Stream? taken, Stream input, Stream output, CancellationToken ct)
+    /// <summary>
+    /// Writes what was taken in so far, if anything, then the rest of <paramref name="input"/>, to
+    /// <paramref name="output"/>; returns the input's length. An input that never ends is passed
+    /// on until the time limit, if there is one.
+    /// </summary>
+    /// <exception cref="PdfLimitExceededException">The time limit passed first.</exception>
+    private static async Task<long> PassThroughAsync(Stream? taken, Stream input, Stream output, TimeLimit time)
     {
+        CancellationToken ct = time.Token;
         long total = 0;
-        if (taken is not null)
+        try
         {
-            total = taken.Length;
-            taken.Position = 0;
-            await taken.CopyToAsync(output, OutputStreams.CopyBufferSize, ct).ConfigureAwait(false);
-        }
+            if (taken is not null)
+            {
+                total = taken.Length;
+                taken.Position = 0;
+                await taken.CopyToAsync(output, OutputStreams.CopyBufferSize, ct).ConfigureAwait(false);
+            }
 
-        byte[] chunk = new byte[OutputStreams.CopyBufferSize];
-        int read;
-        while ((read = await input.ReadAsync(chunk, 0, chunk.Length, ct).ConfigureAwait(false)) > 0)
+            byte[] chunk = new byte[OutputStreams.CopyBufferSize];
+            int read;
+            while ((read = await ReadWithinAsync(input, chunk, 0, chunk.Length, ct).ConfigureAwait(false)) > 0)
+            {
+                await output.WriteAsync(chunk, 0, read, ct).ConfigureAwait(false);
+                total += read;
+            }
+        }
+        catch (OperationCanceledException) when (time.TimedOut)
         {
-            await output.WriteAsync(chunk, 0, read, ct).ConfigureAwait(false);
-            total += read;
+            throw InputTimedOut();
         }
 
         return total;
     }
+
+    /// <summary>
+    /// Copies <paramref name="input"/> to <paramref name="spool"/> until it ends, or until it has
+    /// run past <paramref name="cap"/> bytes by up to one chunk, which is then true.
+    /// </summary>
+    /// <exception cref="PdfLimitExceededException">The time limit passed first.</exception>
+    private static async Task<bool> SpoolAsync(Stream input, Stream spool, long cap, TimeLimit time)
+    {
+        CancellationToken ct = time.Token;
+        byte[] chunk = new byte[OutputStreams.CopyBufferSize];
+        long copied = 0;
+        int read;
+        try
+        {
+            while ((read = await ReadWithinAsync(input, chunk, 0, chunk.Length, ct).ConfigureAwait(false)) > 0)
+            {
+                await spool.WriteAsync(chunk, 0, read, ct).ConfigureAwait(false);
+                copied += read;
+                if (copied > cap) return true;
+            }
+        }
+        catch (OperationCanceledException) when (time.TimedOut)
+        {
+            throw InputTimedOut();
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// A read of the caller's input that ends when <paramref name="ct"/> is cancelled, also on a
+    /// stream that ignores the token (the default ReadAsync only checks it before it starts). A
+    /// read left waiting completes later into a buffer nothing uses any more.
+    /// </summary>
+    private static async Task<int> ReadWithinAsync(Stream input, byte[] buffer, int offset, int count, CancellationToken ct)
+    {
+        // Checked first, so a stream that always has data still stops.
+        ct.ThrowIfCancellationRequested();
+        Task<int> read = input.ReadAsync(buffer, offset, count, ct);
+        if (read.IsCompleted || !ct.CanBeCanceled) return await read.ConfigureAwait(false);
+#if NET8_0_OR_GREATER
+        return await read.WaitAsync(ct).ConfigureAwait(false);
+#else
+        var cancelled = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        using (ct.Register(static state => ((TaskCompletionSource<bool>)state!).TrySetResult(true), cancelled))
+        {
+            if (await Task.WhenAny(read, cancelled.Task).ConfigureAwait(false) != read) ct.ThrowIfCancellationRequested();
+        }
+
+        return await read.ConfigureAwait(false);
+#endif
+    }
 #pragma warning restore CA1835
+
+    /// <summary>The exception for time running out before the input was read or passed on.</summary>
+    private static PdfLimitExceededException InputTimedOut() =>
+        new(PdfLimitKind.Timeout, "Reading the input ran past its time limit (PdfLimits.Timeout).");
 
     /// <summary>
     /// Optimizes a file. The destination is written through a temporary file and moved into place,
@@ -256,6 +323,10 @@ public static partial class PdfOptimizer
     /// <param name="destinationPath">Receives the optimized PDF, or a copy of the source.</param>
     /// <param name="options">Optimization options; <see cref="PdfOptimizerOptions.Default"/> when null.</param>
     /// <param name="cancellationToken">Cancels between and within passes; the destination is then left as it was.</param>
+    /// <exception cref="PdfLimitExceededException">
+    /// Time ran out (<see cref="PdfLimits.Timeout"/>) while the source was being read into memory
+    /// or copied over the limits; the destination is then left as it was.
+    /// </exception>
     public static async Task<PdfOptimizationResult> OptimizeFileAsync(
         string sourcePath,
         string destinationPath,
@@ -271,17 +342,18 @@ public static partial class PdfOptimizer
 
         options ??= PdfOptimizerOptions.Default;
         options.Validate();
+        var deadline = Deadline.Start(options.Limits);
 
         // A file over either input limit is copied through without being read into memory.
         var info = new FileInfo(source);
         if (info.Exists && info.Length > InputCap(options))
         {
-            return await CopyOverLimitFileAsync(source, destination, options, cancellationToken).ConfigureAwait(false);
+            return await CopyOverLimitFileAsync(source, destination, options, deadline, cancellationToken).ConfigureAwait(false);
         }
 
         if (options.Streaming)
         {
-            return await OptimizeFileStreamingAsync(source, destination, options, cancellationToken).ConfigureAwait(false);
+            return await OptimizeFileStreamingAsync(source, destination, options, deadline, cancellationToken).ConfigureAwait(false);
         }
 
         // The length checked above is only a shortcut, as the file may have grown since: the handle
@@ -289,12 +361,13 @@ public static partial class PdfOptimizer
         long cap = InputCap(options);
         using var data = new MemoryStream();
         using (var input = new FileStream(source, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16, FileOptions.Asynchronous))
+        using (var time = new TimeLimit(deadline, cancellationToken))
         {
             long known = input.CanSeek ? input.Length : 0;
             if (known <= cap && known <= Compat.MaxArrayLength) data.Capacity = (int)known;
-            if (known > cap || await SpoolAsync(input, data, cap, cancellationToken).ConfigureAwait(false))
+            if (known > cap || await SpoolAsync(input, data, cap, time).ConfigureAwait(false))
             {
-                return await CopyOverLimitFileAsync(data, input, destination, options, cancellationToken).ConfigureAwait(false);
+                return await CopyOverLimitFileAsync(data, input, destination, options, time, cancellationToken).ConfigureAwait(false);
             }
         }
 
@@ -307,7 +380,10 @@ public static partial class PdfOptimizer
             PdfOptimizationResult result;
             using (var stream = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None, 1 << 16, FileOptions.Asynchronous))
             {
-                result = Optimize(data.GetBuffer().AsMemory(0, (int)data.Length), stream, options, cancellationToken);
+                var clock = Stopwatch.StartNew();
+                (ReadOnlyMemory<byte> written, PdfOptimizationResult r) = OptimizeInMemory(data.GetBuffer().AsMemory(0, (int)data.Length), options, deadline, cancellationToken);
+                await Compat.WriteAsync(stream, written, cancellationToken).ConfigureAwait(false);
+                result = WithElapsed(r, clock);
                 await stream.FlushAsync(cancellationToken).ConfigureAwait(false);
             }
 
@@ -321,17 +397,18 @@ public static partial class PdfOptimizer
     }
 
     /// <summary>Copies a file over the input limits to the destination, through a temporary file like any other result.</summary>
-    private static async Task<PdfOptimizationResult> CopyOverLimitFileAsync(string source, string destination, PdfOptimizerOptions options, CancellationToken ct)
+    private static async Task<PdfOptimizationResult> CopyOverLimitFileAsync(string source, string destination, PdfOptimizerOptions options, Deadline deadline, CancellationToken ct)
     {
         using var input = new FileStream(source, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16, FileOptions.Asynchronous);
-        return await CopyOverLimitFileAsync(null, input, destination, options, ct).ConfigureAwait(false);
+        using var time = new TimeLimit(deadline, ct);
+        return await CopyOverLimitFileAsync(null, input, destination, options, time, ct).ConfigureAwait(false);
     }
 
     /// <summary>
     /// Copies what was taken in of a file over the input limits, if anything, then the rest of
     /// <paramref name="input"/>, to the destination, through a temporary file like any other result.
     /// </summary>
-    private static async Task<PdfOptimizationResult> CopyOverLimitFileAsync(Stream? taken, Stream input, string destination, PdfOptimizerOptions options, CancellationToken ct)
+    private static async Task<PdfOptimizationResult> CopyOverLimitFileAsync(Stream? taken, Stream input, string destination, PdfOptimizerOptions options, TimeLimit time, CancellationToken ct)
     {
         string? directory = Path.GetDirectoryName(destination);
         if (!string.IsNullOrEmpty(directory)) Directory.CreateDirectory(directory);
@@ -341,7 +418,7 @@ public static partial class PdfOptimizer
             long length;
             using (var copy = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None, 1 << 16, FileOptions.Asynchronous))
             {
-                length = await PassThroughAsync(taken, input, copy, ct).ConfigureAwait(false);
+                length = await PassThroughAsync(taken, input, copy, time).ConfigureAwait(false);
                 await copy.FlushAsync(ct).ConfigureAwait(false);
             }
 
@@ -614,18 +691,13 @@ public static partial class PdfOptimizer
     /// </summary>
     internal sealed class RunGuard : IDisposable
     {
-        private readonly CancellationToken _caller;
-        private readonly CancellationTokenSource? _timer;
-        private readonly CancellationTokenSource? _linked;
+        private readonly TimeLimit _time;
 
         /// <param name="budget">A budget shared with another run; null for a new one.</param>
         public RunGuard(PdfLimits limits, long inputBytes, Deadline deadline, CancellationToken caller, int workers = 1, ResourceBudget? budget = null)
         {
             Budget = budget ?? NewBudget(limits, inputBytes, workers);
-            _caller = caller;
-            _timer = deadline.NewTimer();
-            _linked = _timer is null ? null : CancellationTokenSource.CreateLinkedTokenSource(caller, _timer.Token);
-            Token = _linked?.Token ?? caller;
+            _time = new TimeLimit(deadline, caller);
         }
 
         public ResourceBudget Budget { get; }
@@ -638,10 +710,10 @@ public static partial class PdfOptimizer
         };
 
         /// <summary>The caller's token, cancelled as well at the time limit.</summary>
-        public CancellationToken Token { get; }
+        public CancellationToken Token => _time.Token;
 
         /// <summary>The time limit ended the run, not the caller.</summary>
-        public bool TimedOut => _timer is { IsCancellationRequested: true } && !_caller.IsCancellationRequested;
+        public bool TimedOut => _time.TimedOut;
 
         public IReadOnlyList<PdfDiagnostic> Diagnostics => Budget.Diagnostics.Snapshot();
 
@@ -674,11 +746,7 @@ public static partial class PdfOptimizer
             return (OptimizationDisposition.OriginalRetained, $"Rewrite failed ({ex.GetType().Name}): {ex.Message}");
         }
 
-        public void Dispose()
-        {
-            _linked?.Dispose();
-            _timer?.Dispose();
-        }
+        public void Dispose() => _time.Dispose();
 
         private static T? Find<T>(Exception ex)
             where T : Exception => ex switch
@@ -687,6 +755,33 @@ public static partial class PdfOptimizer
             AggregateException all => all.InnerExceptions.Select(Find<T>).FirstOrDefault(found => found is not null),
             _ => ex.InnerException is { } inner ? Find<T>(inner) : null,
         };
+    }
+
+    /// <summary>The caller's token, cancelled as well at a deadline, and whether the deadline did it.</summary>
+    private sealed class TimeLimit : IDisposable
+    {
+        private readonly CancellationToken _caller;
+        private readonly CancellationTokenSource? _timer;
+        private readonly CancellationTokenSource? _linked;
+
+        public TimeLimit(Deadline deadline, CancellationToken caller)
+        {
+            _caller = caller;
+            _timer = deadline.NewTimer();
+            _linked = _timer is null ? null : CancellationTokenSource.CreateLinkedTokenSource(caller, _timer.Token);
+            Token = _linked?.Token ?? caller;
+        }
+
+        public CancellationToken Token { get; }
+
+        /// <summary>The deadline cancelled <see cref="Token"/>, not the caller.</summary>
+        public bool TimedOut => _timer is { IsCancellationRequested: true } && !_caller.IsCancellationRequested;
+
+        public void Dispose()
+        {
+            _linked?.Dispose();
+            _timer?.Dispose();
+        }
     }
 
     /// <summary>Why a file is left as it is, from what opening it showed; null when it may be rewritten.</summary>

@@ -88,6 +88,127 @@ public sealed class OptimizerHardeningTests
         return (result, output.ToArray());
     }
 
+    /// <summary>
+    /// A stream that cannot seek and reads only asynchronously: it serves <paramref name="data"/>,
+    /// then, unless <paramref name="endless"/>, waits for more forever and ignores any token, as a
+    /// stalled connection behind a stream that does not observe one would.
+    /// </summary>
+    private sealed class StalledStream(byte[] data, bool endless = false) : Stream
+    {
+        private int _position;
+
+        public override bool CanRead => true;
+
+        public override bool CanSeek => false;
+
+        public override bool CanWrite => false;
+
+        public override long Length => throw new NotSupportedException();
+
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+
+        public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken) =>
+            Serve(buffer.AsSpan(offset, count)) is { } n ? Task.FromResult(n) : new TaskCompletionSource<int>().Task;
+
+#if NET
+        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default) =>
+            Serve(buffer.Span) is { } n ? ValueTask.FromResult(n) : new ValueTask<int>(new TaskCompletionSource<int>().Task);
+#endif
+
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        /// <summary>Bytes copied into <paramref name="into"/>, or null once the stream has stalled.</summary>
+        private int? Serve(Span<byte> into)
+        {
+            if (endless) return into.Length;
+            if (_position == data.Length) return null;
+            int n = Math.Min(into.Length, data.Length - _position);
+            data.AsSpan(_position, n).CopyTo(into);
+            _position += n;
+            return n;
+        }
+
+        public override void Flush()
+        {
+        }
+
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+
+        public override void SetLength(long value) => throw new NotSupportedException();
+
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
+    /// <summary>
+    /// Runs the call on the thread pool, as an input that never makes it wait would never hand
+    /// back control, and fails the test if it has not ended long after its time limit.
+    /// </summary>
+    private static async Task<PdfLimitExceededException> EndsAtTheTimeLimit(Func<Task<PdfOptimizationResult>> call)
+    {
+        Task<PdfOptimizationResult> run = Task.Run(call);
+        Assert.AreSame(run, await Task.WhenAny(run, Task.Delay(TimeSpan.FromSeconds(30))), "The call ends at its time limit.");
+        return await Assert.ThrowsExactlyAsync<PdfLimitExceededException>(() => run);
+    }
+
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task InputThatStallsEndsAtTheTimeLimit(bool streaming)
+    {
+        var options = new PdfOptimizerOptions { Streaming = streaming, Limits = new PdfLimits { Timeout = TimeSpan.FromMilliseconds(200) } };
+        using var output = new MemoryStream();
+
+        PdfLimitExceededException e = await EndsAtTheTimeLimit(() => PdfOptimizer.OptimizeAsync(new StalledStream(PaddedPdf(1 << 16)), output, options));
+
+        Assert.AreEqual(PdfLimitKind.Timeout, e.Limit);
+        Assert.AreEqual(0, output.Length, "An input that was not read in full is not written.");
+    }
+
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task EndlessInputOverTheLimitEndsAtTheTimeLimit(bool streaming)
+    {
+        var options = new PdfOptimizerOptions { Streaming = streaming, Limits = new PdfLimits { MaxInputBytes = 64 << 10, Timeout = TimeSpan.FromMilliseconds(200) } };
+
+        PdfLimitExceededException e = await EndsAtTheTimeLimit(() => PdfOptimizer.OptimizeAsync(new StalledStream([], endless: true), Stream.Null, options));
+
+        Assert.AreEqual(PdfLimitKind.Timeout, e.Limit);
+    }
+
+    /// <summary>A memory stream whose first <paramref name="slowReads"/> reads take 100 ms and return at most 64 KiB.</summary>
+    private sealed class SlowStartStream(byte[] data, int slowReads) : MemoryStream(data)
+    {
+        private int _slow = slowReads;
+
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            if (Interlocked.Decrement(ref _slow) < 0) return base.Read(buffer, offset, count);
+            Thread.Sleep(100);
+            return base.Read(buffer, offset, Math.Min(count, 64 << 10));
+        }
+    }
+
+    [TestMethod]
+    public async Task StreamingScanCountsTowardTheTimeLimit()
+    {
+        // Hashing the input takes 1.6 seconds, three times the limit; the passes after it are quick.
+        byte[] input = PaddedPdf(1 << 20);
+        var options = new PdfOptimizerOptions { Streaming = true, RecompressStreams = false, MinSavingPercent = 0, Limits = new PdfLimits { Timeout = TimeSpan.FromMilliseconds(500) } };
+        using var source = new SlowStartStream(input, 16);
+        using var output = new MemoryStream();
+
+        PdfOptimizationResult result = await PdfOptimizer.OptimizeAsync(source, output, options);
+
+        Assert.AreEqual(OptimizationDisposition.LimitExceeded, result.Disposition, result.Reason);
+        Assert.AreEqual(PdfLimitKind.Timeout, result.Diagnostics.Single().Limit);
+        CollectionAssert.AreEqual(input, output.ToArray());
+    }
+
     [TestMethod]
     public async Task StreamingSpoolStopsAtTheLimit()
     {
