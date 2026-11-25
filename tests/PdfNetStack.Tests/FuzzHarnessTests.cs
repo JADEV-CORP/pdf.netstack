@@ -104,6 +104,26 @@ public sealed class FuzzHarnessTests
         StringAssert.Contains(finding.Message, "limit");
     }
 
+    [TestMethod]
+    public void HangingInputIsAFinding()
+    {
+        using var release = new ManualResetEventSlim();
+        FuzzTarget target = Synthetic(_ => release.Wait());
+        TimeSpan saved = Oracle.HangLimit;
+        Oracle.HangLimit = TimeSpan.FromMilliseconds(300);
+        try
+        {
+            FuzzFinding finding = Assert.ThrowsExactly<FuzzFinding>(() => Oracle.Check(target, [0]));
+            StringAssert.Contains(finding.Message, "did not finish within");
+            Assert.ThrowsExactly<FuzzFinding>(() => Oracle.WarmUp(target));
+        }
+        finally
+        {
+            Oracle.HangLimit = saved;
+            release.Set();
+        }
+    }
+
     private static FuzzTarget Synthetic(Action<byte[]> run, params Type[] documented) => new()
     {
         Name = "synthetic",

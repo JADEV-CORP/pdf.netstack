@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Runtime.ExceptionServices;
 
 namespace PdfNetStack.Fuzz;
 
@@ -13,6 +14,8 @@ internal sealed class FuzzFinding(string message, Exception? inner = null) : Exc
 /// <item>it allocates at most <see cref="AllocationFactor"/> times the input plus <see cref="AllocationBase"/>;</item>
 /// <item>it finishes within <see cref="TimeLimit"/>.</item>
 /// </list>
+/// A target that does not finish within <see cref="HangLimit"/> is a finding too, so a replay or a
+/// test ends where libFuzzer's own -timeout would end the run.
 /// </summary>
 internal static class Oracle
 {
@@ -21,6 +24,12 @@ internal static class Oracle
     public const long AllocationBase = 64L << 20;
 
     public static readonly TimeSpan TimeLimit = TimeSpan.FromSeconds(2);
+
+    /// <summary>How long a target may run before it counts as hung; settable for the tests.</summary>
+    public static TimeSpan HangLimit { get; internal set; } = TimeSpan.FromSeconds(30);
+
+    // The converters run their own deep-stack thread; this one gets room for the targets that do not.
+    private const int StackBytes = 64 << 20;
 
     /// <summary>The bytes one input may allocate.</summary>
     public static long Budget(int inputLength) => (AllocationFactor * (long)inputLength) + AllocationBase;
@@ -40,13 +49,39 @@ internal static class Oracle
         {
             try
             {
-                target.Run(input);
+                RunBounded(target, input);
             }
-            catch (Exception ex) when (ex is not OutOfMemoryException)
+            catch (Exception ex) when (ex is not OutOfMemoryException and not FuzzFinding)
             {
                 // Only the side effects of the call matter here.
             }
         }
+    }
+
+    /// <summary>
+    /// Runs the target on a background thread and waits for <see cref="HangLimit"/>. A hung target
+    /// cannot be stopped, so its thread is left behind; being a background thread it does not keep the process alive.
+    /// </summary>
+    private static void RunBounded(FuzzTarget target, byte[] input)
+    {
+        Exception? error = null;
+        var worker = new Thread(
+            () =>
+            {
+                try
+                {
+                    target.Run(input);
+                }
+                catch (Exception ex)
+                {
+                    error = ex;
+                }
+            },
+            StackBytes)
+        { IsBackground = true };
+        worker.Start();
+        if (!worker.Join(HangLimit)) throw new FuzzFinding($"{target.Name}: did not finish within {HangLimit.TotalSeconds:F1} s");
+        if (error is not null) ExceptionDispatchInfo.Capture(error).Throw();
     }
 
     /// <summary>Runs one input and throws <see cref="FuzzFinding"/> when it breaks a rule.</summary>
@@ -58,13 +93,13 @@ internal static class Oracle
         Exception? undocumented = null;
         try
         {
-            target.Run(input);
+            RunBounded(target, input);
         }
-        catch (Exception ex) when (target.Documents(ex))
+        catch (Exception ex) when (ex is not FuzzFinding && target.Documents(ex))
         {
             // Bad input reported the way the entry point says it is.
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not FuzzFinding)
         {
             undocumented = ex;
         }
