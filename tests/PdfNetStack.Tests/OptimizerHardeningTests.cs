@@ -169,6 +169,7 @@ public sealed class OptimizerHardeningTests
     }
 
     [TestMethod]
+    [DoNotParallelize] // reads that never wait allocate for the whole time limit, which tests measuring the process's allocations would count
     [DataRow(false)]
     [DataRow(true)]
     public async Task EndlessInputOverTheLimitEndsAtTheTimeLimit(bool streaming)
