@@ -139,8 +139,19 @@ public static partial class PdfOptimizer
         {
             if (!inPlace)
             {
+                // Only as much as the limits allow is taken in. Past that the input is passed
+                // on as it comes, so an endless one never fills the disk.
+                long cap = InputCap(options);
                 spool = TemporaryFile();
-                await OutputStreams.CopyAsync(input, spool, ct).ConfigureAwait(false);
+                bool tooLong = input.CanSeek && input.Length - input.Position > cap;
+                if (!tooLong) tooLong = await SpoolAsync(input, spool, cap, ct).ConfigureAwait(false);
+                if (tooLong)
+                {
+                    long length = await PassThroughAsync(spool, input, output, ct).ConfigureAwait(false);
+                    await output.FlushAsync(ct).ConfigureAwait(false);
+                    return OverLimit(length, options, ct);
+                }
+
                 await spool.FlushAsync(ct).ConfigureAwait(false);
             }
 
@@ -165,6 +176,27 @@ public static partial class PdfOptimizer
         {
             spool?.Dispose();
         }
+    }
+
+    /// <summary>
+    /// Copies <paramref name="input"/> to <paramref name="spool"/> until it ends, or until it has
+    /// run past <paramref name="cap"/> bytes by up to one chunk, which is then true.
+    /// </summary>
+    private static async Task<bool> SpoolAsync(Stream input, Stream spool, long cap, CancellationToken ct)
+    {
+        byte[] chunk = new byte[OutputStreams.CopyBufferSize];
+        long copied = 0;
+        int read;
+#pragma warning disable CA1835 // Array overloads keep one code path for .NET Standard 2.0.
+        while ((read = await input.ReadAsync(chunk, 0, chunk.Length, ct).ConfigureAwait(false)) > 0)
+        {
+            await spool.WriteAsync(chunk, 0, read, ct).ConfigureAwait(false);
+            copied += read;
+            if (copied > cap) return true;
+        }
+#pragma warning restore CA1835
+
+        return false;
     }
 
     /// <summary>
