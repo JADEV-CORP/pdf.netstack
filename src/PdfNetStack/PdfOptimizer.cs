@@ -130,6 +130,8 @@ public static partial class PdfOptimizer
     /// asynchronously into memory. With <see cref="PdfOptimizerOptions.Streaming"/>, a
     /// <see cref="FileStream"/> or <see cref="MemoryStream"/> positioned at its start is read on
     /// demand where it is, and any other input is first copied, asynchronously, to a temporary file.
+    /// An input over <see cref="PdfOptimizerOptions.MaxInputBytes"/> or <see cref="PdfLimits.MaxInputBytes"/>
+    /// is passed on to <paramref name="output"/> as it is read, never held beyond one chunk past the limit.
     /// </remarks>
     /// <param name="input">The source PDF, read from its current position to its end.</param>
     /// <param name="output">Receives the optimized PDF, or the input unchanged.</param>
