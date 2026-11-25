@@ -109,6 +109,10 @@ internal sealed class StandardSecurity
         if (r < 2) throw new PdfFormatException($"Encryption dictionary has an invalid revision /R {r}.");
         if (o.Length < 32 || u.Length < 32) throw new PdfFormatException("Encryption dictionary has invalid /O or /U values.");
 
+        // /V 5 is AES-256 with a 32 byte key, which only revisions 5 and 6 make; the MD5 key
+        // of revisions 2 to 4 has 16 bytes at most.
+        if (keyLength > 16) throw new PdfFormatException($"Encryption dictionary pairs /V {v} with revision /R {r}.");
+
         // Owner first: recover the padded user password from /O, then authenticate with it.
         byte[] ownerKey = OwnerRc4Key(Latin1Password(candidate), r, keyLength);
         byte[] recovered = (byte[])o[..32].Clone();
