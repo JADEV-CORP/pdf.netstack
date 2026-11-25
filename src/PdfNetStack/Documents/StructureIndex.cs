@@ -16,6 +16,15 @@ internal sealed class StructureIndex
     /// <summary>Elements read; a larger tree is read this far and the rest of the content goes untagged.</summary>
     public const int MaxElements = 1_000_000;
 
+    /// <summary>
+    /// Children listed, counted every time an element lists one. Elements may share a /K array
+    /// in a damaged or hostile file, so the count of elements alone does not bound the work.
+    /// </summary>
+    public const long MaxKids = 10_000_000;
+
+    /// <summary>Kids read between two looks at the cancellation token.</summary>
+    public const int KidInterval = 1024;
+
     // Element number to its parent's, -1 under the root.
     private readonly Dictionary<int, int> _parents = [];
 
@@ -87,6 +96,14 @@ internal sealed class StructureIndex
         }
     }
 
+    /// <summary>
+    /// True when the /K of <paramref name="element"/> is an indirect array that another element
+    /// already listed, recorded in <paramref name="listed"/>. A real tree gives each element its
+    /// own children; reading a shared array again for every element costs their product.
+    /// </summary>
+    public static bool KidsAlreadyListed(PdfDocument doc, PdfDictionary element, HashSet<int> listed) =>
+        element["K"] is PdfReference r && doc.Resolve(r) is PdfArray && !listed.Add(r.Number);
+
     /// <summary>A marked content reference or an object reference (ISO 32000-1, 14.7.4.3), not an element.</summary>
     public static bool IsContentReference(PdfDictionary d) => d.GetName("Type") is "MCR" or "OBJR";
 
@@ -111,7 +128,15 @@ internal sealed class StructureIndex
     {
         var stack = new Stack<(PdfObject Entry, int Parent, PdfReference? Page, int Depth)>();
         for (int i = RootKids.Count - 1; i >= 0; i--) stack.Push((RootKids[i], -1, null, 0));
-        while (stack.Count > 0)
+
+        // Elements written in place have no number to remember them by, and a /K array can
+        // contain itself through them, so they are remembered by identity.
+        var directSeen = new HashSet<PdfDictionary>(ReferenceEqualityComparer.Instance);
+        var listedKids = new HashSet<int>();
+        long kidCount = 0;
+        int sharedKids = 0;
+        bool tooManyKids = false;
+        while (stack.Count > 0 && !tooManyKids)
         {
             (PdfObject entry, int parent, PdfReference? page, int depth) = stack.Pop();
 
@@ -129,7 +154,7 @@ internal sealed class StructureIndex
                 element = d;
                 owner = r.Number;
             }
-            else if (entry is PdfDictionary direct && !IsContentReference(direct))
+            else if (entry is PdfDictionary direct && !IsContentReference(direct) && directSeen.Add(direct))
             {
                 element = direct;
                 owner = parent;
@@ -140,11 +165,23 @@ internal sealed class StructureIndex
             }
 
             if (element["ID"] is not null) HasIds = true;
+            if (KidsAlreadyListed(doc, element, listedKids))
+            {
+                sharedKids++;
+                continue;
+            }
 
             // An element's /Pg is the page of its MCIDs and of references that name none (Table 323).
             PdfReference? own = element["Pg"] as PdfReference ?? page;
             foreach (PdfObject kid in Kids(doc, element))
             {
+                if (++kidCount > MaxKids)
+                {
+                    tooManyKids = true;
+                    break;
+                }
+
+                if (kidCount % KidInterval == 0) ct.ThrowIfCancellationRequested();
                 if (kid is PdfNumber { IsInteger: true })
                 {
                     if (own is not null) AddContent(own.Number, owner);
@@ -156,6 +193,9 @@ internal sealed class StructureIndex
                 }
             }
         }
+
+        if (sharedKids > 0) doc.Budget.Diagnostics.Skipped(Compat.Format("{0} structure element(s) list children that another element already lists; they were read once.", sharedKids));
+        if (tooManyKids) doc.Budget.Diagnostics.Skipped(Compat.Format("The structure tree lists more than {0} children; the rest was not read, and its content goes untagged in a copy.", MaxKids));
     }
 
     private void AddContent(int page, int owner)
