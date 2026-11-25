@@ -424,4 +424,17 @@ public sealed class OptimizerHardeningTests
             work.Gate.Exit(held);
         }
     }
+
+    [TestMethod]
+    public void WithoutRecompressionAJpegKeepsItsBytes()
+    {
+        byte[] jpeg = JpegCodecTests.Fixture("photo-q95.jpg");
+        byte[] input = PhotoPdf();
+
+        (byte[] kept, _) = PdfOptimizer.Optimize(input, new PdfOptimizerOptions { MinSavingPercent = 0, RecompressStreams = false });
+        (byte[] recompressed, _) = PdfOptimizer.Optimize(input, new PdfOptimizerOptions { MinSavingPercent = 0 });
+
+        Assert.AreNotEqual(-1, kept.AsSpan().IndexOf(jpeg), "The image is written as it was, a baseline JPEG.");
+        Assert.AreEqual(-1, recompressed.AsSpan().IndexOf(jpeg), "With recompression the same image is coded afresh.");
+    }
 }
