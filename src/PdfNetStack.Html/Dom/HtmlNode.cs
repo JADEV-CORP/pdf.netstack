@@ -58,6 +58,7 @@ internal class HtmlElement(string name) : HtmlNode
     private Dictionary<string, int>? _typeCounts;
     private int _elementIndex;
     private int _typeIndex;
+    private int _depth = -1;
 
     public string Name { get; } = name;
 
@@ -119,6 +120,16 @@ internal class HtmlElement(string name) : HtmlNode
     }
 
     internal int ElementSiblingCount => Parent?.ElementChildren.Count ?? 1;
+
+    /// <summary>The number of ancestors, the document included. Worked out once: the parser builds the tree from the top and never moves a node.</summary>
+    internal int Depth
+    {
+        get
+        {
+            if (_depth < 0) _depth = Parent is null ? 0 : Parent.Depth + 1;
+            return _depth;
+        }
+    }
 
     /// <summary>Position among sibling elements with the same name, from 0.</summary>
     internal int TypeIndex

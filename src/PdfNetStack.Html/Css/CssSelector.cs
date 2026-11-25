@@ -610,7 +610,11 @@ internal sealed class LogicalCondition(string name, List<CssSelector> selectors)
 /// <summary>The :nth-* family: an+b, counted from the start or end, among all siblings or one type.</summary>
 internal sealed class NthCondition(string name, int a, int b, List<CssSelector>? of) : CssCondition
 {
-    private Counted? _counted;
+    // The counts for "of S", one parent per depth of the tree. Styling walks the tree depth first,
+    // so the parents with children still to style are the ancestors of the element styled, one
+    // per depth; a parent is replaced only by another at its depth, once its children are done.
+    // As many slots as the tree is deep, which the parser caps.
+    private Counted?[] _byDepth = [];
 
     public override CssSpecificity Specificity => new CssSpecificity(0, 1, 0) + (of is null ? default : CssSpecificity.Max(of));
 
@@ -717,13 +721,29 @@ internal sealed class NthCondition(string name, int a, int b, List<CssSelector>?
     private int[] MatchingBefore(HtmlElement e, WorkBudget budget)
     {
         HtmlElement? parent = e.Parent;
-        if (parent is not null && _counted is Counted counted && ReferenceEquals(counted.Parent, parent)) return counted.Before;
-        List<HtmlElement> siblings = parent?.ElementChildren ?? [e];
+        if (parent is null) return CountMatching([e], budget);
+
+        // A depth that is off, or elements asked out of order, only cost a recount: the slot is checked against the parent.
+        int depth = parent.Depth;
+        Counted?[] slots = _byDepth;
+        if (depth < slots.Length && slots[depth] is Counted counted && ReferenceEquals(counted.Parent, parent)) return counted.Before;
+
+        int[] before = CountMatching(parent.ElementChildren, budget);
+        if (depth >= slots.Length)
+        {
+            Array.Resize(ref slots, Math.Max(depth + 1, slots.Length * 2));
+            _byDepth = slots;
+        }
+
+        // One record per slot, replaced whole, so a selector shared by mistake still reads a consistent pair.
+        slots[depth] = new Counted(parent, before);
+        return before;
+    }
+
+    private int[] CountMatching(List<HtmlElement> siblings, WorkBudget budget)
+    {
         int[] before = new int[siblings.Count + 1];
         for (int k = 0; k < siblings.Count; k++) before[k + 1] = before[k] + (MatchesAny(of!, siblings[k], budget) ? 1 : 0);
-
-        // One reference, replaced whole, so a selector shared by mistake still reads a consistent pair.
-        if (parent is not null) _counted = new Counted(parent, before);
         return before;
     }
 
