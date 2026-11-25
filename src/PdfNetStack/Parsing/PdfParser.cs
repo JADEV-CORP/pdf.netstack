@@ -65,6 +65,15 @@ internal sealed class PdfParser
     /// </summary>
     public bool NestingExceeded { get; private set; }
 
+    /// <summary>
+    /// Tokens this parser may read; <see cref="NextToken"/> throws at the next one. A caller sets
+    /// it to what its own budget has left, so one operand cannot read past the budget.
+    /// </summary>
+    public long TokenLimit { get; set; } = long.MaxValue;
+
+    /// <summary>Set when <see cref="NextToken"/> threw because <see cref="TokenLimit"/> was reached, not because the syntax was damaged.</summary>
+    public bool TokenLimitExceeded { get; private set; }
+
     public void SkipWhitespaceAndComments()
     {
         ReadOnlySpan<byte> s = _data.Span;
@@ -91,6 +100,12 @@ internal sealed class PdfParser
 
     public Token NextToken()
     {
+        if (Tokens >= TokenLimit)
+        {
+            TokenLimitExceeded = true;
+            throw new PdfFormatException("The token limit was reached.");
+        }
+
         Tokens++;
         SkipWhitespaceAndComments();
         ReadOnlySpan<byte> s = _data.Span;
