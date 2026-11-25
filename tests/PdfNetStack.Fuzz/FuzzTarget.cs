@@ -37,7 +37,9 @@ internal static class FuzzTargets
     // Text in many scripts, shaped with whatever part of it a fuzzed font covers.
     private const string Sample = "Hello, world! fi ffi 0123 Été مرحبا שלום नमस्ते ไทย 한국어 日本語 😀";
 
-    private static readonly Type[] DocumentErrors = [typeof(PdfFormatException), typeof(PdfPasswordException)];
+    // Opening documents NotSupportedException for a security handler other than the standard
+    // password one, and PdfSigner.Verify for an encrypted document.
+    private static readonly Type[] DocumentErrors = [typeof(PdfFormatException), typeof(PdfPasswordException), typeof(NotSupportedException)];
 
     public static IReadOnlyList<FuzzTarget> All { get; } =
     [
@@ -99,9 +101,13 @@ internal static class FuzzTargets
         new()
         {
             Name = "image",
+
+            // With the pixel ceiling the API asks for on untrusted images: 2^22 pixels decode within
+            // the oracle's budget. The default (2^28) allows a canvas that no budget of 64 MiB holds,
+            // and a tiny animated WebP may declare one legitimately.
             Run = data =>
             {
-                PdfImage image = PdfImage.Load(data);
+                PdfImage image = PdfImage.Load(data, 0, 1L << 22);
                 _ = image.PixelWidth + image.PixelHeight;
             },
             Documented = [typeof(FormatException)],
@@ -156,7 +162,9 @@ internal static class FuzzTargets
         new()
         {
             Name = "jpx",
-            Run = data => _ = Jpeg2000Decoder.Decode(data, 64L << 20, 1L << 24),
+            // The byte limit caps the decoder's buffers at their peak; the oracle counts every byte
+            // allocated, temporaries included, so the cap sits at half the oracle's 64 MiB.
+            Run = data => _ = Jpeg2000Decoder.Decode(data, 32L << 20, 1L << 23),
             Documented = [typeof(Jpeg2000FormatException)],
             Seeds = Seeds.Jpx,
         },
