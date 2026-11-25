@@ -495,6 +495,23 @@ public sealed class Jpeg2000DecoderTests
     }
 
     /// <summary>
+    /// A fuzzed JP2: one component of 131133 by 45 samples, 24 MB as a plane, mapped through a
+    /// three column palette into three more planes. The palette's planes count against the limit
+    /// with the component's, so a limit only the component fits refuses the image up front.
+    /// </summary>
+    [TestMethod]
+    public void PalettePlanesCountAgainstTheDecodeLimit()
+    {
+        byte[] data = File.ReadAllBytes(Path.Combine(AppContext.BaseDirectory, "Fixtures", "Fuzz", "jpx", "crash-ca7aff9c960d7d02585d656342d4638fd8747910"));
+        const long limit = 32L << 20;
+
+        Assert.ThrowsExactly<Jpeg2000FormatException>(() => Jpeg2000Decoder.Decode(data, limit));
+
+        Assert.HasCount(1, Jpeg2000Decoder.Decode(data, limit, applyPalette: false).Channels);
+        Assert.HasCount(3, Jpeg2000Decoder.Decode(data, 4 * limit).Channels);
+    }
+
+    /// <summary>
     /// A colour image as one tile: its 32 bit planes alone would pass a 64 MB limit, while its
     /// 8 bit raster fits under it with room for the bands of rows on the way.
     /// </summary>
