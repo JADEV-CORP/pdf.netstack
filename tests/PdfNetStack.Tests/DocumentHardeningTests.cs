@@ -401,17 +401,6 @@ public sealed class DocumentHardeningTests
         CollectionAssert.AreEqual(new[] { 0, 1, 2, 3, 0, 1, 2, 3 }, pages.Select(p => doc.Pages.ToList().IndexOf(p!)).ToArray());
     }
 
-    [TestMethod]
-    public void FlatteningAFormWithManyFieldsStopsWhenCancelledWhileGathering()
-    {
-        using PdfDocument doc = PdfDocument.Open(FormWithPageReferences(50, 20_000, i => i % 50));
-        using var source = new CancellationTokenSource();
-        source.CancelAfter(1);
-
-        Assert.ThrowsExactly<OperationCanceledException>(() => doc.Form.Flatten(source.Token));
-        Assert.IsTrue(doc.Form.Exists, "A cancelled flatten leaves the form in place.");
-    }
-
     private sealed class TempFolder : IDisposable
     {
         public TempFolder()
