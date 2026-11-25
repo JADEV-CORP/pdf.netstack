@@ -95,6 +95,32 @@ public sealed class DocumentHardeningTests
     }
 
     [TestMethod]
+    public async Task MergeAsyncOfInputsWithoutPagesThrowsInvalidOperationAndWritesNothing()
+    {
+        using var output = new MemoryStream();
+
+        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => PdfDocument.MergeAsync([], output));
+        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => PdfDocument.MergeAsync([new MemoryStream(Pdf())], output));
+
+        Assert.AreEqual(0, output.Length);
+    }
+
+    [TestMethod]
+    public async Task MergeAsyncPassesOnLimitSecurityAndOutputErrors()
+    {
+        PdfBuilder encrypted = PdfBuilder.Simple("A");
+        encrypted.Set(50, "<</Filter/Custom/V 1/R 2/O(x)/U(x)/P -4>>");
+        var tooLong = new PdfMergeOptions { LoadOptions = new PdfLoadOptions { Mode = PdfLoadMode.OnDemand, Limits = PdfLimits.Default with { MaxInputBytes = 100 } } };
+        using var output = new MemoryStream();
+
+        await Assert.ThrowsExactlyAsync<PdfLimitExceededException>(() => PdfDocument.MergeAsync([new MemoryStream(Pdf("A"))], output, tooLong));
+        await Assert.ThrowsExactlyAsync<NotSupportedException>(() => PdfDocument.MergeAsync([new MemoryStream(encrypted.Build("/Encrypt 50 0 R/ID[<00><00>]"))], output));
+        await Assert.ThrowsExactlyAsync<NotSupportedException>(() => PdfDocument.MergeAsync([new MemoryStream(Pdf("A"))], new MemoryStream([], writable: false)));
+
+        Assert.AreEqual(0, output.Length);
+    }
+
+    [TestMethod]
     public void MergeChecksTheTokenBeforeItReadsTheSequence()
     {
         int pulled = 0;
