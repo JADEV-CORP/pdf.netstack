@@ -48,6 +48,7 @@ public static class PdfInspector
     /// <param name="limits">Ceilings on the input, on decoding and on time.</param>
     /// <param name="maxDecodedStreamBytes">Ceiling for any single decoded stream.</param>
     /// <exception cref="PdfFormatException">The input is not a readable PDF.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">A limit is out of range.</exception>
     /// <exception cref="PdfLimitExceededException">The input is over <paramref name="limits"/>.</exception>
     public static PdfInspection Inspect(ReadOnlyMemory<byte> input, PdfLimits limits, long maxDecodedStreamBytes = 256L << 20)
     {
@@ -92,9 +93,13 @@ public static class PdfInspector
         }
 
         int pages = PdfOptimizer.CountPages(file, budget.Diagnostics);
+        deadline.ThrowIfPassed(budget);
         if (file.WasReconstructed) budget.Diagnostics.Repaired("The cross-reference data was damaged; objects were found by scanning the file.");
         if (file.LengthsRepaired > 0) budget.Diagnostics.Repaired(Compat.Format("{0} stream length(s) were wrong and were corrected from the data.", file.LengthsRepaired));
         if (file.UnreadableObjects > 0) budget.Diagnostics.Skipped(Compat.Format("{0} object(s) could not be parsed and read as null.", file.UnreadableObjects));
+        bool signed = graph.HasSignatureMarkers || input.Span.IndexOf("/ByteRange"u8) >= 0;
+        bool pdfA1 = PdfOptimizer.IsPdfA1(file, maxDecodedStreamBytes);
+        deadline.ThrowIfPassed(budget);
         return new PdfInspection(
             input.Length,
             file.HeaderVersion,
@@ -104,8 +109,8 @@ public static class PdfInspector
             file.RevisionCount,
             file.IsLinearized,
             encrypted,
-            graph.HasSignatureMarkers || input.Span.IndexOf("/ByteRange"u8) >= 0,
-            PdfOptimizer.IsPdfA1(file, maxDecodedStreamBytes),
+            signed,
+            pdfA1,
             file.UsesObjectStreams,
             file.UsesXrefStreams,
             file.WasReconstructed || file.LengthsRepaired > 0 || file.UnreadableObjects > 0,

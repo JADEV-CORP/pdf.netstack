@@ -203,6 +203,22 @@ public sealed class DocumentHardeningTests
         Assert.IsTrue(doc.Budget.DecodedBytesLeft < left, "The second save reads the first update's file through the budget.");
     }
 
+    [TestMethod]
+    public void InspectChecksTheDeadlineAfterTheMetadataIsDecoded()
+    {
+        PdfBuilder b = PdfBuilder.Simple("A");
+        b.Set(1, "<</Type/Catalog/Pages 2 0 R/Metadata 99 0 R>>");
+        b.SetStream(99, "/Type/Metadata/Subtype/XML/Filter/FlateDecode", PdfBuilder.Deflate(new byte[128 << 20]));
+        byte[] pdf = b.Build();
+        PdfInspector.Inspect(pdf);
+
+        // Everything before the metadata is a few objects; decoding 128 MiB takes far longer than 5 ms.
+        var limits = PdfLimits.Default with { Timeout = TimeSpan.FromMilliseconds(5) };
+        var e = Assert.ThrowsExactly<PdfLimitExceededException>(() => PdfInspector.Inspect(pdf, limits));
+
+        Assert.AreEqual(PdfLimitKind.Timeout, e.Limit);
+    }
+
     private sealed class TempFolder : IDisposable
     {
         public TempFolder()
