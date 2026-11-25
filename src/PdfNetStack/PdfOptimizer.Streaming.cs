@@ -513,7 +513,7 @@ public static partial class PdfOptimizer
     {
         var keys = new byte[]?[work.Count];
         var partitioner = System.Collections.Concurrent.Partitioner.Create(Enumerable.Range(0, work.Count), System.Collections.Concurrent.EnumerablePartitionerOptions.NoBuffering);
-        Parallel.ForEach(partitioner, new ParallelOptions { MaxDegreeOfParallelism = parallelism, CancellationToken = ct }, i => keys[i] = work.ContentKey(i));
+        Parallel.ForEach(partitioner, new ParallelOptions { MaxDegreeOfParallelism = parallelism, CancellationToken = ct }, i => keys[i] = work.ContentKey(i, ct));
         var result = new Dictionary<int, byte[]>();
         for (int i = 0; i < work.Count; i++)
         {

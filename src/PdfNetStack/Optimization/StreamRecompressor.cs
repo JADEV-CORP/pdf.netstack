@@ -208,6 +208,9 @@ internal static class StreamRecompressor
 
         public int Count => Streams.Count;
 
+        /// <summary>The memory the workers on this work's streams share.</summary>
+        internal MemoryGate Gate => _gate;
+
         /// <summary>The budget every decode is charged to: the source file's.</summary>
         public ResourceBudget? Budget { get; init; }
 
@@ -320,26 +323,36 @@ internal static class StreamRecompressor
         /// streaming optimizer can find duplicates before it writes anything. Null when the stream
         /// has no plan or its data does not decode; such a stream is compared by its bytes.
         /// </summary>
-        public byte[]? ContentKey(int i)
+        public byte[]? ContentKey(int i, CancellationToken ct)
         {
             if (_plans[i] is not { } plan) return null;
-            DecodedStream decoded;
+
+            // Only the decoded data is held, a third of what the whole recompression takes.
+            long weight = _gate.Enter(plan.Footprint / 3, ct);
             try
             {
-                decoded = StreamCodec.Decode(Streams[i].Data, plan.Filters, DecodeDepth.CompressionOnly, _decodeLimit, static o => o, Budget);
-            }
-            catch (StreamDecodeException)
-            {
-                return null;
-            }
+                DecodedStream decoded;
+                try
+                {
+                    decoded = StreamCodec.Decode(Streams[i].Data, plan.Filters, DecodeDepth.CompressionOnly, _decodeLimit, static o => o, Budget);
+                }
+                catch (StreamDecodeException)
+                {
+                    return null;
+                }
 
-            using (decoded)
-            {
-                byte[] content = ContentHash(decoded.Data.Span, decoded.PendingPredictor, decoded.Remaining);
+                using (decoded)
+                {
+                    byte[] content = ContentHash(decoded.Data.Span, decoded.PendingPredictor, decoded.Remaining);
 
-                // Whether the stream may be compacted, requantized or resampled, and to what size.
-                string what = FormattableString.Invariant($"{plan.Compact}|{plan.Recompress}|{plan.Jpeg?.Quality}|{plan.Image?.Target}|{plan.Image?.MayConvert}|{plan.Image?.PaletteBase is not null}");
-                return Compat.Sha256([.. content, .. System.Text.Encoding.ASCII.GetBytes(what)]);
+                    // Whether the stream may be compacted, requantized or resampled, and to what size.
+                    string what = FormattableString.Invariant($"{plan.Compact}|{plan.Recompress}|{plan.Jpeg?.Quality}|{plan.Image?.Target}|{plan.Image?.MayConvert}|{plan.Image?.PaletteBase is not null}");
+                    return Compat.Sha256([.. content, .. System.Text.Encoding.ASCII.GetBytes(what)]);
+                }
+            }
+            finally
+            {
+                _gate.Exit(weight);
             }
         }
 

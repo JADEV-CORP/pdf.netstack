@@ -137,11 +137,15 @@ internal readonly struct Deadline
         ? Timeout.InfiniteTimeSpan
         : TimeSpan.FromSeconds(Math.Max(0, _end - Stopwatch.GetTimestamp()) / (double)Stopwatch.Frequency);
 
-    /// <summary>A source the deadline cancels, for work that takes a token; null without a deadline.</summary>
+    /// <summary>
+    /// A source the deadline cancels, for work that takes a token; null without a deadline, and
+    /// when it is further off than a timer can count, about 24.8 days on .NET Framework.
+    /// </summary>
     public CancellationTokenSource? NewTimer()
     {
         if (_end == 0) return null;
         TimeSpan left = Remaining;
+        if (left.TotalMilliseconds > int.MaxValue) return null;
         if (left >= TimeSpan.FromMilliseconds(1)) return new CancellationTokenSource(left);
 
         // Under a millisecond left: .NET cancels such a source at once, but .NET Framework starts a

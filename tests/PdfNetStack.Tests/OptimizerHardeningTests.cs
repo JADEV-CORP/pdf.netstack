@@ -377,4 +377,51 @@ public sealed class OptimizerHardeningTests
         Assert.ThrowsExactly<OperationCanceledException>(() => ImageSamples.Convert(new byte[10], 100, 100, 1, 13, ColorSpace.Gray, decode, false, Cancelled()));
         Assert.AreEqual(100, ImageSamples.Convert(new byte[10], 100, 100, 1, 13, ColorSpace.Gray, decode, false, CancellationToken.None).Width);
     }
+
+    [TestMethod]
+    public void TimeoutBeyondWhatATimerTakesStillRuns()
+    {
+        // A timer takes at most int.MaxValue milliseconds, about 24.8 days, on .NET Framework.
+        var limits = new PdfLimits { Timeout = TimeSpan.FromDays(60) };
+        byte[] input = PdfBuilder.Simple("x").Build();
+
+        (_, PdfOptimizationResult result) = PdfOptimizer.Optimize(input, new PdfOptimizerOptions { Limits = limits });
+        using PdfDocument doc = PdfDocument.Open(input, new PdfLoadOptions { Limits = limits });
+        PdfInspection inspection = PdfInspector.Inspect(input, limits);
+
+        Assert.AreNotEqual(OptimizationDisposition.LimitExceeded, result.Disposition, result.Reason);
+        Assert.AreEqual(1, doc.Pages.Count);
+        Assert.AreEqual(1, inspection.PageCount);
+    }
+
+    /// <summary>A planned stream of the work for a small image, and the work's memory gate.</summary>
+    private static (StreamRecompressor.Work Work, int Stream) GatedWork()
+    {
+        PdfFile file = PdfFile.Open(PredictedImagePdf(64), 64 << 10);
+        ObjectGraph graph = ObjectGraph.Collect(file, false, false, CancellationToken.None);
+        StreamRecompressor.Work work = StreamRecompressor.Prepare(file, graph, RecompressionScope.All, CompressionLevel.Optimal, false, true, false, null, null, 64 << 10, CancellationToken.None);
+        return (work, work.IndexOf(10));
+    }
+
+    [TestMethod]
+    public void ContentKeysWaitForTheMemoryGate()
+    {
+        (StreamRecompressor.Work work, int image) = GatedWork();
+        long held = work.Gate.Enter(long.MaxValue, CancellationToken.None);
+        try
+        {
+            Assert.ThrowsExactly<OperationCanceledException>(() => work.ContentKey(image, Cancelled()));
+
+            Task<byte[]?> key = Task.Run(() => work.ContentKey(image, CancellationToken.None));
+            Assert.IsFalse(key.Wait(300), "The decode waits while the gate's memory is spent.");
+            work.Gate.Exit(held);
+            held = 0;
+            Assert.IsTrue(key.Wait(10_000));
+            Assert.IsNotNull(key.Result);
+        }
+        finally
+        {
+            work.Gate.Exit(held);
+        }
+    }
 }
