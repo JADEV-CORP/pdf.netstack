@@ -209,7 +209,7 @@ internal sealed partial class PageImporter
                     copy.PendingReferences.Add((result, value));
                     break;
                 case "C" when !SameDocument:
-                    result.Set(key, RenamedClasses(_source.Resolve(value)));
+                    result.Set(key, RenamedClasses(value, copy, ct));
                     break;
                 default:
                     result.Set(key, CopyValue(value, key, 1, pageMap, batch, work));
@@ -550,12 +550,43 @@ internal sealed partial class PageImporter
     private static string Renamed(Dictionary<string, string>? renames, string name) => renames is not null && renames.TryGetValue(name, out string? to) ? to : name;
 
     /// <summary>An element's /C: a class name, or an array of names each optionally followed by a revision number.</summary>
-    private PdfObject RenamedClasses(PdfObject? value) => value switch
+    /// <remarks>
+    /// Many elements can share one /C array held as an object. It is renamed once a round, into a
+    /// new object the copies share, as the originals do; each name read is charged to the round's work.
+    /// </remarks>
+    private PdfObject RenamedClasses(PdfObject value, StructureCopy copy, CancellationToken ct)
     {
-        PdfName name => new PdfName(Renamed(_classRenames, name.Value)),
-        PdfArray array => new PdfArray([.. array.Select(item => _source.Resolve(item) is PdfName n ? new PdfName(Renamed(_classRenames, n.Value)) : item is PdfReference ? PdfNull.Instance : item)]),
-        _ => PdfNull.Instance,
-    };
+        if (value is PdfReference shared && copy.ClassArrays.TryGetValue(shared.Number, out PdfObject? done)) return done;
+        PdfObject renamed;
+        switch (_source.Resolve(value))
+        {
+            case PdfName name:
+                renamed = new PdfName(Renamed(_classRenames, name.Value));
+                break;
+            case PdfArray array:
+                var items = new List<PdfObject>(array.Count);
+                foreach (PdfObject item in array)
+                {
+                    // Out of work, the element goes without its classes, and the elements after it are not copied.
+                    if (!copy.Charge(ct))
+                    {
+                        _source.Budget.Diagnostics.Skipped(Compat.Format("A copy of the structure tree stopped after {0} children and references; the rest of its content goes untagged.", StructureIndex.MaxKids));
+                        return PdfNull.Instance;
+                    }
+
+                    items.Add(_source.Resolve(item) is PdfName n ? new PdfName(Renamed(_classRenames, n.Value)) : item is PdfReference ? PdfNull.Instance : item);
+                }
+
+                renamed = value is PdfReference ? _target.AddObject(new PdfArray(items)) : new PdfArray(items);
+                break;
+            default:
+                renamed = PdfNull.Instance;
+                break;
+        }
+
+        if (value is PdfReference own) copy.ClassArrays[own.Number] = renamed;
+        return renamed;
+    }
 
     private void MergeRoleMap(PdfDictionary root, StructureIndex index)
     {
@@ -686,7 +717,8 @@ internal sealed partial class PageImporter
         // /C holds a class name, or class names each optionally followed by a revision number.
         PdfDictionary? attribute = null;
         PdfNumber? revision = null;
-        PdfArray list = names as PdfArray ?? PdfArray.Of(names);
+        PdfObject resolved = _target.Resolve(names) ?? PdfNull.Instance;
+        PdfArray list = resolved as PdfArray ?? PdfArray.Of(resolved);
         for (int i = 0; i < list.Count && attribute is null; i++)
         {
             if (list[i] is not PdfName name) continue;
@@ -951,11 +983,14 @@ internal sealed partial class PageImporter
         /// <summary>Elements written in place that were copied, by identity.</summary>
         public HashSet<PdfDictionary> DirectVisited { get; } = new(ReferenceEqualityComparer.Instance);
 
+        /// <summary>Source /C values held as objects of their own, to what the copies hold instead.</summary>
+        public Dictionary<int, PdfObject> ClassArrays { get; } = [];
+
         /// <summary>Indirect /K arrays some element already listed.</summary>
         public HashSet<int> ListedKids { get; } = [];
 
         /// <summary>
-        /// Children listed and /Ref and /Headers entries read so far, bounded together by
+        /// Children listed and /Ref, /C and /Headers entries read so far, bounded together by
         /// <see cref="StructureIndex.MaxKids"/>, so the work of a round is bounded however the
         /// file shares its arrays.
         /// </summary>
