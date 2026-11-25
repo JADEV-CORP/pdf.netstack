@@ -18,7 +18,7 @@ internal static class Program
           PDFNETSTACK_FUZZ_TARGET=<target> dotnet PdfNetStack.Fuzz.dll <input>   one input, as libFuzzer runs it
 
         Without it:
-          PdfNetStack.Fuzz replay <target> <file or folder>...   run inputs through the oracle; exit 1 on a finding
+          PdfNetStack.Fuzz replay <target> <file or folder>...   run inputs through the oracle; exit 1 on a finding, stop at a hang
           PdfNetStack.Fuzz seeds <target> <fixtures> <out>      write the target's starting inputs
           PdfNetStack.Fuzz list                                 list the targets
         """;
@@ -66,7 +66,7 @@ internal static class Program
                 Console.WriteLine($"{t.Name}: {written} seed(s) in {args[3]}");
                 return 0;
             case "replay" when args.Length >= 3 && FuzzTargets.Find(args[1]) is { } t:
-                return Replay(t, args[2..]);
+                return Replay(t, args[2..], Console.Out);
             default:
                 Console.Error.WriteLine(Usage);
                 return 2;
@@ -80,8 +80,8 @@ internal static class Program
     /// </summary>
     internal static TimeSpan SharpFuzzHangLimit(string[] args) => args.Length == 0 ? Timeout.InfiniteTimeSpan : Oracle.HangLimit;
 
-    /// <summary>Runs every file through the oracle and prints one line per finding.</summary>
-    private static int Replay(FuzzTarget target, string[] paths)
+    /// <summary>Runs every file through the oracle and prints one line per finding, stopping at a hang.</summary>
+    internal static int Replay(FuzzTarget target, string[] paths, TextWriter output)
     {
         var files = paths.SelectMany<string, string>(p => Directory.Exists(p) ? Directory.GetFiles(p).Order(StringComparer.Ordinal) : [p]).ToList();
 
@@ -98,12 +98,21 @@ internal static class Program
             catch (FuzzFinding finding)
             {
                 findings++;
-                Console.WriteLine($"FINDING {path}: {finding.Message}");
-                if (finding.InnerException is { } inner) Console.WriteLine(inner.StackTrace);
+                output.WriteLine($"FINDING {path}: {finding.Message}");
+                if (finding.InnerException is { } inner) output.WriteLine(inner.StackTrace);
+
+                // The hung run cannot be stopped, and the next input would be measured with it:
+                // allocations count for the whole process, and it takes CPU from the clock. So the
+                // replay stops here, as libFuzzer stops at its first timeout.
+                if (finding.StillRunning)
+                {
+                    output.WriteLine($"Stopped at the hang: {files.Count - inputs} input(s) after it not checked; replay them separately.");
+                    break;
+                }
             }
         }
 
-        Console.WriteLine($"{target.Name}: {inputs} input(s), {findings} finding(s)");
+        output.WriteLine($"{target.Name}: {inputs} input(s), {findings} finding(s)");
         return findings == 0 ? 0 : 1;
     }
 }

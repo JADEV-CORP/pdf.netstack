@@ -125,6 +125,52 @@ public sealed class FuzzHarnessTests
     }
 
     [TestMethod]
+    public void ReplayStopsAtAHang()
+    {
+        // b hangs while allocating, then c is fine but takes a moment. b's thread cannot be
+        // stopped, and its allocations counted against c, a false finding.
+        string folder = Path.Combine(Path.GetTempPath(), "pdfnetstack-replay-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(folder);
+        string[] files = ["a", "b", "c"];
+        for (int i = 0; i < files.Length; i++)
+        {
+            files[i] = Path.Combine(folder, files[i]);
+            File.WriteAllBytes(files[i], [(byte)i]);
+        }
+
+        using var release = new ManualResetEventSlim();
+        FuzzTarget target = Synthetic(data =>
+        {
+            if (data is [1])
+            {
+                while (!release.IsSet) GC.KeepAlive(new byte[1 << 16]);
+            }
+            else if (data is [2])
+            {
+                Thread.Sleep(200);
+            }
+        });
+        TimeSpan saved = Oracle.HangLimit;
+        Oracle.HangLimit = TimeSpan.FromMilliseconds(300);
+        var output = new StringWriter();
+        try
+        {
+            Assert.AreEqual(1, PdfNetStack.Fuzz.Program.Replay(target, files, output));
+        }
+        finally
+        {
+            Oracle.HangLimit = saved;
+            release.Set();
+            Directory.Delete(folder, recursive: true);
+        }
+
+        string text = output.ToString();
+        StringAssert.Contains(text, "FINDING " + files[1] + ": synthetic: did not finish within");
+        Assert.IsFalse(text.Contains("FINDING " + files[2], StringComparison.Ordinal), text);
+        StringAssert.Contains(text, "1 input(s) after it not checked");
+    }
+
+    [TestMethod]
     public void OneFileRunKeepsTheHangLimit()
     {
         // libFuzzer starts the harness without arguments and ends a hung run with its own -timeout.

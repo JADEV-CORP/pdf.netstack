@@ -4,7 +4,11 @@ using System.Runtime.ExceptionServices;
 namespace PdfNetStack.Fuzz;
 
 /// <summary>An input that broke one of the oracle's rules.</summary>
-internal sealed class FuzzFinding(string message, Exception? inner = null) : Exception(message, inner);
+internal sealed class FuzzFinding(string message, Exception? inner = null) : Exception(message, inner)
+{
+    /// <summary>The target hung and still runs on its thread, which nothing can stop.</summary>
+    public bool StillRunning { get; init; }
+}
 
 /// <summary>
 /// Decides whether one input is a finding. Crashes alone miss the bugs that matter for a parser of
@@ -87,7 +91,7 @@ internal static class Oracle
             StackBytes)
         { IsBackground = true };
         worker.Start();
-        if (!worker.Join(HangLimit)) throw new FuzzFinding($"{target.Name}: did not finish within {HangLimit.TotalSeconds:F1} s");
+        if (!worker.Join(HangLimit)) throw new FuzzFinding($"{target.Name}: did not finish within {HangLimit.TotalSeconds:F1} s") { StillRunning = true };
         if (error is not null) ExceptionDispatchInfo.Capture(error).Throw();
     }
 
