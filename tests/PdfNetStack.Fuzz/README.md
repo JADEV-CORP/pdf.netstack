@@ -31,6 +31,9 @@ dotnet run --project tests/PdfNetStack.Fuzz -c Release -- seeds open tests/PdfNe
 dotnet run --project tests/PdfNetStack.Fuzz -c Release -- replay open seeds/open crash-1234
 ```
 
+A replay stops at an input that does not finish within 30 seconds: its thread cannot be stopped,
+and it would count against the inputs after it. Replay those separately.
+
 Fuzz with libFuzzer (Linux), as `.github/workflows/fuzz.yml` does:
 
 ```bash
