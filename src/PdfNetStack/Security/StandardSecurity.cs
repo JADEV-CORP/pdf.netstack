@@ -105,7 +105,8 @@ internal sealed class StandardSecurity
             throw new PdfPasswordException();
         }
 
-        if (r < 2) throw new NotSupportedException($"Security handler revision {r} is not supported.");
+        // Revisions are 2 to 6; 0 and 1 do not exist, so the dictionary is damaged.
+        if (r < 2) throw new PdfFormatException($"Encryption dictionary has an invalid revision /R {r}.");
         if (o.Length < 32 || u.Length < 32) throw new PdfFormatException("Encryption dictionary has invalid /O or /U values.");
 
         // Owner first: recover the padded user password from /O, then authenticate with it.
@@ -323,7 +324,8 @@ internal sealed class StandardSecurity
                 "AESV2" => CryptMethod.AesV2,
                 "AESV3" => CryptMethod.AesV3,
                 "None" or null => CryptMethod.None,
-                string other => throw new NotSupportedException($"Crypt filter method '{other}' is not supported."),
+                // The methods are None, V2, AESV2 and AESV3; any other name is damage, not a feature.
+                string other => throw new PdfFormatException($"Crypt filter method '{other}' is not valid."),
             };
         }
 
