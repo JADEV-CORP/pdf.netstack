@@ -24,12 +24,32 @@ public sealed class FuzzHarnessTests
         var seeds = target.Seeds(Fixtures).ToList();
         Assert.IsNotEmpty(seeds, name + " has no seeds");
 
-        Oracle.WarmUp(target);
+        Oracle.WarmUp(target, seeds[0].Data);
         foreach ((string file, byte[] data) in seeds)
         {
             Assert.IsLessThanOrEqualTo(Seeds.MaxBytes, data.Length, file);
             Oracle.Check(target, data);
         }
+    }
+
+    /// <summary>Inputs the fuzzer found, saved as Fixtures/Fuzz/&lt;target&gt;/&lt;file&gt; once fixed.</summary>
+    public static IEnumerable<object[]> Findings =>
+        Directory.GetDirectories(Path.Combine(Fixtures, "Fuzz"))
+            .SelectMany(dir => Directory.GetFiles(dir).Select(file => new object[] { Path.GetFileName(dir), Path.GetFileName(file) }))
+            .OrderBy(row => (string)row[0], StringComparer.Ordinal)
+            .ThenBy(row => (string)row[1], StringComparer.Ordinal);
+
+    [TestMethod]
+    [DynamicData(nameof(Findings))]
+    public void PastFindingsPassTheOracle(string name, string file)
+    {
+        FuzzTarget target = FuzzTargets.Find(name)!;
+        Assert.IsNotNull(target, "Fixtures/Fuzz/" + name + " is not a target");
+        byte[] input = File.ReadAllBytes(Path.Combine(Fixtures, "Fuzz", name, file));
+
+        // The input warms up first, as under libFuzzer, so loading code is not counted.
+        Oracle.WarmUp(target, input);
+        Oracle.Check(target, input);
     }
 
     [TestMethod]
