@@ -100,4 +100,50 @@ public sealed class StructureHardeningTests
         target.Pages.Import(s.Pages);
         Assert.AreEqual("Document(P(Span),Table(TH,TD),Heading(Link),Figure)", StructureImportTests.CheckStructure(StructureImportTests.Saved(target)));
     }
+
+    [TestMethod]
+    public void ElementsSharingOneKidsArrayAreReadOnce()
+    {
+        const int Elements = 4000;
+        const int Kids = 4000;
+        var b = new PdfBuilder();
+        b.Set(1, "<</Type/Catalog/Pages 2 0 R/StructTreeRoot 20 0 R>>");
+        b.Set(2, "<</Type/Pages/Kids[5 0 R]/Count 1>>");
+        b.Set(5, "<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]>>");
+        b.Set(20, "<</Type/StructTreeRoot/K 21 0 R/ParentTree 30 0 R>>");
+        b.Set(21, "<</Type/StructElem/S/Document/P 20 0 R/K[" + string.Join(" ", Enumerable.Range(300, Elements).Select(n => n + " 0 R")) + "]>>");
+        b.Set(30, "<</Nums[]>>");
+        b.Set(100, "[" + string.Join(" ", Enumerable.Range(0, Kids)) + "]");
+        for (int i = 0; i < Elements; i++) b.Set(300 + i, "<</Type/StructElem/S/P/P 21 0 R/Pg 5 0 R/K 100 0 R>>");
+
+        PdfDocument source = PdfDocument.Open(b.Build());
+        PdfDocument target = PdfDocument.Create();
+
+#if NET
+        long before = GC.GetAllocatedBytesForCurrentThread();
+#endif
+        target.Pages.Import(source.Pages);
+#if NET
+        long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+        Assert.IsLessThan(64L * 1024 * 1024, allocated, "a shared kids array is not copied once per element");
+#endif
+        Assert.IsTrue(source.Diagnostics.Any(d => d.Kind == PdfDiagnosticKind.Skipped), "the skipped sharing is reported");
+    }
+
+    [TestMethod]
+    public void AKidsArrayThatContainsItselfThroughDirectElementsIsWalkedOnce()
+    {
+        var b = new PdfBuilder();
+        b.Set(1, "<</Type/Catalog/Pages 2 0 R/StructTreeRoot 20 0 R>>");
+        b.Set(2, "<</Type/Pages/Kids[5 0 R]/Count 1>>");
+        b.Set(5, "<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]>>");
+        b.Set(20, "<</Type/StructTreeRoot/K 40 0 R>>");
+        b.Set(40, "[<</Type/StructElem/S/P/Pg 5 0 R/K 40 0 R>> <</Type/StructElem/S/P/Pg 5 0 R/K 40 0 R>>]");
+
+        PdfDocument source = PdfDocument.Open(b.Build());
+        PdfDocument target = PdfDocument.Create();
+        Task import = Task.Run(() => target.Pages.Import(source.Pages));
+        Assert.IsTrue(import.Wait(TimeSpan.FromSeconds(10)), "the import finishes");
+        Assert.HasCount(1, target.Pages);
+    }
 }

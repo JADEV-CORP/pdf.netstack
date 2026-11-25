@@ -106,7 +106,7 @@ internal sealed partial class PageImporter
     private (PdfDictionary Dictionary, int Number)? CopyElement(
         PdfObject entry, PdfReference? inheritedPage, int depth, StructureCopy copy, Dictionary<int, int> pageMap, Dictionary<int, int> batch, Queue<(PdfObject, int)> work, CancellationToken ct)
     {
-        if (depth > StructureIndex.MaxDepth) return null;
+        if (depth > StructureIndex.MaxDepth || copy.TooManyKids) return null;
         int? number = entry is PdfReference r ? r.Number : null;
 
         // An element reached twice, through a cycle or a second parent, is copied once.
@@ -114,11 +114,25 @@ internal sealed partial class PageImporter
         if (_source.Resolve(entry) is not PdfDictionary element || StructureIndex.IsContentReference(element)) return null;
         if (++copy.Copied % CancellationInterval == 0) ct.ThrowIfCancellationRequested();
 
+        // An element written in place can be reached again through a /K array that contains it.
+        if (number is null && !copy.DirectVisited.Add(element)) return null;
+
+        // The index read a shared /K array for one element only; the others have no children here.
+        if (StructureIndex.KidsAlreadyListed(_source, element, copy.ListedKids)) return null;
+
         PdfReference? page = element["Pg"] as PdfReference ?? inheritedPage;
         var kids = new PdfArray();
         var children = new List<PdfDictionary>();
         foreach (PdfObject kid in StructureIndex.Kids(_source, element))
         {
+            if (++copy.KidCount > StructureIndex.MaxKids)
+            {
+                copy.TooManyKids = true;
+                _source.Budget.Diagnostics.Skipped(Compat.Format("A copy of the structure tree stopped after {0} children; the rest of its content goes untagged.", StructureIndex.MaxKids));
+                break;
+            }
+
+            if (copy.KidCount % StructureIndex.KidInterval == 0) ct.ThrowIfCancellationRequested();
             if (kid is PdfNumber { IsInteger: true })
             {
                 if (page is not null && pageMap.ContainsKey(page.Number)) kids.Add(kid);
@@ -627,6 +641,17 @@ internal sealed partial class PageImporter
         public PdfDictionary? ClassMap { get; set; }
 
         public int Copied { get; set; }
+
+        /// <summary>Elements written in place that were copied, by identity.</summary>
+        public HashSet<PdfDictionary> DirectVisited { get; } = new(ReferenceEqualityComparer.Instance);
+
+        /// <summary>Indirect /K arrays some element already listed.</summary>
+        public HashSet<int> ListedKids { get; } = [];
+
+        /// <summary>Children listed so far, bounded by <see cref="StructureIndex.MaxKids"/>.</summary>
+        public long KidCount { get; set; }
+
+        public bool TooManyKids { get; set; }
 
         /// <summary>
         /// The parent tree value for a copy whose source key is <paramref name="key"/>: for
