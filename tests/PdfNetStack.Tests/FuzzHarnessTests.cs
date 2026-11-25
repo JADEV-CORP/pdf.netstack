@@ -124,6 +124,16 @@ public sealed class FuzzHarnessTests
         }
     }
 
+    [TestMethod]
+    public void OneFileRunKeepsTheHangLimit()
+    {
+        // libFuzzer starts the harness without arguments and ends a hung run with its own -timeout.
+        // Given one file, SharpFuzz runs it once with no timeout: the oracle's limit is all there is.
+        Assert.AreEqual(Timeout.InfiniteTimeSpan, PdfNetStack.Fuzz.Program.SharpFuzzHangLimit([]));
+        Assert.AreEqual(Oracle.HangLimit, PdfNetStack.Fuzz.Program.SharpFuzzHangLimit(["crash-input"]));
+        Assert.AreNotEqual(Timeout.InfiniteTimeSpan, Oracle.HangLimit);
+    }
+
     private static FuzzTarget Synthetic(Action<byte[]> run, params Type[] documented) => new()
     {
         Name = "synthetic",
