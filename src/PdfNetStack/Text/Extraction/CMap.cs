@@ -225,7 +225,13 @@ internal sealed class CMap
         switch (_form)
         {
             case UnicodeForm.Utf16:
-                return length == 4 ? char.ConvertFromUtf32(0x10000 + ((int)((code >> 16) - 0xD800) << 10) + (int)((code & 0xFFFF) - 0xDC00)) : Char((int)code);
+                if (length != 4) return Char((int)code);
+
+                // Four bytes are a surrogate pair. Anything else is not UTF-16 and maps to nothing.
+                uint high = code >> 16, low = code & 0xFFFF;
+                return high is >= 0xD800 and <= 0xDBFF && low is >= 0xDC00 and <= 0xDFFF
+                    ? char.ConvertFromUtf32(0x10000 + (int)((high - 0xD800) << 10) + (int)(low - 0xDC00))
+                    : null;
             case UnicodeForm.Utf32:
                 return code <= 0x10FFFF ? Char((int)code) : null;
             case UnicodeForm.Utf8:
