@@ -147,8 +147,6 @@
 - Behaviour changes in the optimizer's output: object numbering in compact files differs from the
   input order; an XObject `/Name` can disappear; metadata is compressed in PDF/A-2 and later
   inputs.
-- Library defaults on the public 77 file corpus: {{1.2.0 saving}} before, {{1.3.0 saving}} after,
-  from the 1.3 CI comparison report.
 - `PdfNetStack.Html`: selector matching uses an ancestor Bloom filter, so 313 KB of descendant
   selectors went from 82 s to 2 s. Custom properties are shared between elements: 4,000 properties
   on 60,000 elements went from 6.7 GB to 0.3 GB allocated.
