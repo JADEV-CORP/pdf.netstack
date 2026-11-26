@@ -37,18 +37,24 @@
   its jamo, although it reported covering it; an encryption dictionary with a revision below 2 or
   an unknown crypt filter method raised `NotSupportedException`, and one pairing `/V 5` with a
   revision below 5 threw `ArgumentOutOfRangeException`: both now raise `PdfFormatException`; an empty font collection raised `ArgumentOutOfRangeException` and now
-  raises `FontFormatException`.
+  raises `FontFormatException`; a 576 byte JPEG 2000 image whose palette maps one component to
+  several channels allocated those channels outside the decode limit.
 - Fixed: on .NET Framework, a `PdfLimits.Timeout` with under a millisecond left started a timer
   that fired after short work had finished, so the call returned instead of stopping.
 - Fixed: an input over `PdfLimits.MaxInputBytes` or `PdfOptimizerOptions.MaxInputBytes` reached
   the optimizer's memory or disk before it was refused: a forward-only input was copied in full to
   a temporary file, `OptimizeAsync` buffered up to 1 GiB, and `OptimizeFileAsync` read the whole
   file. It is now passed through unchanged, holding at most one chunk past the limit, and reported
-  as `LimitExceeded`. `PdfLimits.Timeout` now also bounds opening, reading the input and, on
-  demand, parsing it.
+  as `LimitExceeded`, also when a file grows past the limit while it is read. `PdfLimits.Timeout`
+  now also bounds opening, reading the input and, on demand, parsing it. The optimizer starts its
+  time limit before it reads the input: `OptimizeAsync` and `OptimizeFileAsync` raise
+  `PdfLimitExceededException` when time runs out while the input is still being read or passed on,
+  as they can no longer write it unchanged.
 - Fixed, budgets that could be bypassed: decoded images handed back were refunded to
   `MaxTotalDecodedBytes`; JPEG, JPEG 2000 and CCITT images were charged at their dictionary size
-  rather than their own; the optimizer's lossy decodes and undone predictors were not charged; up to
+  rather than their own; the optimizer's lossy decodes, JPEG requantization checks and undone predictors were not
+  charged; the lossless and lossy passes of one optimization each had a whole budget, and now share
+  one; up to
   1023 content operators ran per page once `MaxOperationsPerDocument` was spent; one operand, such
   as a long array, was not bounded by the token budget; and the time limit was read every 1024
   operators, so one long text string ran far past it.
@@ -57,10 +63,14 @@
   file); both are read once and bounded. A page listed twice in one import gets its own tags and
   annotations, a table merged twice keeps each cell's header reference, a `/Ref` to a later element
   is kept, a shared form keeps its parent tree key when a later import tags it, parent tree keys
-  never pass the largest integer, and a cancelled import removes the objects it copied.
+  never pass the largest integer, and a cancelled import removes the objects it copied. A page
+  listed twice keeps its links to the pages copied with it, a cancelled import also removes the
+  copies of the pages listed twice, a page imported into its own document sees the tags earlier
+  imports added, header IDs named in class attributes are renamed with the headers, and `/Ref`,
+  `/Headers` and class arrays are charged to the budget.
 - Fixed in the HTML converter, work that grew with the square of the input and was not counted
-  against `MaxStyleWork` or `MaxLayoutWork`: pseudo-element and compound selectors, long class
-  lists, line building in long paragraphs, and fixed boxes and running headers repeated on every
+  against `MaxStyleWork` or `MaxLayoutWork`: pseudo-element and compound selectors, attribute
+  selectors on long values, `:nth-child(An+B of S)` in nested documents, long class lists, line building in long paragraphs, and fixed boxes and running headers repeated on every
   page. Parsing text observes cancellation.
 - Fixed: `ToArray` without optimization and the optimizer's writer ignored cancellation; a cancelled
   `MergeAsync` left an opened input stream undisposed; `Merge` read the whole sequence before its
@@ -71,9 +81,12 @@
   allocated up to 8 MB for each; a page listed many times in the page tree was copied outside the
   budget; a lossy optimization stopped by a limit other than time came back as the lossless rewrite
   marked `Optimized`; ActualText crossing `MaxTextCharsPerPage` was dropped with the text after it;
-  a `Timeout` above about 24.8 days threw `ArgumentOutOfRangeException`.
+  a `Timeout` above about 24.8 days threw `ArgumentOutOfRangeException`; a page reached both
+  directly and through a branch nested too deep was dropped as a loop; a `true`, `false` or `null`
+  operand read as the token budget ran out threw `PdfFormatException` instead of ending the page.
 - `PdfDocument.Open`, `OpenAsync` and page text, letter, word and image extraction document
-  `PdfLimitExceededException`, which they already threw.
+  `PdfLimitExceededException`, which they already threw. `MergeAsync` documents it too, with
+  `NotSupportedException` and the `InvalidOperationException` for inputs without a page.
 - `PdfDocument.Open` and `OpenOnDemand` document `NotSupportedException` for a file encrypted with
   a security handler other than the standard password one, which they already threw.
 - Large decode buffers are no longer kept in the shared array pool after a call: an image heavy
@@ -101,7 +114,8 @@
   pages into a new document.
 - `PdfAcroForm.Fill(values, flatten)` sets fields by name in one call and checks everything first:
   unknown names, read only fields and values a field does not take throw one `ArgumentException`
-  listing every problem, and nothing changes. `TryGetField<T>` finds a field of a given kind
+  listing every problem, and nothing changes. A null value clears a field whose parent holds a
+  value too: the field gets an empty value of its own, and its siblings keep the parent's. `TryGetField<T>` finds a field of a given kind
   without a cast.
 - `PdfOptimizerOptions.RemoveUsageRights` and `--remove-usage-rights` rewrite a form whose only
   signature is Adobe Reader usage rights, and remove them. Off by default.
@@ -126,7 +140,9 @@
   Predicted rows are deflated as they are made, and object streams are compressed in parallel; the
   output is the same file.
 - Lossless recompression is bounded by each stream's expected decoded size, and one memory budget,
-  half of what the runtime reports available, bounds every optimization running in the process.
+  half of what the runtime reports available, bounds every optimization running in the process. A
+  stream is decoded no further than its expected size; one whose `/DL` or dimensions understate it
+  waits for the memory it really takes.
 - `Optimize(byte[])` and `OptimizeAsync` write the rewrite without extra copies.
 - Behaviour changes in the optimizer's output: object numbering in compact files differs from the
   input order; an XObject `/Name` can disappear; metadata is compressed in PDF/A-2 and later
@@ -157,7 +173,8 @@
   to commits with job level permissions. Added CodeQL and OpenSSF Scorecard, and SECURITY.md lists
   supported versions and the disclosure timeline.
 - Fuzzing: a SharpFuzz and libFuzzer harness with an allocation and time oracle for 13 entry
-  points, on pull requests and nightly.
+  points, on pull requests and nightly. A replay stops at the first input that hangs, and a run on
+  one file keeps a time limit.
 - The optimizer comparison uses library defaults, the Native AOT tool on one thread and qpdf 12,
   and checks PDF/A conformance and usage rights.
 - The repository moved to github.com/JADEV-CORP/pdf.netstack, and the package metadata points
